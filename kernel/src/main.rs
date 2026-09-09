@@ -273,7 +273,7 @@ extern "C" fn _start() -> ! {
             rights: ipc::Rights::SEND,
         },
     );
-    task::scheduler::spawn(init_process);
+    task::scheduler::spawn(init_process).expect("process table exhausted spawning the very first process");
 
     // scheduler::start() never returns: once a real process exists, the
     // machine is its (and the scheduler's) from here on, driven by the

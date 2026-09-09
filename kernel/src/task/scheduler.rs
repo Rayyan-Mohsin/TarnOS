@@ -65,13 +65,23 @@ pub fn allocate_pid() -> Pid {
 /// Normal-code-only — this is the one place the scheduler's state
 /// allocates (`Box::new`), which is why it must never be called from
 /// interrupt context.
-pub fn spawn(process: Process) {
+///
+/// Returns `Err(ResourceExhausted)` instead of panicking if the process
+/// table is already full. Not reachable by any process today — there is
+/// no spawn syscall yet, so this only ever runs from trusted boot code
+/// with exactly one process to create — but a real `Result` here means
+/// the syscall a later milestone adds inherits a safe primitive instead
+/// of a kernel-wide panic the moment `MAX_PROCESSES` processes exist.
+pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let pid = process.pid;
     let index = pid.0 as usize;
+    if index >= MAX_PROCESSES {
+        return Err(tarnos_abi::SyscallError::ResourceExhausted);
+    }
     let mut sched = SCHEDULER.lock();
-    assert!(index < MAX_PROCESSES, "process table exhausted");
     sched.processes[index] = Some(Box::new(process));
     sched.ready.push(pid);
+    Ok(())
 }
 
 /// Marks `pid` current, activates its address space, and points TSS.RSP0

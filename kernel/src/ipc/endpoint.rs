@@ -70,10 +70,13 @@ pub enum RecvResult {
 
 /// Wakes whichever kind of waiter was just displaced by a successful
 /// receive. A woken sender gets no data back, just success.
+/// `Waiter::None` (see its doc comment) means the original sender
+/// already got its answer synchronously and there is nothing to do.
 fn wake_sender(sender: Waiter) {
     match sender {
         Waiter::Task(waker) => waker.wake(),
         Waiter::Process(pid) => scheduler::wake_blocked_process(pid, WakeResult::SendCompleted),
+        Waiter::None => {}
     }
 }
 
@@ -112,6 +115,11 @@ impl Endpoint {
                     );
                 }
             }
+            // `Slot::try_send` only ever returns a real Task/Process
+            // receiver via `SendOutcome::Delivered` -- `Waiter::None` is
+            // exclusively a *sender*-side placeholder (see its doc
+            // comment) -- but the match must stay exhaustive.
+            Waiter::None => {}
         }
     }
 

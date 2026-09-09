@@ -14,6 +14,21 @@ use crate::ring::RingBuffer;
 pub enum Waiter<P> {
     Task(core::task::Waker),
     Process(P),
+    /// Nobody: notifying this "waiter" is a deliberate no-op. Used only
+    /// by [`Slot::try_send`]'s `ReceiverWaiting` arm, where a message is
+    /// re-queued for a `Waiter::Task` receiver's own re-poll to collect
+    /// (see that arm's doc comment) — the *original* sender already
+    /// received its answer synchronously, via that same call's
+    /// `SendOutcome::Delivered` return value, the moment the message was
+    /// accepted. Storing the real sender alongside the re-queued message
+    /// and waking it *again* when the message is finally collected would
+    /// tell an already-resolved sender it just completed a send it made
+    /// once, correctly, some time ago — for a `Waiter::Process` sender
+    /// this is not just redundant but actively corrupting: it would
+    /// re-mark a process `Ready`/re-queue it in the scheduler while that
+    /// process might already be running (or gone), producing a second,
+    /// bogus scheduler entry for it.
+    None,
 }
 
 /// Outcome of [`Slot::try_send`].
@@ -83,9 +98,13 @@ impl<M, P, const N: usize> Slot<M, P, N> {
 
     /// Attempts to deliver `message` right now via the waiting receiver,
     /// if any — see the type-level doc comment on why delivering to a
-    /// receiver actually means re-queuing `(message, sender)` for that
-    /// receiver to pick up, rather than handing it over directly.
-    /// Otherwise queues `(message, sender)` as a new waiting sender.
+    /// receiver actually means re-queuing `message` for that receiver to
+    /// pick up, rather than handing it over directly. The caller's
+    /// `sender` is deliberately *not* what gets stored alongside it (see
+    /// [`Waiter::None`]'s doc comment) — this call already resolves
+    /// `sender` synchronously, via this very return value, so nothing
+    /// should be told about it again later. Otherwise queues `(message,
+    /// sender)` as a new waiting sender, for real.
     pub fn try_send(&mut self, message: M, sender: Waiter<P>) -> SendOutcome<P> {
         match self {
             Slot::ReceiverWaiting(_) => {
@@ -93,8 +112,9 @@ impl<M, P, const N: usize> Slot<M, P, N> {
                 else {
                     unreachable!()
                 };
+                let _ = sender; // resolved synchronously by the caller; see doc comment above.
                 let mut queue = RingBuffer::new();
-                queue.push((message, sender));
+                queue.push((message, Waiter::None));
                 *self = Slot::SendersWaiting(queue);
                 SendOutcome::Delivered(receiver)
             }
@@ -168,7 +188,7 @@ mod tests {
     fn assert_process(w: Waiter<u32>, expected: u32) {
         match w {
             Waiter::Process(p) => assert_eq!(p, expected),
-            Waiter::Task(_) => panic!("expected a Waiter::Process({expected})"),
+            _ => panic!("expected a Waiter::Process({expected})"),
         }
     }
 
@@ -203,12 +223,60 @@ mod tests {
         // receiver was displaced, the message must still be retrievable
         // via a normal try_recv (this is how a woken Task actually gets
         // it on re-poll; here we just simulate that re-poll directly).
+        // The re-queued sender is `Waiter::None`, not the original
+        // `Waiter::Process(1)` -- see `Waiter::None`'s doc comment on
+        // why re-notifying the original sender here would be a bug (it
+        // already got its answer, synchronously, from the `Delivered`
+        // returned above).
         match slot.try_recv(Waiter::Process(99)) {
             RecvOutcome::Delivered { message, sender } => {
                 assert_eq!(message, "hello");
-                assert_process(sender, 1);
+                assert!(matches!(sender, Waiter::None));
             }
             _ => panic!("expected the re-queued message to still be there"),
+        }
+    }
+
+    #[test]
+    fn immediate_delivery_to_a_task_does_not_replay_a_stale_wake_on_the_original_sender() {
+        // Regression test for a real bug caught in kernel integration
+        // testing: a Process sender whose send is delivered immediately
+        // (a Task receiver was already waiting) returns `Delivered` and
+        // moves on -- it is not blocked and needs no further wake. When
+        // that Task receiver is later re-polled and actually collects
+        // the re-queued message, the caller must not be told to wake
+        // "the sender" using the *original* Waiter::Process -- that
+        // process may have long since exited, or be running something
+        // else entirely, and marking it Ready/re-queuing it in the
+        // scheduler a second time would corrupt scheduler state (this
+        // manifested as an intermittent "switch_to named a process that
+        // does not exist" kernel panic). The sender in the eventually-
+        // delivered outcome must be `Waiter::None`, not the process.
+        let mut slot: Slot<&str, u32, 4> = Slot::new();
+        let (flag, task_receiver) = flag_waiter();
+        assert!(matches!(
+            slot.try_recv(task_receiver),
+            RecvOutcome::Enqueued
+        ));
+
+        let sender_pid = 42;
+        match slot.try_send("hi", Waiter::Process(sender_pid)) {
+            SendOutcome::Delivered(Waiter::Task(waker)) => waker.wake(),
+            _ => panic!("expected the task receiver to be delivered to immediately"),
+        }
+        assert!(flag.0.load(Ordering::SeqCst), "receiver's waker must fire");
+
+        // Simulates the woken task's re-poll actually collecting the
+        // message.
+        match slot.try_recv(Waiter::Process(999)) {
+            RecvOutcome::Delivered { message, sender } => {
+                assert_eq!(message, "hi");
+                assert!(
+                    matches!(sender, Waiter::None),
+                    "must not hand back the original process sender for a second wake"
+                );
+            }
+            _ => panic!("expected the re-queued message to still be collectible"),
         }
     }
 
