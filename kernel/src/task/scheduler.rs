@@ -174,12 +174,18 @@ pub fn on_syscall_yield(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     on_timer_tick(current_frame)
 }
 
-/// Called from the `SYS_EXIT` syscall path: drops the calling process
-/// (no frame to preserve — it isn't coming back) and switches to
-/// whichever process is next ready. If none are, this milestone has no
-/// idle process to fall back to, so it halts the core here rather than
-/// returning into the caller's now-invalid stack.
-pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
+/// Drops the calling process (no frame to preserve — it isn't coming
+/// back) and switches to whichever process is next ready. If none are,
+/// this milestone has no idle process to fall back to, so it halts the
+/// core here rather than returning into the caller's now-invalid stack.
+///
+/// Shared by two callers that are, from the scheduler's point of view,
+/// exactly the same event: a process voluntarily exiting (`SYS_EXIT`,
+/// via [`on_syscall_exit`]) and a process being forcibly killed after a
+/// CPU exception it caused (see `arch::x86_64::idt`'s process-facing
+/// fault handlers) — neither has a frame worth preserving, and both
+/// need the same "drop it, run whatever's next" handling.
+pub fn terminate_current_process() -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
     if let Some(current_pid) = sched.current.take() {
         sched.processes[current_pid.0 as usize] = None;
@@ -206,6 +212,13 @@ pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
     maybe_print_switch(next_pid, rax, rbx);
     crate::task::executor::run_ready_tasks();
     frame_ptr
+}
+
+/// Called from the `SYS_EXIT` syscall path: exiting voluntarily is
+/// exactly [`terminate_current_process`]'s event, just reached from a
+/// different entry stub.
+pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    terminate_current_process()
 }
 
 /// Runs `f` against the currently-running process, e.g. to resolve a

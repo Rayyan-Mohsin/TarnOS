@@ -63,6 +63,40 @@ impl TrapFrame {
     }
 }
 
+/// Saved CPU state captured by one of the process-facing exception entry
+/// stubs (below) for a vector that carries a hardware error code — page
+/// fault and general-protection fault. Identical to [`TrapFrame`] except
+/// for the extra `error_code` word hardware pushes directly below `rip`
+/// for these vectors; kept as a separate type (rather than an `Option`
+/// field on `TrapFrame`) so `TrapFrame`'s own layout — load-bearing for
+/// every non-faulting resume path — never has to account for a field
+/// that's meaningless outside a fault.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FaultFrameWithCode {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
 // The timer-interrupt entry point. Two paths, chosen by checking the RPL
 // of the hardware-saved CS (always at a fixed offset regardless of which
 // path was taken, since it's the second-to-last thing pushed by hardware
@@ -157,6 +191,185 @@ extern "C" fn ring3_timer_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
 extern "C" fn ring0_timer_tick() {
     super::interrupts::on_timer_tick_bookkeeping();
     super::interrupts::send_timer_eoi();
+}
+
+// Process-facing exception entry stubs: page fault, general-protection
+// fault, invalid opcode, divide error. Each needs the same hand-rolled
+// register-capture treatment as the timer above and for the same
+// reason — killing the faulting process and switching to whatever the
+// scheduler picks next needs full control over exactly which registers
+// get restored on the way out, which the compiler-generated
+// `extern "x86-interrupt"` ABI (used for every *other* exception here,
+// none of which need to redirect control anywhere but back to where
+// they fired) does not give us.
+//
+// Two shapes, not four, since only the presence of a hardware error
+// code affects the stack layout: `exception_entry_no_code` calls its
+// two Rust functions with a `*mut TrapFrame` (CS lands at the same
+// offset as the timer stub's, since neither pushes an error code);
+// `exception_entry_with_code` calls them with a `*mut FaultFrameWithCode`
+// instead (CS is 8 bytes further out, past the error code). Both branch
+// on the saved CS's CPL exactly like the timer stub: CPL 0 means the
+// *kernel's own* code faulted, which is still simply fatal (the ring0
+// function never returns), while CPL 3 means a process faulted, which
+// the ring3 function turns into "kill that process, resume whatever the
+// scheduler picks next" — reusing the same
+// `task::scheduler::terminate_current_process` used for an ordinary
+// `SYS_EXIT`.
+macro_rules! exception_entry_no_code {
+    ($entry:ident, $ring0:path, $ring3:path) => {
+        core::arch::global_asm!(
+            concat!(".global ", stringify!($entry)),
+            concat!(stringify!($entry), ":"),
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            // Same offset as the timer stub: 15 pushed qwords (120
+            // bytes) + RIP (8 bytes) = CS at offset 128.
+            "mov rax, [rsp + 128]",
+            "test al, 3",
+            "jz 2f",
+            "1:", // ring3: a process faulted
+            "mov rdi, rsp",
+            "call {ring3}",
+            "mov rsp, rax",
+            "jmp 3f",
+            "2:", // ring0: the kernel itself faulted -- never returns
+            "mov rdi, rsp",
+            "call {ring0}",
+            "3:",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+            "iretq",
+            ring3 = sym $ring3,
+            ring0 = sym $ring0,
+        );
+    };
+}
+
+macro_rules! exception_entry_with_code {
+    ($entry:ident, $ring0:path, $ring3:path) => {
+        core::arch::global_asm!(
+            concat!(".global ", stringify!($entry)),
+            concat!(stringify!($entry), ":"),
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            // 120 bytes of pushes + error_code (8) + RIP (8) = CS at
+            // offset 136 -- 8 further out than the no-error-code stub,
+            // to account for the hardware-pushed error code.
+            "mov rax, [rsp + 136]",
+            "test al, 3",
+            "jz 2f",
+            "1:", // ring3: a process faulted
+            "mov rdi, rsp",
+            "call {ring3}",
+            "mov rsp, rax",
+            "jmp 3f",
+            "2:", // ring0: the kernel itself faulted -- never returns
+            "mov rdi, rsp",
+            "call {ring0}",
+            "3:",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+            "iretq",
+            ring3 = sym $ring3,
+            ring0 = sym $ring0,
+        );
+    };
+}
+
+exception_entry_no_code!(
+    divide_error_entry,
+    super::idt::divide_error_ring0,
+    super::idt::divide_error_ring3
+);
+exception_entry_no_code!(
+    invalid_opcode_entry,
+    super::idt::invalid_opcode_ring0,
+    super::idt::invalid_opcode_ring3
+);
+exception_entry_with_code!(
+    page_fault_entry,
+    super::idt::page_fault_ring0,
+    super::idt::page_fault_ring3
+);
+exception_entry_with_code!(
+    general_protection_fault_entry,
+    super::idt::general_protection_fault_ring0,
+    super::idt::general_protection_fault_ring3
+);
+
+unsafe extern "C" {
+    fn divide_error_entry();
+    fn invalid_opcode_entry();
+    fn page_fault_entry();
+    fn general_protection_fault_entry();
+}
+
+/// The addresses to install in the IDT for the four process-facing
+/// exception vectors handled by the hand-rolled stubs above.
+pub fn divide_error_entry_addr() -> VirtAddr {
+    VirtAddr::new(divide_error_entry as *const () as u64)
+}
+pub fn invalid_opcode_entry_addr() -> VirtAddr {
+    VirtAddr::new(invalid_opcode_entry as *const () as u64)
+}
+pub fn page_fault_entry_addr() -> VirtAddr {
+    VirtAddr::new(page_fault_entry as *const () as u64)
+}
+pub fn general_protection_fault_entry_addr() -> VirtAddr {
+    VirtAddr::new(general_protection_fault_entry as *const () as u64)
 }
 
 /// Loads `frame`'s saved registers and resumes execution at its `rip` via
