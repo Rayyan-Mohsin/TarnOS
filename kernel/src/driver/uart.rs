@@ -173,3 +173,20 @@ pub async fn echo_task() {
         write_byte(byte);
     }
 }
+
+/// The kernel-space console server: receives IPC messages over
+/// `endpoint` and writes their text to the UART. This is the bridge
+/// between the IPC-mediated path usermode must use and the same UART
+/// driver `earlycon`/boot diagnostics reach directly — the seam where
+/// UART could later move to an isolated driver process (forwarding
+/// `write_bytes` over IPC instead of calling it directly) with no change
+/// needed on this server's `CharDevice`-shaped calling convention.
+pub async fn console_server(endpoint: alloc::sync::Arc<crate::ipc::Endpoint>) {
+    loop {
+        let message = endpoint.recv().await;
+        let mut buf = [0u8; tarnos_abi::MESSAGE_INLINE_WORDS * 8];
+        let text = message.as_str_lossy(&mut buf);
+        write_bytes(text.as_bytes());
+        write_bytes(b"\r\n");
+    }
+}

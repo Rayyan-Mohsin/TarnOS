@@ -112,4 +112,22 @@ impl Process {
         let entry = VirtAddr::new(DUMMY_CODE_BASE + page_offset);
         Self::new(pid, address_space, entry)
     }
+
+    /// Builds a process by loading a real static ELF64 `ET_EXEC` image —
+    /// the actual way a process is created, once there's an ELF to load;
+    /// `new_dummy` above only exists because this milestone bootstraps
+    /// scheduler/syscall validation before `init`'s ELF bytes are wired
+    /// up as a boot module.
+    pub fn from_elf(pid: Pid, elf_bytes: &[u8]) -> Result<Self, &'static str> {
+        let address_space =
+            AddressSpace::new().map_err(|_| "out of memory creating address space")?;
+        let mut allocator = GlobalFrameAllocator;
+        let entry = {
+            let mut mapper = unsafe { address_space.mapper() };
+            crate::elf::load(elf_bytes, &mut mapper, &mut allocator)
+                .map_err(|_| "failed to load ELF image")?
+                .entry
+        };
+        Self::new(pid, address_space, entry)
+    }
 }

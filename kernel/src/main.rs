@@ -162,8 +162,7 @@ extern "C" fn _start() -> ! {
     driver::uart::write_bytes(b"[uart] real 16550 driver online, this line went through it\r\n");
     earlyprintln!("[boot] UART driver initialized, IRQ4 unmasked (type to test echo)");
 
-    let mut executor = task::executor::Executor::new();
-    executor.spawn(task::executor::Task::new(driver::uart::echo_task()));
+    task::executor::spawn(task::executor::Task::new(driver::uart::echo_task()));
     earlyprintln!("[boot] async executor started (UART RX echo task spawned)");
 
     // IPC smoke test: capability table rights-checking, plus the
@@ -193,22 +192,22 @@ extern "C" fn _start() -> ! {
         // Receiver spawned (and so polled) before the sender.
         let receiver_first = Arc::new(Endpoint::new());
         let rf_recv = receiver_first.clone();
-        executor.spawn(task::executor::Task::new(async move {
+        task::executor::spawn(task::executor::Task::new(async move {
             let msg = rf_recv.recv().await;
             assert_eq!(msg.tag, 111);
             earlyprintln!("[boot] IPC smoke test (receiver-first) passed");
         }));
-        executor.spawn(task::executor::Task::new(async move {
+        task::executor::spawn(task::executor::Task::new(async move {
             receiver_first.send(Message::new(111, [0; 4])).await;
         }));
 
         // Sender spawned (and so polled) before the receiver.
         let sender_first = Arc::new(Endpoint::new());
         let sf_send = sender_first.clone();
-        executor.spawn(task::executor::Task::new(async move {
+        task::executor::spawn(task::executor::Task::new(async move {
             sf_send.send(Message::new(222, [0; 4])).await;
         }));
-        executor.spawn(task::executor::Task::new(async move {
+        task::executor::spawn(task::executor::Task::new(async move {
             let msg = sender_first.recv().await;
             assert_eq!(msg.tag, 222);
             earlyprintln!("[boot] IPC smoke test (sender-first) passed");
@@ -218,105 +217,52 @@ extern "C" fn _start() -> ! {
     // Drains the executor once so the IPC smoke test tasks above (which
     // complete immediately, since a receiver is always either already
     // waiting or arrives in the same drain) actually run and print
-    // before boot moves on to the scheduler test below, which never
-    // returns to this idle loop.
-    executor.run_ready_tasks();
+    // before boot moves on to spawning init below.
+    task::executor::run_ready_tasks();
 
     earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
-    // SYSCALL smoke test: two ring-3 "dummy processes" exercising every
-    // syscall this milestone defines. C sends a tagged message then
-    // exits (SYS_SEND, SYS_EXIT); D polls for it non-blockingly,
-    // yielding between attempts until it arrives (SYS_RECV, SYS_YIELD),
-    // then parks with the received tag in rbx — observable the same way
-    // the milestone-12 scheduler test observed its dummy processes'
-    // registers, proving the message's payload actually made the round
-    // trip through the syscall ABI and the rendezvous endpoint, not just
-    // that the instructions didn't crash. Both processes share one
-    // capability slot 0, pointing at the same endpoint with the rights
-    // each side actually needs (never both — that's the point of
-    // capabilities: C cannot receive on this endpoint, D cannot send).
-    //
-    // scheduler::start() never returns: once real processes exist, the
-    // machine is theirs, driven by the timer's forced preemption between
-    // them — the kernel's own idle loop above never runs again after
-    // this point. That's a real, if simplified, limitation of this
-    // milestone (kernel tasks and processes aren't yet time-sliced
-    // against processes) rather than a bug; a later milestone task
-    // integrates them.
-    let shared_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+    // The real boot sequence: spawn and poll the console server to its
+    // first `recv().await` (so it's registered as a waiting receiver)
+    // *before* init is created and scheduled — eliminating the
+    // sender-before-receiver race by construction rather than by
+    // handling both orderings at runtime.
+    let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+    task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+        console_endpoint.clone(),
+    )));
+    task::executor::run_ready_tasks();
+    earlyprintln!("[boot] console server started, waiting for messages");
 
-    let pid_c = task::scheduler::allocate_pid();
-    let mut process_c = task::process::Process::new_dummy(pid_c, dummy_process_c)
-        .expect("failed to build dummy process C");
-    process_c.cap_table.insert(
-        tarnos_abi::CapIndex(0),
+    let init_module = MODULES_REQUEST
+        .response()
+        .expect("Limine did not honor the modules request")
+        .modules()
+        .iter()
+        .find(|module| module.cmdline() == "init")
+        .expect("no boot module with cmdline \"init\" (check limine.conf's module_string)");
+
+    let init_pid = task::scheduler::allocate_pid();
+    let mut init_process = task::process::Process::from_elf(init_pid, init_module.data())
+        .expect("failed to load init's ELF image");
+    init_process.cap_table.insert(
+        tarnos_abi::CONSOLE_CAP,
         ipc::CapabilitySlot {
-            object: ipc::KernelObjectRef::Endpoint(shared_endpoint.clone()),
+            object: ipc::KernelObjectRef::Endpoint(console_endpoint),
             rights: ipc::Rights::SEND,
         },
     );
-    task::scheduler::spawn(process_c);
+    task::scheduler::spawn(init_process);
 
-    let pid_d = task::scheduler::allocate_pid();
-    let mut process_d = task::process::Process::new_dummy(pid_d, dummy_process_d)
-        .expect("failed to build dummy process D");
-    process_d.cap_table.insert(
-        tarnos_abi::CapIndex(0),
-        ipc::CapabilitySlot {
-            object: ipc::KernelObjectRef::Endpoint(shared_endpoint),
-            rights: ipc::Rights::RECV,
-        },
-    );
-    task::scheduler::spawn(process_d);
-
-    earlyprintln!("[boot] syscall smoke-test processes spawned, starting scheduler...");
+    // scheduler::start() never returns: once a real process exists, the
+    // machine is its (and the scheduler's) from here on, driven by the
+    // timer's forced preemption — the kernel's own idle loop above never
+    // runs again after this point. That's a real, if simplified,
+    // limitation of this milestone (kernel tasks and processes aren't
+    // yet time-sliced against each other) rather than a bug; a later
+    // milestone task integrates them. init calling `sys_exit` with
+    // nothing else scheduled falls back to `scheduler::on_syscall_exit`'s
+    // halt, which is this milestone's clean terminal state.
+    earlyprintln!("[boot] spawning init...");
     task::scheduler::start();
-}
-
-/// Sends one tagged message on capability slot 0, then exits.
-/// Self-contained asm (not ordinary Rust) so it fits in a single page
-/// with no working stack, matching `Process::new_dummy`'s requirements.
-unsafe extern "C" fn dummy_process_c() -> ! {
-    unsafe {
-        asm!(
-            "xor edi, edi",   // cap index 0
-            "mov esi, 12345", // tag
-            "xor edx, edx",
-            "xor r10d, r10d",
-            "xor r8d, r8d",
-            "xor r9d, r9d",
-            "mov eax, 1", // SYS_SEND
-            "syscall",
-            "xor edi, edi", // exit code 0
-            "mov eax, 3",   // SYS_EXIT
-            "syscall",
-            "2:",
-            "jmp 2b",
-            options(noreturn)
-        );
-    }
-}
-
-/// Polls capability slot 0 for a message, yielding between non-blocking
-/// attempts, then parks with the received tag in `rbx` once one arrives.
-unsafe extern "C" fn dummy_process_d() -> ! {
-    unsafe {
-        asm!(
-            "2:",
-            "xor edi, edi", // cap index 0
-            "mov eax, 2",   // SYS_RECV
-            "syscall",
-            "test rax, rax",
-            "jz 3f",
-            "mov eax, 0", // SYS_YIELD
-            "syscall",
-            "jmp 2b",
-            "3:",
-            "mov rbx, rdi", // success: stash the received tag
-            "4:",
-            "jmp 4b",
-            options(noreturn)
-        );
-    }
 }

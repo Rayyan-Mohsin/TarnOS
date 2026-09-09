@@ -14,7 +14,10 @@ use tarnos_rt::syscall;
 tarnos_rt::entry_point!(main);
 
 fn main() -> ! {
-    let greeting = Message::from_str_lossy("Hello from userspace, TarnOS is alive!");
+    // Must fit within a Message's 32-byte inline capacity (see
+    // tarnos_abi::MESSAGE_INLINE_WORDS) — this milestone only supports
+    // inline messages, no out-of-line payloads yet.
+    let greeting = Message::from_str_lossy("Hello from TarnOS userspace!");
     let _ = syscall::sys_send(CONSOLE_CAP, greeting);
     syscall::sys_exit(0);
 }

@@ -167,18 +167,33 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         sched.ready.push(current_pid);
     }
 
-    let Some(next_pid) = sched.ready.pop() else {
-        // Nothing schedulable (no processes exist yet, or only the one
-        // just interrupted, which was already re-queued above and will
-        // simply be popped back out — either way there is nothing to
-        // switch to right now).
-        return current_frame;
+    let result_frame = match sched.ready.pop() {
+        Some(next_pid) => {
+            let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
+            drop(sched);
+            maybe_print_switch(next_pid, rax, rbx);
+            frame_ptr
+        }
+        None => {
+            // Nothing schedulable (no processes exist yet, or only the
+            // one just interrupted, which was already re-queued above
+            // and will simply be popped back out) — resume exactly what
+            // was interrupted.
+            drop(sched);
+            current_frame
+        }
     };
 
-    let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
-    drop(sched);
-    maybe_print_switch(next_pid, rax, rbx);
-    frame_ptr
+    // Kernel tasks (the UART echo task, the console server) need to keep
+    // making progress even while real processes are running and the
+    // kernel's own idle loop — where they'd otherwise only ever be
+    // polled — never runs again once `scheduler::start()` hands the
+    // machine to them. Every timer tick is a convenient, already-
+    // interrupts-disabled point to give them one, on top of whatever
+    // process-switching just happened above.
+    crate::task::executor::run_ready_tasks();
+
+    result_frame
 }
 
 /// Called from the `SYS_YIELD` syscall path. Voluntarily giving up the
@@ -202,6 +217,12 @@ pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
 
     let Some(next_pid) = sched.ready.pop() else {
         drop(sched);
+        // One last chance for kernel tasks to react to whatever the
+        // exiting process just did (e.g. the console server processing
+        // a message `sys_send` handed off moments before this
+        // `sys_exit`) before interrupts — and with them, every future
+        // tick that would otherwise keep draining them — stop for good.
+        crate::task::executor::run_ready_tasks();
         crate::earlyprintln!("[sched] last process exited, halting.");
         loop {
             unsafe {
@@ -213,6 +234,7 @@ pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
     drop(sched);
     maybe_print_switch(next_pid, rax, rbx);
+    crate::task::executor::run_ready_tasks();
     frame_ptr
 }
 

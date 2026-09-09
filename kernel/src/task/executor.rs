@@ -39,11 +39,11 @@ impl TaskId {
 
 pub struct Task {
     id: TaskId,
-    future: Pin<Box<dyn Future<Output = ()>>>,
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl Task {
-    pub fn new(future: impl Future<Output = ()> + 'static) -> Self {
+    pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
             id: TaskId::new(),
             future: Box::pin(future),
@@ -129,35 +129,52 @@ impl Wake for TaskWaker {
     }
 }
 
-/// A single-threaded, cooperative task executor. Not itself behind a
-/// global lock — it is only ever driven from one place (the kernel idle
-/// loop), never from interrupt context, so it doesn't need one.
+/// A single-threaded, cooperative task executor.
+///
+/// Reached through the global [`spawn`]/[`run_ready_tasks`] functions
+/// below rather than constructed per-caller: kernel tasks (the UART echo
+/// task, the console server) need to keep making progress both from the
+/// kernel's own idle loop *and* from the scheduler's per-tick drain once
+/// real processes are running (see `task::scheduler::on_timer_tick`) — a
+/// value local to one call site couldn't be reached from the other. The
+/// lock is [`SpinLock`] (interrupt-disabling), not a plain one, because
+/// both of those call sites really do use it: the idle loop with
+/// interrupts enabled, the scheduler's tick handler with them already
+/// off.
 pub struct Executor {
     tasks: BTreeMap<TaskId, Task>,
     wakers: BTreeMap<TaskId, Waker>,
 }
 
+static EXECUTOR: SpinLock<Executor> = SpinLock::new(Executor::new());
+
+/// Adds a task and schedules it to run at least once.
+pub fn spawn(task: Task) {
+    let id = task.id;
+    EXECUTOR.lock().tasks.insert(id, task);
+    READY_QUEUE.lock().push(id);
+}
+
+/// Polls every currently-ready task once. Safe to call both from the
+/// kernel idle loop and from interrupt-disabled context (the scheduler's
+/// timer-tick handler) — never from *inside* an interrupt handler that
+/// hasn't already gone through `SpinLock`, since polling a future can
+/// allocate (e.g. inserting into `wakers` below) and a genuinely
+/// interrupts-enabled interrupted context is exactly what must never
+/// touch the heap allocator's lock.
+pub fn run_ready_tasks() {
+    EXECUTOR.lock().run_ready_tasks_locked();
+}
+
 impl Executor {
-    pub fn new() -> Self {
+    const fn new() -> Self {
         Self {
             tasks: BTreeMap::new(),
             wakers: BTreeMap::new(),
         }
     }
 
-    /// Adds a task and schedules it to run at least once.
-    pub fn spawn(&mut self, task: Task) {
-        let id = task.id;
-        self.tasks.insert(id, task);
-        READY_QUEUE.lock().push(id);
-    }
-
-    /// Polls every currently-ready task once. Safe to call from the
-    /// kernel idle loop after returning from `hlt` — never from inside an
-    /// interrupt handler itself, since polling a future can allocate
-    /// (e.g. inserting into `wakers` below) and interrupts are exactly
-    /// the context that must never touch the heap allocator's lock.
-    pub fn run_ready_tasks(&mut self) {
+    fn run_ready_tasks_locked(&mut self) {
         if OVERFLOWED.swap(false, Ordering::Relaxed) {
             let ids: Vec<TaskId> = self.tasks.keys().copied().collect();
             for id in ids {
