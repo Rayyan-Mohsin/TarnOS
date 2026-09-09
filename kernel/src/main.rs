@@ -12,6 +12,7 @@ mod arch;
 mod driver;
 #[macro_use]
 mod earlycon;
+mod elf;
 mod ipc;
 mod lang_items;
 mod memory;
