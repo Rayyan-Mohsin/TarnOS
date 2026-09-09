@@ -1,0 +1,97 @@
+//! Hardware interrupt plumbing: the legacy 8259 PIC (remapped clear of the
+//! CPU exception vectors) and the PIT timer tick.
+//!
+//! ACPI/MADT parsing and the LAPIC/IOAPIC migration this implies are
+//! deferred to the SMP milestone — the RSDP is already captured at boot
+//! (see `main.rs`) specifically so that migration is additive later
+//! rather than requiring a boot-protocol change now.
+use core::sync::atomic::{AtomicU64, Ordering};
+use pic8259::ChainedPics;
+use spin::Mutex;
+use x86_64::instructions::port::Port;
+use x86_64::structures::idt::InterruptStackFrame;
+
+use crate::earlyprintln;
+
+/// The primary PIC is remapped so IRQ0-7 land on vectors 32-39, clear of
+/// the CPU's 32 reserved exception vectors (0-31); the secondary PIC
+/// follows immediately after at 40-47.
+const PIC_1_OFFSET: u8 = 32;
+const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+
+pub const TIMER_VECTOR: u8 = PIC_1_OFFSET; // IRQ0
+pub const IRQ4_VECTOR: u8 = PIC_1_OFFSET + 4; // IRQ4 (COM1)
+
+static PICS: Mutex<ChainedPics> =
+    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of timer ticks since [`init`]. Will back scheduler timeslice
+/// accounting once a scheduler exists; for now it only drives the
+/// heartbeat print that proves interrupts are actually firing.
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+const PIT_FREQUENCY_HZ: u32 = 100;
+const PIT_BASE_FREQUENCY_HZ: u32 = 1_193_182;
+
+/// Programs PIT channel 0 for a periodic tick at [`PIT_FREQUENCY_HZ`] and
+/// remaps + configures the PICs so only IRQ0 (timer) starts unmasked.
+/// IRQ4 (COM1) is registered in the IDT (see `idt::init`) but stays
+/// masked here — the UART driver (a later milestone task) unmasks it
+/// once it has actually enabled RX-available interrupts on the device,
+/// so nothing can fire on that line before anything is listening.
+///
+/// # Safety
+/// Must run after the IDT (with handlers for [`TIMER_VECTOR`] and
+/// [`IRQ4_VECTOR`] installed) is loaded, and before interrupts are
+/// enabled with `sti`.
+pub unsafe fn init() {
+    unsafe {
+        PICS.lock().initialize();
+        // Unmask IRQ0 only (bit 0 clear); every other primary-PIC line
+        // and the entire secondary PIC stay masked until something is
+        // actually ready to handle them.
+        PICS.lock().write_masks(0b1111_1110, 0b1111_1111);
+    }
+
+    let divisor = (PIT_BASE_FREQUENCY_HZ / PIT_FREQUENCY_HZ) as u16;
+    unsafe {
+        let mut command: Port<u8> = Port::new(0x43);
+        let mut channel0: Port<u8> = Port::new(0x40);
+        // Channel 0, lobyte/hibyte access mode, mode 2 (rate generator).
+        command.write(0b0011_0100u8);
+        channel0.write((divisor & 0xFF) as u8);
+        channel0.write((divisor >> 8) as u8);
+    }
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // One line roughly once a second, just enough to prove ticks keep
+    // arriving without flooding the serial console at 100 Hz.
+    if n % (PIT_FREQUENCY_HZ as u64) == 0 {
+        earlyprintln!("[timer] {} ticks", n);
+    }
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(TIMER_VECTOR);
+    }
+}
+
+/// Placeholder: acknowledges IRQ4 without doing anything else. Real RX
+/// handling is added when the UART driver unmasks this line — until then
+/// it is masked at the PIC and this handler cannot actually run, but the
+/// vector is wired up now so the driver only has to unmask the line, not
+/// also touch the IDT.
+extern "x86-interrupt" fn irq4_placeholder_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(IRQ4_VECTOR);
+    }
+}
+
+pub(super) fn register_handlers(idt: &mut x86_64::structures::idt::InterruptDescriptorTable) {
+    idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
+    idt[IRQ4_VECTOR].set_handler_fn(irq4_placeholder_handler);
+}

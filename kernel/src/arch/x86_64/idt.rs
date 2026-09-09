@@ -22,6 +22,7 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
+        super::interrupts::register_handlers(&mut idt);
         idt
     });
     idt.load();
