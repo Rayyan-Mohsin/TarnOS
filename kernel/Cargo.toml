@@ -14,3 +14,5 @@ bench = false
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
 limine = "0.6"
+x86_64 = "0.15"
+spin = "0.9"

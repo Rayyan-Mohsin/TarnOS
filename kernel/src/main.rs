@@ -1,13 +1,14 @@
 //! TarnOS kernel entry point.
 //!
 //! This file wires up the Limine boot protocol requests and hands off to
-//! the rest of the kernel. Early boot output goes through a bare, direct
-//! port-I/O poke (see [`early_print`]) rather than the real UART driver
-//! (`driver::uart`, added later) so boot can be proven working before any
-//! other subsystem exists.
+//! the rest of the kernel.
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
+mod arch;
+#[macro_use]
+mod earlycon;
 mod lang_items;
 
 use core::arch::asm;
@@ -70,46 +71,43 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
-/// Writes a byte directly to the COM1 I/O port with no UART initialization.
-///
-/// QEMU's 16550 emulation accepts bytes on THR (0x3F8) without prior DLAB/
-/// FIFO setup, so this is sufficient to prove boot+link+ISO+QEMU works
-/// before the real driver (`driver::uart`, with proper initialization and
-/// LSR busy-checking, needed on real hardware) exists.
-fn early_print(s: &str) {
-    for byte in s.bytes() {
-        unsafe {
-            asm!("out dx, al", in("dx") 0x3F8u16, in("al") byte, options(nomem, nostack, preserves_flags));
-        }
-    }
-}
-
 #[no_mangle]
 extern "C" fn _start() -> ! {
-    assert!(BASE_REVISION.is_supported(), "unsupported Limine base revision");
+    assert!(
+        BASE_REVISION.is_supported(),
+        "unsupported Limine base revision"
+    );
 
-    early_print("TarnOS booting...\r\n");
+    earlyprintln!("TarnOS booting...");
+
+    arch::x86_64::init();
+    earlyprintln!("[boot] GDT/TSS/IDT initialized");
+
+    // Self-test: a breakpoint exception is non-fatal and the handler
+    // returns, so reaching the next line proves the IDT is wired up
+    // correctly rather than merely compiled.
+    unsafe {
+        asm!("int3", options(nomem, nostack));
+    }
+    earlyprintln!("[boot] breakpoint self-test passed");
 
     if let Some(resp) = MEMMAP_REQUEST.response() {
-        early_print("[boot] memory map received\r\n");
-        let _ = resp.entries().len();
+        earlyprintln!("[boot] memory map received ({} entries)", resp.entries().len());
     }
     if let Some(resp) = HHDM_REQUEST.response() {
-        early_print("[boot] HHDM offset received\r\n");
-        let _ = resp.offset;
+        earlyprintln!("[boot] HHDM offset received ({:#x})", resp.offset);
     }
     if EXECUTABLE_ADDRESS_REQUEST.response().is_some() {
-        early_print("[boot] kernel address received\r\n");
+        earlyprintln!("[boot] kernel address received");
     }
     if let Some(resp) = MODULES_REQUEST.response() {
-        early_print("[boot] boot modules received\r\n");
-        let _ = resp.modules().len();
+        earlyprintln!("[boot] boot modules received ({})", resp.modules().len());
     }
     if RSDP_REQUEST.response().is_some() {
-        early_print("[boot] RSDP received\r\n");
+        earlyprintln!("[boot] RSDP received");
     }
 
-    early_print("TarnOS kernel skeleton alive, halting.\r\n");
+    earlyprintln!("TarnOS kernel skeleton alive, halting.");
 
     loop {
         unsafe {
