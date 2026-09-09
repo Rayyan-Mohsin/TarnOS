@@ -99,6 +99,21 @@ extern "C" fn _start() -> ! {
     arch::x86_64::init();
     earlyprintln!("[boot] GDT/TSS/IDT initialized");
 
+    // Deliberately faults instead of continuing boot — see
+    // `cargo run -p xtask -- test-fault`, which builds with this feature
+    // specifically to confirm the page-fault/double-fault handling
+    // produces a clean panic + halt rather than a triple fault. Never
+    // enabled for a normal build.
+    #[cfg(feature = "fault-injection-test")]
+    unsafe {
+        // Canonical (so this actually reaches the page-fault handler
+        // rather than a general-protection fault on a malformed
+        // address) but nowhere Limine's memory map would ever mark
+        // usable, so it is guaranteed unmapped.
+        let bad_ptr = 0x0000_1000_0000_0000u64 as *const u8;
+        core::ptr::read_volatile(bad_ptr);
+    }
+
     // Self-test: a breakpoint exception is non-fatal and the handler
     // returns, so reaching the next line proves the IDT is wired up
     // correctly rather than merely compiled.

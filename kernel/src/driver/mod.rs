@@ -13,7 +13,7 @@
 //! of a future out-of-process driver manager, not a one-off.
 pub mod uart;
 
-use spin::Mutex;
+use crate::sync::SpinLock;
 
 /// Lifecycle every driver implements.
 pub trait Driver {
@@ -48,7 +48,15 @@ const MAX_IRQ: usize = 16;
 /// `uart::handle_irq`) and call its `InterruptHandler` implementation
 /// after locking it, which a trait object tied to `&'static` storage
 /// cannot express as simply for a singleton device.
-static IRQ_TABLE: Mutex<[Option<fn()>; MAX_IRQ]> = Mutex::new([None; MAX_IRQ]);
+///
+/// `SpinLock`, not a plain `spin::Mutex`: `dispatch_irq` below locks this
+/// from interrupt context. Not currently reachable as a live deadlock
+/// (each IRQ line is registered before it's unmasked at the PIC, so
+/// `dispatch_irq` can't fire mid-`register_irq` today) but that ordering
+/// is an invariant of the *caller*, not something this table enforces —
+/// using the interrupt-disabling lock here makes the safety structural
+/// instead of dependent on every future driver getting init order right.
+static IRQ_TABLE: SpinLock<[Option<fn()>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
 /// Registers `handler` to run when IRQ `irq` is dispatched. Does not touch
 /// the PIC mask — a driver unmasks its own line only once it is actually

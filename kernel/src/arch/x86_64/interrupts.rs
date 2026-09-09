@@ -7,11 +7,11 @@
 //! rather than requiring a boot-protocol change now.
 use core::sync::atomic::{AtomicU64, Ordering};
 use pic8259::ChainedPics;
-use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::earlyprintln;
+use crate::sync::SpinLock;
 
 /// The primary PIC is remapped so IRQ0-7 land on vectors 32-39, clear of
 /// the CPU's 32 reserved exception vectors (0-31); the secondary PIC
@@ -25,8 +25,16 @@ pub const IRQ4: u8 = 4; // COM1
 pub const TIMER_VECTOR: u8 = PIC_1_OFFSET + TIMER_IRQ;
 pub const IRQ4_VECTOR: u8 = PIC_1_OFFSET + IRQ4;
 
-static PICS: Mutex<ChainedPics> =
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+// `SpinLock`, not a plain `spin::Mutex`: `send_timer_eoi` and
+// `irq4_handler` both lock this from interrupt context, and `unmask_irq4`
+// below locks it twice in a row from normal code. A plain mutex left a
+// real, if narrow, self-deadlock window — a timer interrupt landing on
+// this core in between those two normal-code locks would spin forever in
+// its own EOI trying to re-acquire a lock only the now-interrupted code
+// could release. Observed in practice as an intermittent boot hang right
+// at UART init (the only caller of `unmask_irq4`), fixed by this type.
+static PICS: SpinLock<ChainedPics> =
+    SpinLock::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 

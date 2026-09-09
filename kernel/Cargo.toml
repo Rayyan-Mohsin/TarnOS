@@ -11,6 +11,14 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Deliberately dereferences an unmapped address early in boot instead of
+# running the normal boot sequence, to confirm the page-fault/double-fault
+# handling actually produces a clean panic + halt rather than a triple
+# fault. Exercised by `cargo run -p xtask -- test-fault`, never enabled
+# for a normal build/run.
+fault-injection-test = []
+
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
 limine = "0.6"

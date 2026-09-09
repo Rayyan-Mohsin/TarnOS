@@ -19,8 +19,9 @@ fn main() {
 
     let result = match cmd {
         "build" => build(false),
-        "iso" => iso(false),
+        "iso" => iso(false, &[]),
         "run" => run(rest),
+        "test-fault" => test_fault(),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -42,7 +43,9 @@ fn print_usage() {
          \x20 iso              Build (if needed) and assemble build/tarnos.iso\n\
          \x20 run [flags]      Build the ISO (if needed) and boot it in QEMU\n\
          \x20                    --uefi    boot via OVMF instead of legacy BIOS\n\
-         \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot"
+         \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot\n\
+         \x20 test-fault       Build with a deliberate page fault injected at boot and\n\
+         \x20                    confirm it produces a clean panic + halt, not a triple fault"
     );
 }
 
@@ -72,7 +75,7 @@ fn run_cmd(cmd: &mut Command) -> Result<(), String> {
 /// it. It defaults to a position-independent executable, which a fixed-
 /// address higher-half kernel doesn't want, hence the explicit
 /// `relocation-model=static` override.
-fn build_kernel(root: &Path, release: bool) -> Result<(), String> {
+fn build_kernel(root: &Path, release: bool, extra_features: &[&str]) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root)
         .env("RUSTFLAGS", "-C relocation-model=static")
@@ -87,6 +90,9 @@ fn build_kernel(root: &Path, release: bool) -> Result<(), String> {
         ]);
     if release {
         cmd.arg("--release");
+    }
+    if !extra_features.is_empty() {
+        cmd.args(["--features", &extra_features.join(",")]);
     }
     run_cmd(&mut cmd)
 }
@@ -111,7 +117,7 @@ fn build_init(root: &Path, release: bool) -> Result<(), String> {
 
 fn build(release: bool) -> Result<(), String> {
     let root = workspace_root();
-    build_kernel(&root, release)?;
+    build_kernel(&root, release, &[])?;
     build_init(&root, release)?;
     println!("xtask: build OK");
     Ok(())
@@ -173,9 +179,9 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
     Ok(limine_dir)
 }
 
-fn iso(release: bool) -> Result<(), String> {
+fn iso(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
-    build_kernel(&root, release)?;
+    build_kernel(&root, release, kernel_features)?;
     build_init(&root, release)?;
     let limine_dir = ensure_limine(&root)?;
 
@@ -263,7 +269,7 @@ fn run(flags: &[String]) -> Result<(), String> {
     let debug = flags.iter().any(|f| f == "--debug");
 
     let root = workspace_root();
-    iso(false)?;
+    iso(false, &[])?;
 
     let iso_path = root.join("build").join("tarnos.iso");
     let mut cmd = Command::new("qemu-system-x86_64");
@@ -313,4 +319,76 @@ fn run(flags: &[String]) -> Result<(), String> {
 
     println!("xtask: launching QEMU ({})", if uefi { "UEFI" } else { "BIOS" });
     run_cmd(&mut cmd)
+}
+
+/// Builds the kernel with a deliberate page-fault-at-boot injected (the
+/// `fault-injection-test` feature — see `kernel/src/main.rs`), boots it,
+/// and checks the serial output for a clean panic + halt rather than a
+/// triple fault (which under QEMU with `-no-reboot` would otherwise show
+/// up as the guest resetting instead of printing a diagnostic). This is
+/// the permanent, repeatable form of the same check done by hand back
+/// when the double-fault IST stack was first wired up.
+///
+/// The kernel has no way to signal "done" on its own here (the fault
+/// handler halts forever by design), so this runs QEMU for a fixed
+/// window and then kills it, rather than waiting for it to exit.
+fn test_fault() -> Result<(), String> {
+    let root = workspace_root();
+    iso(false, &["fault-injection-test"])?;
+
+    let iso_path = root.join("build").join("tarnos.iso");
+    let log_path = root.join("build").join("fault-test.log");
+    let _ = std::fs::remove_file(&log_path);
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .current_dir(&root)
+        .args([
+            "-M",
+            "q35",
+            "-m",
+            "512M",
+            "-serial",
+            &format!("file:{}", log_path.display()),
+            "-display",
+            "none",
+            "-cdrom",
+            iso_path.to_str().unwrap(),
+            "-boot",
+            "d",
+            "-no-reboot",
+            "-no-shutdown",
+        ])
+        .spawn()
+        .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
+
+    // The fault happens within the first handful of boot instructions,
+    // and QEMU flushes the file-backed serial backend continuously, so a
+    // few seconds is generous rather than tight.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log = std::fs::read_to_string(&log_path)
+        .map_err(|e| format!("reading {}: {e}", log_path.display()))?;
+    println!("xtask: captured serial output:\n{log}");
+
+    let boot_lines = log.matches("TarnOS booting").count();
+    if boot_lines != 1 {
+        return Err(format!(
+            "expected exactly one boot (\"TarnOS booting\" once); saw {boot_lines} — \
+             looks like the guest reset instead of halting after the fault"
+        ));
+    }
+    if !log.contains("[KERNEL PANIC]") || !log.contains("page fault") {
+        return Err(
+            "expected a \"[KERNEL PANIC] ... page fault ...\" line in the serial output, \
+             but didn't find one"
+                .to_string(),
+        );
+    }
+
+    println!(
+        "xtask: test-fault PASSED — one clean panic + halt, no triple fault / reboot loop"
+    );
+    Ok(())
 }
