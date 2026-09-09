@@ -1,3 +1,4 @@
+pub mod context_switch;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

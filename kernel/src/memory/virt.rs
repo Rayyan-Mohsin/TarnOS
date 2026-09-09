@@ -7,10 +7,10 @@
 //! the unsafety of raw paging is audited once, here, instead of trusted
 //! ad hoc at every call site that needs a mapping.
 use spin::{Mutex, Once};
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
-    Mapper as X86Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-    Translate,
+    FrameAllocator, Mapper as X86Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -78,17 +78,7 @@ pub fn map(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFla
         // guarantees it is not aliased by any other live mapping.
         unsafe { mapper.map_to(page, frame, flags, &mut allocator) }
             .map(|flush| flush.flush())
-            .map_err(|e| match e {
-                x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed => {
-                    MapError::OutOfMemory
-                }
-                x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_) => {
-                    MapError::AlreadyMapped
-                }
-                x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage => {
-                    MapError::AlreadyMapped
-                }
-            })
+            .map_err(map_error_from)
     })
 }
 
@@ -106,4 +96,95 @@ pub fn unmap(page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
 /// `None` if it is unmapped.
 pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     with_mapper(|mapper| mapper.translate_addr(addr))
+}
+
+fn map_error_from(e: x86_64::structures::paging::mapper::MapToError<Size4KiB>) -> MapError {
+    use x86_64::structures::paging::mapper::MapToError;
+    match e {
+        MapToError::FrameAllocationFailed => MapError::OutOfMemory,
+        MapToError::PageAlreadyMapped(_) | MapToError::ParentEntryHugePage => {
+            MapError::AlreadyMapped
+        }
+    }
+}
+
+/// A process's own address space: a PML4 distinct from the kernel's
+/// boot-time one, with the kernel half (the canonical upper half, PML4
+/// indices 256..512) copied from it so every process has the kernel
+/// mapped identically — required for interrupt/syscall entry to work no
+/// matter which process's page tables are active when a trap occurs.
+pub struct AddressSpace {
+    pml4_frame: PhysFrame<Size4KiB>,
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Self, MapError> {
+        let mut allocator = GlobalFrameAllocator;
+        let frame = allocator.allocate_frame().ok_or(MapError::OutOfMemory)?;
+        let new_table: &mut PageTable =
+            unsafe { &mut *phys_to_virt(frame.start_address()).as_mut_ptr() };
+        new_table.zero();
+        with_mapper(|mapper| {
+            let master = mapper.level_4_table();
+            for i in 256..512 {
+                new_table[i] = master[i].clone();
+            }
+        });
+        Ok(Self { pml4_frame: frame })
+    }
+
+    pub fn pml4_frame(&self) -> PhysFrame<Size4KiB> {
+        self.pml4_frame
+    }
+
+    /// Builds a fresh `OffsetPageTable` bound to this address space's
+    /// PML4, independent of the currently-active one — this is what lets
+    /// process creation (and the ELF loader, called through it) populate
+    /// a process's memory before that process ever runs and its address
+    /// space becomes the active one.
+    ///
+    /// # Safety
+    /// `memory::virt::init` must already have run. The caller must not
+    /// hold another live `OffsetPageTable` for this same `AddressSpace`
+    /// at the same time (mutable-aliasing hazard) — in practice, use one
+    /// at a time and let it drop before calling this again.
+    pub unsafe fn mapper(&self) -> OffsetPageTable<'static> {
+        let hhdm_offset = *HHDM_OFFSET
+            .get()
+            .expect("memory::virt::init() must run before AddressSpace::mapper()");
+        let table: &'static mut PageTable =
+            unsafe { &mut *phys_to_virt(self.pml4_frame.start_address()).as_mut_ptr() };
+        unsafe { OffsetPageTable::new(table, hhdm_offset) }
+    }
+
+    /// Convenience wrapper around [`AddressSpace::mapper`] for mapping a
+    /// single page (a stack page, or a code page remapped for the
+    /// dummy-process scheduler smoke test) without the caller needing to
+    /// juggle an `OffsetPageTable` itself.
+    pub fn map(
+        &self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), MapError> {
+        let mut mapper = unsafe { self.mapper() };
+        let mut allocator = GlobalFrameAllocator;
+        unsafe { mapper.map_to(page, frame, flags, &mut allocator) }
+            .map(|flush| flush.flush())
+            .map_err(map_error_from)
+    }
+
+    /// Switches CR3 to this address space.
+    ///
+    /// # Safety
+    /// Every address this address space's kernel half maps must match
+    /// the currently-executing code's expectations (true for any
+    /// `AddressSpace` built by [`AddressSpace::new`]), and the caller
+    /// must be prepared for every subsequent memory access to go through
+    /// these page tables instead of whichever were active before.
+    pub unsafe fn activate(&self) {
+        unsafe {
+            Cr3::write(self.pml4_frame, Cr3Flags::empty());
+        }
+    }
 }

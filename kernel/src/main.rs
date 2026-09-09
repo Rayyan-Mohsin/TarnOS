@@ -22,9 +22,17 @@ mod task;
 use core::arch::asm;
 use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest,
-    RsdpRequest,
+    RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
+
+/// Requested explicitly rather than relying on Limine's unspecified
+/// default: boot code and the process-creation smoke test both build
+/// sizable stack values before they're moved onto the heap, and a small
+/// default stack would risk overflowing into whatever memory follows it.
+#[used]
+#[link_section = ".requests"]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(0x10000);
 
 /// Tells Limine we speak base revision 3 — the revision this kernel
 /// actually relies on (RSDP is a physical address only from revision 3
@@ -207,12 +215,58 @@ extern "C" fn _start() -> ! {
         }));
     }
 
+    // Drains the executor once so the IPC smoke test tasks above (which
+    // complete immediately, since a receiver is always either already
+    // waiting or arrives in the same drain) actually run and print
+    // before boot moves on to the scheduler test below, which never
+    // returns to this idle loop.
+    executor.run_ready_tasks();
+
     earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
-    loop {
-        executor.run_ready_tasks();
-        unsafe {
-            asm!("hlt", options(nomem, nostack));
-        }
+    // Scheduler/context-switch smoke test: two ring-3 "dummy processes"
+    // (each just a tight, self-contained asm loop bumping one register —
+    // no ELF, no syscalls, nothing that depends on later milestone
+    // tasks), preempted purely by the timer interrupt. Isolates
+    // scheduler + context-switch correctness from ELF/syscall
+    // complexity, per the milestone plan. Real ELF-loaded processes are
+    // wired up in a later milestone task, reusing this same
+    // Process::new/on_timer_tick machinery unchanged.
+    //
+    // scheduler::start() never returns: once real processes exist, the
+    // machine is theirs, driven by the timer's forced preemption between
+    // them — the kernel's own idle loop below never runs again after
+    // this point. That's a real, if simplified, limitation of this
+    // milestone (kernel tasks and processes aren't yet time-sliced
+    // against each other) rather than a bug; a later milestone task
+    // integrates them.
+    let pid_a = task::scheduler::allocate_pid();
+    let process_a =
+        task::process::Process::new_dummy(pid_a, dummy_process_a).expect("failed to build dummy process A");
+    task::scheduler::spawn(process_a);
+
+    let pid_b = task::scheduler::allocate_pid();
+    let process_b =
+        task::process::Process::new_dummy(pid_b, dummy_process_b).expect("failed to build dummy process B");
+    task::scheduler::spawn(process_b);
+
+    earlyprintln!("[boot] two dummy ring-3 processes spawned, starting scheduler...");
+    task::scheduler::start();
+}
+
+/// Self-contained: touches nothing but its own registers, so it fits
+/// comfortably within a single page and needs no working stack — a tight
+/// asm loop rather than ordinary Rust specifically to avoid the compiler
+/// introducing a prologue/epilogue or stack spills that would make the
+/// "one page, no stack needed" assumption fragile.
+unsafe extern "C" fn dummy_process_a() -> ! {
+    unsafe {
+        asm!("xor rax, rax", "2:", "add rax, 1", "jmp 2b", options(noreturn));
+    }
+}
+
+unsafe extern "C" fn dummy_process_b() -> ! {
+    unsafe {
+        asm!("xor rbx, rbx", "2:", "add rbx, 1", "jmp 2b", options(noreturn));
     }
 }

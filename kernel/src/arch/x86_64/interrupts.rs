@@ -71,13 +71,23 @@ pub unsafe fn init() {
     }
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// Bumps the tick counter and prints the heartbeat. Called from
+/// `context_switch`'s hand-written timer entry stub — the timer vector
+/// cannot use a plain `extern "x86-interrupt" fn` like the other
+/// handlers here, because that ABI hides the general-purpose registers
+/// from us, and a scheduler resuming a *different* process than the one
+/// interrupted needs full control over exactly which registers get
+/// restored on the way out.
+pub(super) fn on_timer_tick_bookkeeping() {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     // One line roughly once a second, just enough to prove ticks keep
     // arriving without flooding the serial console at 100 Hz.
     if n % (PIT_FREQUENCY_HZ as u64) == 0 {
         earlyprintln!("[timer] {} ticks", n);
     }
+}
+
+pub(super) fn send_timer_eoi() {
     unsafe {
         PICS.lock().notify_end_of_interrupt(TIMER_VECTOR);
     }
@@ -107,6 +117,12 @@ pub fn unmask_irq4() {
 }
 
 pub(super) fn register_handlers(idt: &mut x86_64::structures::idt::InterruptDescriptorTable) {
-    idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
+    // SAFETY: `timer_interrupt_entry` is a valid interrupt-vector entry
+    // point (see `context_switch`): it saves every general-purpose
+    // register on entry and restores them before `iretq`, matching what
+    // an interrupt gate requires.
+    unsafe {
+        idt[TIMER_VECTOR].set_handler_addr(super::context_switch::timer_interrupt_entry_addr());
+    }
     idt[IRQ4_VECTOR].set_handler_fn(irq4_handler);
 }

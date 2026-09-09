@@ -7,6 +7,8 @@
 //! base values, which only works if kernel_data sits exactly one GDT slot
 //! after kernel_code, and user_code exactly one slot after user_data. That
 //! ordering is set up now so it never has to be revisited.
+use core::cell::UnsafeCell;
+
 use spin::Once;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
@@ -34,7 +36,16 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-static TSS: Once<TaskStateSegment> = Once::new();
+/// Wraps the TSS in an `UnsafeCell` rather than `spin::Once`'s plain
+/// value: `set_kernel_stack` needs to keep mutating `privilege_stack_table[0]`
+/// (RSP0) on every process switch, long after `init` has run, while the
+/// GDT's TSS descriptor holds a `&'static` pointing at this same memory.
+/// Safe because every mutation happens with interrupts disabled (from
+/// within `sync::SpinLock`-guarded scheduler code) on this single core.
+struct TssCell(UnsafeCell<TaskStateSegment>);
+unsafe impl Sync for TssCell {}
+
+static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 static SELECTORS: Once<&'static Selectors> = Once::new();
 
@@ -45,11 +56,10 @@ fn double_fault_stack_top() -> VirtAddr {
 }
 
 pub fn init() {
-    let tss = TSS.call_once(|| {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack_top();
-        tss
-    });
+    // SAFETY: single-threaded boot, before interrupts are enabled.
+    let tss: &'static mut TaskStateSegment = unsafe { &mut *TSS.0.get() };
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack_top();
+    let tss: &'static TaskStateSegment = tss;
 
     let (gdt, selectors) = GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
@@ -89,4 +99,20 @@ pub fn selectors() -> &'static Selectors {
     SELECTORS
         .get()
         .expect("gdt::init() must run before gdt::selectors()")
+}
+
+/// Sets RSP0: the kernel stack the CPU switches to on any trap
+/// (interrupt, exception, or `SYSCALL`) that raises the privilege level.
+/// Called on every process switch so a trap taken while a given process
+/// is running always lands on *that* process's kernel stack, never a
+/// different process's.
+///
+/// # Safety
+/// Must only be called with interrupts disabled — the caller is
+/// overwriting state the CPU consults on the next privilege-raising trap,
+/// which must not happen mid-update.
+pub unsafe fn set_kernel_stack(rsp0: VirtAddr) {
+    unsafe {
+        (*TSS.0.get()).privilege_stack_table[0] = rsp0;
+    }
 }

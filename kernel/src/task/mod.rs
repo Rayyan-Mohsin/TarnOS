@@ -1,4 +1,6 @@
 pub mod executor;
+pub mod process;
+pub mod scheduler;
 
 /// A process identifier. Defined here (rather than in `task::process`,
 /// which doesn't exist yet) because `ipc::endpoint::Waiter` needs to name
