@@ -9,6 +9,7 @@
 extern crate alloc;
 
 mod arch;
+mod driver;
 #[macro_use]
 mod earlycon;
 mod lang_items;
@@ -144,6 +145,10 @@ extern "C" fn _start() -> ! {
 
         earlyprintln!("[boot] heap smoke test passed (Box + 1000-element Vec)");
     }
+
+    driver::uart::init();
+    driver::uart::write_bytes(b"[uart] real 16550 driver online, this line went through it\r\n");
+    earlyprintln!("[boot] UART driver initialized, IRQ4 unmasked (type to test echo)");
 
     earlyprintln!("TarnOS kernel skeleton alive, halting.");
 

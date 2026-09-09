@@ -19,8 +19,11 @@ use crate::earlyprintln;
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-pub const TIMER_VECTOR: u8 = PIC_1_OFFSET; // IRQ0
-pub const IRQ4_VECTOR: u8 = PIC_1_OFFSET + 4; // IRQ4 (COM1)
+pub const TIMER_IRQ: u8 = 0;
+pub const IRQ4: u8 = 4; // COM1
+
+pub const TIMER_VECTOR: u8 = PIC_1_OFFSET + TIMER_IRQ;
+pub const IRQ4_VECTOR: u8 = PIC_1_OFFSET + IRQ4;
 
 static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
@@ -80,18 +83,30 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
-/// Placeholder: acknowledges IRQ4 without doing anything else. Real RX
-/// handling is added when the UART driver unmasks this line — until then
-/// it is masked at the PIC and this handler cannot actually run, but the
-/// vector is wired up now so the driver only has to unmask the line, not
-/// also touch the IDT.
-extern "x86-interrupt" fn irq4_placeholder_handler(_stack_frame: InterruptStackFrame) {
+/// Dispatches to whatever the driver framework registered for IRQ4 (the
+/// UART driver, once it has initialized the device and unmasked this
+/// line via [`unmask_irq4`]). Registered in the IDT unconditionally, but
+/// masked at the PIC until then, so nothing can call in with no handler
+/// registered.
+extern "x86-interrupt" fn irq4_handler(_stack_frame: InterruptStackFrame) {
+    crate::driver::dispatch_irq(IRQ4);
     unsafe {
         PICS.lock().notify_end_of_interrupt(IRQ4_VECTOR);
     }
 }
 
+/// Unmasks IRQ4 at the PIC. Called by the UART driver only after it has
+/// finished initializing the device and enabling its RX-available
+/// interrupt — never before, since unmasking first would let the line
+/// fire before `driver::register_irq` has anything registered for it.
+pub fn unmask_irq4() {
+    unsafe {
+        let [mask1, mask2] = PICS.lock().read_masks();
+        PICS.lock().write_masks(mask1 & !(1 << IRQ4), mask2);
+    }
+}
+
 pub(super) fn register_handlers(idt: &mut x86_64::structures::idt::InterruptDescriptorTable) {
     idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
-    idt[IRQ4_VECTOR].set_handler_fn(irq4_placeholder_handler);
+    idt[IRQ4_VECTOR].set_handler_fn(irq4_handler);
 }
