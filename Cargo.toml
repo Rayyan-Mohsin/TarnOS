@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "xtask",
     "libs/tarnos-abi",
+    "libs/tarnos-kcore",
     "libs/tarnos-rt",
     "kernel",
     "userland/init",

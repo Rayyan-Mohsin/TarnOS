@@ -19,130 +19,35 @@
 //! and later resume it, which nothing in this milestone's demo exercises
 //! (the demo's boot ordering guarantees a receiver is always already
 //! waiting, so a process never actually needs to block on `send` either).
+//!
+//! The actual rendezvous state machine is `tarnos_kcore::endpoint::Slot`
+//! — extracted so it's unit-testable on the host without a lock. This
+//! type is a thin wrapper: a `Slot<MessagePayload, Pid>` behind the
+//! kernel's interrupt-disabling `SpinLock`.
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
 use tarnos_abi::Message;
+use tarnos_kcore::endpoint::Slot;
 
 use crate::sync::SpinLock;
 use crate::task::Pid;
 
 use super::message::MessagePayload;
 
-/// Whoever is waiting on one side of a rendezvous.
-pub enum Waiter {
-    Task(Waker),
-    Process(Pid),
-}
-
-impl Waiter {
-    /// Wakes a `Task` waiter immediately. `Process` waiters cannot be
-    /// woken here — `Endpoint` doesn't know about the scheduler — so the
-    /// caller of the operation that produced a `Process` waiter (the
-    /// syscall layer, once it exists) is responsible for re-checking and
-    /// resuming it.
-    fn wake_if_task(self) {
-        if let Waiter::Task(waker) = self {
-            waker.wake();
-        }
-    }
-}
-
-enum Slot {
-    Empty,
-    SenderWaiting {
-        message: MessagePayload,
-        sender: Waiter,
-    },
-    ReceiverWaiting {
-        receiver: Waiter,
-    },
-}
+/// Whoever is waiting on one side of a rendezvous — see
+/// `tarnos_kcore::endpoint::Waiter`'s doc comment.
+pub type Waiter = tarnos_kcore::endpoint::Waiter<Pid>;
 
 pub struct Endpoint {
-    slot: SpinLock<Slot>,
+    slot: SpinLock<Slot<MessagePayload, Pid>>,
 }
 
 impl Endpoint {
     pub fn new() -> Self {
         Self {
-            slot: SpinLock::new(Slot::Empty),
-        }
-    }
-
-    /// Attempts to deliver `message` right now. If a receiver is already
-    /// waiting, hands off and wakes it (if it's a task — a waiting
-    /// process is resumed by whoever dequeues it, since `Endpoint` cannot
-    /// touch the scheduler), returning `true`. Otherwise records `sender`
-    /// as the endpoint's new waiting sender and returns `false`.
-    ///
-    /// Panics if a sender is already waiting — `Endpoint` is a
-    /// single-slot rendezvous, and having two senders queued at once
-    /// would silently drop one of them; callers must not call this twice
-    /// without an intervening successful receive.
-    fn try_send_inner(&self, message: Message, sender: Waiter) -> bool {
-        let mut guard = self.slot.lock();
-        match &*guard {
-            Slot::SenderWaiting { .. } => {
-                drop(guard);
-                panic!("Endpoint::try_send called while another sender is already waiting")
-            }
-            Slot::ReceiverWaiting { .. } => {
-                let Slot::ReceiverWaiting { receiver } =
-                    core::mem::replace(
-                        &mut *guard,
-                        Slot::SenderWaiting {
-                            message: MessagePayload::inline(message),
-                            sender,
-                        },
-                    )
-                else {
-                    unreachable!()
-                };
-                // The message is now waiting in the slot for the receiver
-                // to actually take on its next poll; waking it here only
-                // re-schedules that poll (for a task) or is a no-op for
-                // now (for a process — see `Waiter::wake_if_task`).
-                drop(guard);
-                receiver.wake_if_task();
-                true
-            }
-            Slot::Empty => {
-                *guard = Slot::SenderWaiting {
-                    message: MessagePayload::inline(message),
-                    sender,
-                };
-                false
-            }
-        }
-    }
-
-    /// Attempts to receive right now. If a sender is already waiting,
-    /// takes its message, wakes it (if a task), and returns it.
-    /// Otherwise records `receiver` as the endpoint's new waiting
-    /// receiver and returns `None`.
-    fn try_recv_inner(&self, receiver: Waiter) -> Option<Message> {
-        let mut guard = self.slot.lock();
-        match &*guard {
-            Slot::ReceiverWaiting { .. } => {
-                drop(guard);
-                panic!("Endpoint::try_recv called while another receiver is already waiting")
-            }
-            Slot::SenderWaiting { .. } => {
-                let Slot::SenderWaiting { message, sender } =
-                    core::mem::replace(&mut *guard, Slot::Empty)
-                else {
-                    unreachable!()
-                };
-                drop(guard);
-                sender.wake_if_task();
-                Some(message.into_inline())
-            }
-            Slot::Empty => {
-                *guard = Slot::ReceiverWaiting { receiver };
-                None
-            }
+            slot: SpinLock::new(Slot::new()),
         }
     }
 
@@ -156,7 +61,9 @@ impl Endpoint {
     /// being primed first (see `docs/adr` and the boot-ordering note in
     /// `main.rs`) and treat `false` as an error rather than a real block.
     pub fn try_send(&self, message: Message, sender_pid: Pid) -> bool {
-        self.try_send_inner(message, Waiter::Process(sender_pid))
+        self.slot
+            .lock()
+            .try_send(MessagePayload::inline(message), Waiter::Process(sender_pid))
     }
 
     /// Non-blocking receive for the syscall path: returns a message if a
@@ -167,20 +74,10 @@ impl Endpoint {
     /// this milestone's demo exercises — so this never blocks; it only
     /// checks.
     pub fn try_recv_nonblocking(&self) -> Option<Message> {
-        let mut guard = self.slot.lock();
-        match &*guard {
-            Slot::SenderWaiting { .. } => {
-                let Slot::SenderWaiting { message, sender } =
-                    core::mem::replace(&mut *guard, Slot::Empty)
-                else {
-                    unreachable!()
-                };
-                drop(guard);
-                sender.wake_if_task();
-                Some(message.into_inline())
-            }
-            _ => None,
-        }
+        self.slot
+            .lock()
+            .try_recv_nonblocking()
+            .map(MessagePayload::into_inline)
     }
 
     /// Async send for kernel-task callers: suspends the calling task
@@ -222,10 +119,10 @@ impl Future for SendFuture<'_> {
                 // endpoint's pending-sender slot (not lost) and this
                 // future has nothing left to do but wait to be told it
                 // was taken.
-                if self
-                    .endpoint
-                    .try_send_inner(message, Waiter::Task(cx.waker().clone()))
-                {
+                if self.endpoint.slot.lock().try_send(
+                    MessagePayload::inline(message),
+                    Waiter::Task(cx.waker().clone()),
+                ) {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -251,8 +148,13 @@ impl Future for RecvFuture<'_> {
     type Output = Message;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Message> {
-        match self.endpoint.try_recv_inner(Waiter::Task(cx.waker().clone())) {
-            Some(message) => Poll::Ready(message),
+        match self
+            .endpoint
+            .slot
+            .lock()
+            .try_recv(Waiter::Task(cx.waker().clone()))
+        {
+            Some(message) => Poll::Ready(message.into_inline()),
             None => Poll::Pending,
         }
     }

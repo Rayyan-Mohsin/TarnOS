@@ -22,41 +22,11 @@ use super::Pid;
 
 const MAX_PROCESSES: usize = 16;
 
-struct ReadyQueue {
-    buffer: [Option<Pid>; MAX_PROCESSES],
-    head: usize,
-    len: usize,
-}
-
-impl ReadyQueue {
-    const fn new() -> Self {
-        Self {
-            buffer: [None; MAX_PROCESSES],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, pid: Pid) -> bool {
-        if self.len == MAX_PROCESSES {
-            return false;
-        }
-        let idx = (self.head + self.len) % MAX_PROCESSES;
-        self.buffer[idx] = Some(pid);
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<Pid> {
-        if self.len == 0 {
-            return None;
-        }
-        let pid = self.buffer[self.head].take();
-        self.head = (self.head + 1) % MAX_PROCESSES;
-        self.len -= 1;
-        pid
-    }
-}
+/// See `tarnos_kcore::RingBuffer`'s doc comment — the extracted,
+/// unit-tested version of what used to be a hand-copied ring buffer
+/// here (and, until the same extraction, an almost-identical copy in
+/// `task::executor`).
+type ReadyQueue = tarnos_kcore::RingBuffer<Pid, MAX_PROCESSES>;
 
 struct Inner {
     processes: [Option<Box<Process>>; MAX_PROCESSES],

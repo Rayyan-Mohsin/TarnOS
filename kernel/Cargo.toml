@@ -21,6 +21,7 @@ fault-injection-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
+tarnos-kcore = { path = "../libs/tarnos-kcore" }
 limine = "0.6"
 x86_64 = "0.15"
 spin = "0.9"

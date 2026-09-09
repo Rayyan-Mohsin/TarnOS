@@ -57,41 +57,11 @@ impl Task {
 
 const READY_QUEUE_CAPACITY: usize = 64;
 
-struct ReadyQueue {
-    buffer: [Option<TaskId>; READY_QUEUE_CAPACITY],
-    head: usize,
-    len: usize,
-}
-
-impl ReadyQueue {
-    const fn new() -> Self {
-        Self {
-            buffer: [None; READY_QUEUE_CAPACITY],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, id: TaskId) -> bool {
-        if self.len == READY_QUEUE_CAPACITY {
-            return false;
-        }
-        let idx = (self.head + self.len) % READY_QUEUE_CAPACITY;
-        self.buffer[idx] = Some(id);
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<TaskId> {
-        if self.len == 0 {
-            return None;
-        }
-        let id = self.buffer[self.head].take();
-        self.head = (self.head + 1) % READY_QUEUE_CAPACITY;
-        self.len -= 1;
-        id
-    }
-}
+/// See `tarnos_kcore::RingBuffer`'s doc comment — this is the extracted,
+/// unit-tested version of what used to be a hand-copied ring buffer
+/// here (and, until the same extraction, an almost-identical copy in
+/// `task::scheduler`).
+type ReadyQueue = tarnos_kcore::RingBuffer<TaskId, READY_QUEUE_CAPACITY>;
 
 static READY_QUEUE: SpinLock<ReadyQueue> = SpinLock::new(ReadyQueue::new());
 

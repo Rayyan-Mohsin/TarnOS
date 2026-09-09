@@ -8,7 +8,15 @@
 //! carved out of a scavenged physical region: it is part of the kernel
 //! image, so it is already mapped by the time Limine hands off control,
 //! with no chicken-and-egg problem against the allocator it backs.
+//!
+//! The actual bit-twiddling (`tarnos_kcore::Bitmap`) and the byte-range-
+//! to-frame-range rounding (`tarnos_kcore::bitmap::usable_frame_range`)
+//! live in `tarnos-kcore` instead of here, specifically so they're
+//! unit-testable on the host — this module is a thin adapter that adds
+//! back the hardware types (`PhysFrame`, the Limine `Entry`) a host-side
+//! test has no use for.
 use spin::Mutex;
+use tarnos_kcore::bitmap::usable_frame_range;
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
 
@@ -23,57 +31,7 @@ const MAX_TRACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const MAX_TRACKED_FRAMES: usize = (MAX_TRACKED_BYTES / FRAME_SIZE) as usize;
 const BITMAP_WORDS: usize = MAX_TRACKED_FRAMES / 64;
 
-struct Bitmap {
-    words: [u64; BITMAP_WORDS],
-    /// One past the highest frame index ever marked usable; bounds search
-    /// so allocation doesn't scan tens of thousands of always-reserved
-    /// words past the top of installed RAM.
-    frame_count: usize,
-}
-
-impl Bitmap {
-    const fn new() -> Self {
-        Self {
-            words: [0; BITMAP_WORDS],
-            frame_count: 0,
-        }
-    }
-
-    fn set_free(&mut self, frame_index: usize) {
-        if frame_index >= MAX_TRACKED_FRAMES {
-            return;
-        }
-        self.words[frame_index / 64] |= 1 << (frame_index % 64);
-        if frame_index >= self.frame_count {
-            self.frame_count = frame_index + 1;
-        }
-    }
-
-    fn set_used(&mut self, frame_index: usize) {
-        if frame_index >= MAX_TRACKED_FRAMES {
-            return;
-        }
-        self.words[frame_index / 64] &= !(1 << (frame_index % 64));
-    }
-
-    fn is_free(&self, frame_index: usize) -> bool {
-        frame_index < MAX_TRACKED_FRAMES
-            && (self.words[frame_index / 64] & (1 << (frame_index % 64))) != 0
-    }
-
-    fn allocate(&mut self) -> Option<usize> {
-        for word_index in 0..(self.frame_count.div_ceil(64)) {
-            let word = self.words[word_index];
-            if word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                let frame_index = word_index * 64 + bit;
-                self.set_used(frame_index);
-                return Some(frame_index);
-            }
-        }
-        None
-    }
-}
+type Bitmap = tarnos_kcore::Bitmap<BITMAP_WORDS>;
 
 pub struct BitmapFrameAllocator {
     bitmap: Bitmap,
@@ -93,10 +51,8 @@ impl BitmapFrameAllocator {
             if entry.type_ != MEMMAP_USABLE {
                 continue;
             }
-            let start_frame = entry.base.div_ceil(FRAME_SIZE);
-            let end_frame = (entry.base + entry.length) / FRAME_SIZE;
-            for frame_index in start_frame..end_frame {
-                self.bitmap.set_free(frame_index as usize);
+            for frame_index in usable_frame_range(entry.base, entry.length, FRAME_SIZE) {
+                self.bitmap.set_free(frame_index);
             }
         }
     }

@@ -96,6 +96,14 @@ name = "tarnos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "tarnos-kcore"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "tarnos-abi",
+]
+
+[[package]]
 name = "tarnos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -105,6 +113,7 @@ dependencies = [
  "pic8259",
  "spin",
  "tarnos-abi",
+ "tarnos-kcore",
  "x86_64",
 ]
 
