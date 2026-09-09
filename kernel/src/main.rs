@@ -96,6 +96,43 @@ extern "C" fn _start() -> ! {
 
     earlyprintln!("TarnOS booting...");
 
+    if let Some(resp) = MEMMAP_REQUEST.response() {
+        earlyprintln!("[boot] memory map received ({} entries)", resp.entries().len());
+    }
+    if let Some(resp) = HHDM_REQUEST.response() {
+        earlyprintln!("[boot] HHDM offset received ({:#x})", resp.offset);
+    }
+    if EXECUTABLE_ADDRESS_REQUEST.response().is_some() {
+        earlyprintln!("[boot] kernel address received");
+    }
+    if let Some(resp) = MODULES_REQUEST.response() {
+        earlyprintln!("[boot] boot modules received ({})", resp.modules().len());
+    }
+    if RSDP_REQUEST.response().is_some() {
+        earlyprintln!("[boot] RSDP received");
+    }
+
+    // Runs before `arch::x86_64::init()` now (it didn't in earlier
+    // milestones): the double-fault IST stack that GDT setup installs
+    // needs a real, guard-paged mapping (see `arch::x86_64::gdt`), which
+    // needs the frame allocator and page mapper this call brings up.
+    // Nothing before this point touches the heap or paging beyond what
+    // Limine already set up, so the reorder is free.
+    let hhdm_offset = x86_64::VirtAddr::new(
+        HHDM_REQUEST
+            .response()
+            .expect("Limine did not honor the HHDM request")
+            .offset,
+    );
+    let memmap_entries = MEMMAP_REQUEST
+        .response()
+        .expect("Limine did not honor the memory map request")
+        .entries();
+    unsafe {
+        memory::init(hhdm_offset, memmap_entries);
+    }
+    earlyprintln!("[boot] memory management initialized (frame allocator, page mapper, heap)");
+
     arch::x86_64::init();
     earlyprintln!("[boot] GDT/TSS/IDT initialized");
 
@@ -121,37 +158,6 @@ extern "C" fn _start() -> ! {
         asm!("int3", options(nomem, nostack));
     }
     earlyprintln!("[boot] breakpoint self-test passed");
-
-    if let Some(resp) = MEMMAP_REQUEST.response() {
-        earlyprintln!("[boot] memory map received ({} entries)", resp.entries().len());
-    }
-    if let Some(resp) = HHDM_REQUEST.response() {
-        earlyprintln!("[boot] HHDM offset received ({:#x})", resp.offset);
-    }
-    if EXECUTABLE_ADDRESS_REQUEST.response().is_some() {
-        earlyprintln!("[boot] kernel address received");
-    }
-    if let Some(resp) = MODULES_REQUEST.response() {
-        earlyprintln!("[boot] boot modules received ({})", resp.modules().len());
-    }
-    if RSDP_REQUEST.response().is_some() {
-        earlyprintln!("[boot] RSDP received");
-    }
-
-    let hhdm_offset = x86_64::VirtAddr::new(
-        HHDM_REQUEST
-            .response()
-            .expect("Limine did not honor the HHDM request")
-            .offset,
-    );
-    let memmap_entries = MEMMAP_REQUEST
-        .response()
-        .expect("Limine did not honor the memory map request")
-        .entries();
-    unsafe {
-        memory::init(hhdm_offset, memmap_entries);
-    }
-    earlyprintln!("[boot] memory management initialized (frame allocator, page mapper, heap)");
 
     // Smoke test: if the heap allocator is wired up correctly, `Box` and
     // `Vec` (backed by real physical frames mapped in the previous step)

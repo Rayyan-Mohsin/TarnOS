@@ -13,8 +13,12 @@ use spin::Once;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
+use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, Size4KiB};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
+
+use crate::memory::phys::GlobalFrameAllocator;
+use crate::memory::virt;
 
 /// Index into the TSS's Interrupt Stack Table reserved for double faults.
 ///
@@ -26,7 +30,11 @@ use x86_64::VirtAddr;
 /// stack" handler cannot be made to work.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
+const DOUBLE_FAULT_STACK_PAGES: u64 = 5;
+/// Fixed virtual base for the double-fault stack, chosen clear of the
+/// kernel heap (`0xffff_9000_0000_0000`) and the per-process kernel
+/// stack region (`0xffff_9800_0000_0000`, see `task::process`).
+const DOUBLE_FAULT_STACK_BASE: u64 = 0xffff_9400_0000_0000;
 
 pub struct Selectors {
     pub kernel_code: SegmentSelector,
@@ -49,10 +57,31 @@ static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 static SELECTORS: Once<&'static Selectors> = Once::new();
 
+/// Maps [`DOUBLE_FAULT_STACK_PAGES`] pages at a fixed virtual base and
+/// returns the top of that mapping — deliberately leaving the page
+/// immediately below it (at `DOUBLE_FAULT_STACK_BASE` itself) unmapped as
+/// a guard page. A double fault is exactly the case a stack overflow can
+/// trigger (the CPU faulting again while trying to push an exception
+/// frame onto an already-exhausted stack), so this is the one stack in
+/// the kernel where an unguarded overflow would be most likely to
+/// silently corrupt whatever memory happened to sit below it instead of
+/// reliably faulting.
+///
+/// Must run after `memory::init()` (needs the frame allocator and page
+/// mapper) — see the boot-order note in `main.rs`.
 fn double_fault_stack_top() -> VirtAddr {
-    static mut STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
-    let start = VirtAddr::from_ptr(&raw const STACK);
-    start + DOUBLE_FAULT_STACK_SIZE as u64
+    let mut allocator = GlobalFrameAllocator;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    for i in 1..=DOUBLE_FAULT_STACK_PAGES {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            DOUBLE_FAULT_STACK_BASE + i * 4096,
+        ));
+        let frame = allocator
+            .allocate_frame()
+            .expect("out of memory mapping the double-fault stack");
+        virt::map(page, frame, flags).expect("failed to map double-fault stack page");
+    }
+    VirtAddr::new(DOUBLE_FAULT_STACK_BASE + (1 + DOUBLE_FAULT_STACK_PAGES) * 4096)
 }
 
 pub fn init() {

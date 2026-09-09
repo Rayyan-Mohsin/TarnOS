@@ -1,15 +1,12 @@
 //! A process: an address space, a saved CPU state, a kernel stack to trap
 //! into, and the capabilities it holds.
-use alloc::vec;
-use alloc::boxed::Box;
-
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::context_switch::TrapFrame;
 use crate::ipc::CapTable;
 use crate::memory::phys::GlobalFrameAllocator;
-use crate::memory::virt::{self, AddressSpace};
+use crate::memory::virt::{self, AddressSpace, MapError};
 
 use super::Pid;
 
@@ -19,29 +16,58 @@ pub enum ProcessState {
     Running,
 }
 
-const KERNEL_STACK_SIZE: usize = 16 * 1024;
+const KERNEL_STACK_PAGES: u64 = 4; // 16 KiB
 const USER_STACK_PAGES: u64 = 4; // 16 KiB
 /// Just under the top of the canonical lower half — the same permitted
 /// range `elf::load` validates PT_LOAD segments against — leaving a
 /// large gap below it for a future heap/mmap region.
 const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 
+/// Fixed virtual base for per-process kernel stacks, one
+/// `KERNEL_STACK_SLOT_STRIDE`-sized slot per `Pid` — chosen clear of the
+/// kernel heap (`0xffff_9000_0000_0000`) and the double-fault stack
+/// (`0xffff_9400_0000_0000`, see `arch::x86_64::gdt`). Mapped through
+/// each process's own `AddressSpace` rather than carved from the heap
+/// (as earlier milestones did with a plain `Box<[u8]>`) specifically so
+/// a guard page can sit immediately below every stack: a kernel-stack
+/// overflow reliably page-faults instead of silently corrupting whatever
+/// heap allocation happened to land next to it. Never accessed except
+/// while its owning process's address space is active (see
+/// `task::scheduler::switch_to`), so — unlike the heap — this mapping
+/// only ever needs to exist in that one process's own page tables, not
+/// shared with anyone else's.
+const KERNEL_STACKS_BASE: u64 = 0xffff_9800_0000_0000;
+const KERNEL_STACK_SLOT_STRIDE: u64 = 4096 * (1 + KERNEL_STACK_PAGES); // guard page + stack
+
+fn kernel_stack_slot_base(pid: Pid) -> u64 {
+    KERNEL_STACKS_BASE + pid.0 * KERNEL_STACK_SLOT_STRIDE
+}
+
+/// Maps this process's kernel stack pages into `address_space`, leaving
+/// the page at the slot's base address unmapped as a guard page.
+fn map_kernel_stack(pid: Pid, address_space: &AddressSpace) -> Result<(), MapError> {
+    let mut allocator = GlobalFrameAllocator;
+    let slot_base = kernel_stack_slot_base(pid);
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    for i in 1..=KERNEL_STACK_PAGES {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
+        let frame = allocator.allocate_frame().ok_or(MapError::OutOfMemory)?;
+        address_space.map(page, frame, flags)?;
+    }
+    Ok(())
+}
+
 pub struct Process {
     pub pid: Pid,
     pub address_space: AddressSpace,
     pub trap_frame: TrapFrame,
-    /// Boxed as a slice (not an inline array) specifically so
-    /// construction never materializes 16 KiB on the *current* stack
-    /// before moving it to the heap — `vec![0; N]` writes straight into
-    /// the new heap allocation.
-    kernel_stack: Box<[u8]>,
     pub cap_table: CapTable,
     pub state: ProcessState,
 }
 
 impl Process {
     pub fn kernel_stack_top(&self) -> VirtAddr {
-        VirtAddr::from_ptr(self.kernel_stack.as_ptr()) + self.kernel_stack.len() as u64
+        VirtAddr::new(kernel_stack_slot_base(self.pid) + (1 + KERNEL_STACK_PAGES) * 4096)
     }
 
     /// Core constructor: an address space plus an entry point becomes a
@@ -69,13 +95,14 @@ impl Process {
                 .map_err(|_| "failed to map user stack")?;
         }
 
+        map_kernel_stack(pid, &address_space).map_err(|_| "failed to map kernel stack")?;
+
         let trap_frame = TrapFrame::initial_user_frame(entry, stack_top);
 
         Ok(Self {
             pid,
             address_space,
             trap_frame,
-            kernel_stack: vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice(),
             cap_table: CapTable::new(),
             state: ProcessState::Ready,
         })
