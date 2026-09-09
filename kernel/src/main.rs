@@ -6,10 +6,13 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod arch;
 #[macro_use]
 mod earlycon;
 mod lang_items;
+mod memory;
 
 use core::arch::asm;
 use limine::request::{
@@ -105,6 +108,41 @@ extern "C" fn _start() -> ! {
     }
     if RSDP_REQUEST.response().is_some() {
         earlyprintln!("[boot] RSDP received");
+    }
+
+    let hhdm_offset = x86_64::VirtAddr::new(
+        HHDM_REQUEST
+            .response()
+            .expect("Limine did not honor the HHDM request")
+            .offset,
+    );
+    let memmap_entries = MEMMAP_REQUEST
+        .response()
+        .expect("Limine did not honor the memory map request")
+        .entries();
+    unsafe {
+        memory::init(hhdm_offset, memmap_entries);
+    }
+    earlyprintln!("[boot] memory management initialized (frame allocator, page mapper, heap)");
+
+    // Smoke test: if the heap allocator is wired up correctly, `Box` and
+    // `Vec` (backed by real physical frames mapped in the previous step)
+    // work exactly like they would with `std`.
+    {
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+
+        let boxed = Box::new(0x7e57u64);
+        assert_eq!(*boxed, 0x7e57);
+
+        let mut v = Vec::new();
+        for i in 0..1000u64 {
+            v.push(i);
+        }
+        assert_eq!(v.len(), 1000);
+        assert_eq!(v.iter().sum::<u64>(), 1000 * 999 / 2);
+
+        earlyprintln!("[boot] heap smoke test passed (Box + 1000-element Vec)");
     }
 
     earlyprintln!("TarnOS kernel skeleton alive, halting.");
