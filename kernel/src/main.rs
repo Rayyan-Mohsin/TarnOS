@@ -14,6 +14,8 @@ mod driver;
 mod earlycon;
 mod lang_items;
 mod memory;
+mod sync;
+mod task;
 
 use core::arch::asm;
 use limine::request::{
@@ -150,9 +152,14 @@ extern "C" fn _start() -> ! {
     driver::uart::write_bytes(b"[uart] real 16550 driver online, this line went through it\r\n");
     earlyprintln!("[boot] UART driver initialized, IRQ4 unmasked (type to test echo)");
 
-    earlyprintln!("TarnOS kernel skeleton alive, halting.");
+    let mut executor = task::executor::Executor::new();
+    executor.spawn(task::executor::Task::new(driver::uart::echo_task()));
+    earlyprintln!("[boot] async executor started (UART RX echo task spawned)");
+
+    earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
     loop {
+        executor.run_ready_tasks();
         unsafe {
             asm!("hlt", options(nomem, nostack));
         }

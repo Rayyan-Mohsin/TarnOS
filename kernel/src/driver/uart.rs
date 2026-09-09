@@ -5,11 +5,15 @@
 //! initialized), this does the real 16550 initialization sequence and
 //! checks LSR before every transmit — required on real hardware even
 //! though QEMU's emulation tolerates skipping it.
-use spin::Mutex;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+
 use x86_64::instructions::port::Port;
 
 use super::{CharDevice, Driver, InterruptHandler};
 use crate::arch::x86_64::interrupts;
+use crate::sync::SpinLock;
 
 const COM1_BASE: u16 = 0x3F8;
 
@@ -96,17 +100,23 @@ impl CharDevice for Uart16550 {
 
 impl InterruptHandler for Uart16550 {
     fn handle_irq(&mut self) {
-        // Echo every byte immediately as they arrive. This is a stopgap
-        // proving the interrupt -> driver path end to end; a later
-        // milestone task replaces it with a real async task woken via a
-        // `Waker` instead of doing the echo inline in interrupt context.
-        while let Some(byte) = self.try_read_byte() {
-            self.write_byte(byte);
+        // Only wake whoever is waiting — never touch the FIFO or run task
+        // code here. Reading the byte and echoing it back both happen at
+        // task-poll time (see `RxAvailable` / `echo_task` below), in the
+        // kernel idle loop, not in interrupt context.
+        if let Some(waker) = RX_WAKER.lock().take() {
+            waker.wake();
         }
     }
 }
 
-static COM1: Mutex<Uart16550> = Mutex::new(Uart16550::new(COM1_BASE));
+// `COM1` is locked from interrupt context (`handle_irq`, below) as well
+// as normal code (`write_bytes`), so it must use the interrupt-disabling
+// `SpinLock` rather than a plain `spin::Mutex` — otherwise normal code
+// holding the lock could be interrupted by the very ISR that also wants
+// it, deadlocking this core against itself.
+static COM1: SpinLock<Uart16550> = SpinLock::new(Uart16550::new(COM1_BASE));
+static RX_WAKER: SpinLock<Option<Waker>> = SpinLock::new(None);
 
 fn handle_irq() {
     COM1.lock().handle_irq();
@@ -123,4 +133,43 @@ pub fn init() {
 
 pub fn write_bytes(bytes: &[u8]) {
     COM1.lock().write_bytes(bytes);
+}
+
+pub fn write_byte(byte: u8) {
+    COM1.lock().write_byte(byte);
+}
+
+/// Resolves to the next received byte, exercising the full
+/// interrupt -> `Waker` -> executor -> driver path rather than polling.
+struct RxAvailable;
+
+impl Future for RxAvailable {
+    type Output = u8;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u8> {
+        if let Some(byte) = COM1.lock().try_read_byte() {
+            return Poll::Ready(byte);
+        }
+        // Register interest, then re-check: a byte (and the interrupt
+        // that would have woken us) may have arrived in the gap between
+        // the check above and this registration, and we would otherwise
+        // miss that wakeup and hang forever.
+        *RX_WAKER.lock() = Some(cx.waker().clone());
+        match COM1.lock().try_read_byte() {
+            Some(byte) => Poll::Ready(byte),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A standalone kernel task that echoes every received byte back out,
+/// entirely via the async interrupt -> waker -> executor -> driver path
+/// (no polling loop, no work done inside interrupt context) — proof that
+/// the executor's wake bridge actually works, not just that the UART can
+/// transmit and receive.
+pub async fn echo_task() {
+    loop {
+        let byte = RxAvailable.await;
+        write_byte(byte);
+    }
 }
