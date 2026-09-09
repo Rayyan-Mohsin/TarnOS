@@ -1,0 +1,9 @@
+# Applies only when a --target is explicitly given (kernel and userland/init,
+# both built against the custom JSON targets under targets/). xtask's own
+# host build never passes --target, so it is unaffected by this table.
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target-dir = "target"

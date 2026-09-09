@@ -1,0 +1,15 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+tarnos-abi = { path = "../../libs/tarnos-abi" }
+tarnos-rt = { path = "../../libs/tarnos-rt" }

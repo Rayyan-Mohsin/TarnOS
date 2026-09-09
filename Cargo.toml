@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "libs/tarnos-abi",
+    "libs/tarnos-rt",
+    "kernel",
+    "userland/init",
+]
+
+# The kernel and userland binaries build against custom no_std target JSONs
+# (see targets/) and are never built as part of the default workspace
+# selection for the host triple, since a plain `cargo build` at the
+# workspace root has no host-triple use for them. xtask drives their
+# builds explicitly with `--target targets/<...>.json -Zbuild-std=...`.
+default-members = ["xtask"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

@@ -1,0 +1,9 @@
+[package]
+name = "tarnos-abi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "tarnos_abi"
+path = "src/lib.rs"

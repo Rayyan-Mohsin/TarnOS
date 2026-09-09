@@ -1,0 +1,12 @@
+[package]
+name = "tarnos-rt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "tarnos_rt"
+path = "src/lib.rs"
+
+[dependencies]
+tarnos-abi = { path = "../tarnos-abi" }

@@ -1,0 +1,16 @@
+[package]
+name = "tarnos-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "tarnos-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+tarnos-abi = { path = "../libs/tarnos-abi" }
+limine = "0.6"
