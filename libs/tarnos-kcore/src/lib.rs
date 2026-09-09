@@ -25,5 +25,5 @@ pub mod ring;
 
 pub use bitmap::Bitmap;
 pub use captable::{CapTable, CapabilitySlot, Rights};
-pub use endpoint::{Slot, Waiter};
+pub use endpoint::{RecvOutcome, SendOutcome, Slot, Waiter};
 pub use ring::RingBuffer;

@@ -43,11 +43,12 @@ pub fn sys_send(cap: CapIndex, message: Message) -> Result<(), SyscallError> {
     }
 }
 
-/// Non-blocking receive: an empty endpoint returns
-/// `Err(SyscallError::WouldBlock)` rather than waiting — the kernel does
-/// not yet support suspending a process on `recv` (see the kernel's
-/// `ipc::endpoint` module docs), so a caller that wants to wait must
-/// retry itself, typically via [`sys_yield`] between attempts.
+/// Receives a message on `cap`, blocking (at the kernel level — this
+/// call simply doesn't return until a sender shows up) if none is
+/// already waiting. `Err` only for a genuine failure: the capability
+/// doesn't grant `RECV`, doesn't exist, or (see
+/// `SyscallError::ResourceExhausted`) the endpoint's bounded wait queue
+/// was already completely full.
 pub fn sys_recv(cap: CapIndex) -> Result<Message, SyscallError> {
     let retval: i64;
     let tag: u64;

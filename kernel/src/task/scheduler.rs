@@ -20,7 +20,11 @@ use crate::sync::SpinLock;
 use super::process::{Process, ProcessState};
 use super::Pid;
 
-const MAX_PROCESSES: usize = 16;
+/// Also the bound on how many processes can simultaneously be queued as
+/// waiters on a single `ipc::Endpoint` (see `ipc::endpoint`'s `Slot`) —
+/// there can never be more blocked senders or receivers on one endpoint
+/// than there are processes in existence at all.
+pub const MAX_PROCESSES: usize = 16;
 
 /// See `tarnos_kcore::RingBuffer`'s doc comment — the extracted,
 /// unit-tested version of what used to be a hand-copied ring buffer
@@ -174,6 +178,51 @@ pub fn on_syscall_yield(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     on_timer_tick(current_frame)
 }
 
+/// Picks the next ready process and switches to it, given `sched`'s lock
+/// already held. If none is ready yet, gives kernel tasks one drain —
+/// not zero, and not an unbounded retry loop — before finally halting:
+/// a task's poll (e.g. the console server receiving a message) can
+/// itself complete a rendezvous with a process that was `Blocked` on
+/// the other side (see `ipc::endpoint::Endpoint::wake_receiver`), which
+/// pushes that process into `ready` as a direct side effect of the
+/// drain, so a process can genuinely become schedulable only *because*
+/// of that one drain. Nothing en route to this function's two callers
+/// (a process terminating or blocking) allocates or holds another lock
+/// across the drain, so one pass is enough to observe everything it
+/// could produce — a second pass would only ever find the same, already
+/// re-checked, empty queue.
+fn switch_to_next_or_halt(
+    mut sched: crate::sync::SpinLockGuard<'_, Inner>,
+    halt_message: &str,
+) -> *mut TrapFrame {
+    if let Some(next_pid) = sched.ready.pop() {
+        return finish_switch(sched, next_pid);
+    }
+
+    drop(sched);
+    crate::task::executor::run_ready_tasks();
+    sched = SCHEDULER.lock();
+    if let Some(next_pid) = sched.ready.pop() {
+        return finish_switch(sched, next_pid);
+    }
+
+    drop(sched);
+    crate::earlyprintln!("{halt_message}");
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+fn finish_switch(mut sched: crate::sync::SpinLockGuard<'_, Inner>, next_pid: Pid) -> *mut TrapFrame {
+    let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
+    drop(sched);
+    maybe_print_switch(next_pid, rax, rbx);
+    crate::task::executor::run_ready_tasks();
+    frame_ptr
+}
+
 /// Drops the calling process (no frame to preserve — it isn't coming
 /// back) and switches to whichever process is next ready. If none are,
 /// this milestone has no idle process to fall back to, so it halts the
@@ -190,28 +239,7 @@ pub fn terminate_current_process() -> *mut TrapFrame {
     if let Some(current_pid) = sched.current.take() {
         sched.processes[current_pid.0 as usize] = None;
     }
-
-    let Some(next_pid) = sched.ready.pop() else {
-        drop(sched);
-        // One last chance for kernel tasks to react to whatever the
-        // exiting process just did (e.g. the console server processing
-        // a message `sys_send` handed off moments before this
-        // `sys_exit`) before interrupts — and with them, every future
-        // tick that would otherwise keep draining them — stop for good.
-        crate::task::executor::run_ready_tasks();
-        crate::earlyprintln!("[sched] last process exited, halting.");
-        loop {
-            unsafe {
-                core::arch::asm!("cli", "hlt", options(nomem, nostack));
-            }
-        }
-    };
-
-    let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
-    drop(sched);
-    maybe_print_switch(next_pid, rax, rbx);
-    crate::task::executor::run_ready_tasks();
-    frame_ptr
+    switch_to_next_or_halt(sched, "[sched] last process exited, halting.")
 }
 
 /// Called from the `SYS_EXIT` syscall path: exiting voluntarily is
@@ -230,6 +258,71 @@ pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
     let pid = sched.current?;
     let process = sched.processes[pid.0 as usize].as_mut()?;
     Some(f(process))
+}
+
+/// What to write into a blocked process's saved registers before waking
+/// it — the two ways a `SYS_SEND`/`SYS_RECV` that had to block can later
+/// complete. Built by whichever `ipc::Endpoint` operation displaces a
+/// `Waiter::Process`, since only it knows which of the two just happened
+/// and (for a receiver) what was actually delivered.
+pub enum WakeResult {
+    /// A blocked sender's message was just taken by a receiver.
+    SendCompleted,
+    /// A blocked receiver was just handed a message.
+    RecvCompleted { tag: u64, words: [u64; 3] },
+}
+
+/// Moves a `Blocked` process back to `Ready` and into the ready queue,
+/// having already written the syscall return value its blocked
+/// `SYS_SEND`/`SYS_RECV` should see once resumed. Called by
+/// `ipc::Endpoint` when a send or receive completes a rendezvous with a
+/// process that was blocked on the other side — `Endpoint` itself has no
+/// notion of a scheduler, so it hands the bookkeeping here instead of
+/// doing it directly. A no-op if `pid` no longer exists (e.g. it was
+/// killed by a fault while blocked — see `arch::x86_64::idt`).
+pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
+    let mut sched = SCHEDULER.lock();
+    let Some(process) = sched.processes[pid.0 as usize].as_mut() else {
+        return;
+    };
+    match result {
+        WakeResult::SendCompleted => {
+            process.trap_frame.rax = 0;
+        }
+        WakeResult::RecvCompleted { tag, words } => {
+            process.trap_frame.rax = 0;
+            process.trap_frame.rdi = tag;
+            process.trap_frame.rsi = words[0];
+            process.trap_frame.rdx = words[1];
+            process.trap_frame.r10 = words[2];
+        }
+    }
+    process.state = ProcessState::Ready;
+    sched.ready.push(pid);
+}
+
+/// Suspends the calling process inside a blocking `SYS_SEND`/`SYS_RECV`
+/// that found no partner ready: persists `current_frame` into the
+/// process's own `trap_frame` (so `wake_blocked_process` can resume it
+/// later, exactly like a preempted process's frame is persisted in
+/// `on_timer_tick`), marks it `Blocked`, and — the one thing that
+/// actually distinguishes this from an ordinary preemption — does *not*
+/// push it back into the ready queue, so it can never be scheduled again
+/// until something wakes it. Switches to whatever's next ready exactly
+/// like `terminate_current_process`, including the same "nothing left
+/// to run" halt if every other process is also blocked or gone.
+pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    let mut sched = SCHEDULER.lock();
+    if let Some(current_pid) = sched.current {
+        if let Some(process) = sched.processes[current_pid.0 as usize].as_mut() {
+            // SAFETY: `current_frame` is a valid, fully-initialized
+            // TrapFrame -- it's the same frame the syscall entry
+            // trampoline built for this process's own trap.
+            process.trap_frame = unsafe { *current_frame };
+            process.state = ProcessState::Blocked;
+        }
+    }
+    switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
 }
 
 /// Starts running processes: picks the first ready one and resumes it.

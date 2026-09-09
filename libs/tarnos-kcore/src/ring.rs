@@ -5,21 +5,28 @@
 //! heap allocator's lock is not safe to touch (see
 //! `tarnos-kernel`'s `task::executor` and `task::scheduler`, both of
 //! which had their own hand-copied version of exactly this type before
-//! it was extracted here).
+//! it was extracted here) — or a bounded wait queue that must never
+//! silently grow into an unbounded buffer (`tarnos-kernel`'s
+//! `ipc::endpoint::Endpoint`).
 
 /// A FIFO queue over `N` slots, backed by a fixed-size array — no heap
 /// allocation, ever. `push` on a full buffer fails rather than growing;
 /// `pop` on an empty one returns `None` rather than blocking.
+///
+/// Works for any `T`, not just `Copy` types: initializing the backing
+/// array uses an inline `const` repeat (`[const { None }; N]`) rather
+/// than the ordinary array-repeat expression, which is what would
+/// otherwise force a `T: Copy` bound here.
 pub struct RingBuffer<T, const N: usize> {
     buffer: [Option<T>; N],
     head: usize,
     len: usize,
 }
 
-impl<T: Copy, const N: usize> RingBuffer<T, N> {
+impl<T, const N: usize> RingBuffer<T, N> {
     pub const fn new() -> Self {
         Self {
-            buffer: [None; N],
+            buffer: [const { None }; N],
             head: 0,
             len: 0,
         }
@@ -61,7 +68,7 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     }
 }
 
-impl<T: Copy, const N: usize> Default for RingBuffer<T, N> {
+impl<T, const N: usize> Default for RingBuffer<T, N> {
     fn default() -> Self {
         Self::new()
     }
@@ -127,5 +134,17 @@ mod tests {
         assert_eq!(q.len(), 2);
         q.pop();
         assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn works_for_non_copy_types() {
+        // `String` is not `Copy` -- this compiling and passing is the
+        // actual point of the test.
+        let mut q: RingBuffer<String, 2> = RingBuffer::new();
+        assert!(q.push(String::from("a")));
+        assert!(q.push(String::from("b")));
+        assert!(!q.push(String::from("c")));
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        assert_eq!(q.pop().as_deref(), Some("b"));
     }
 }

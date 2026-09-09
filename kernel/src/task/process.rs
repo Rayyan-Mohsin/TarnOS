@@ -14,6 +14,11 @@ use super::Pid;
 pub enum ProcessState {
     Ready,
     Running,
+    /// Suspended inside `SYS_SEND`/`SYS_RECV` with no partner ready —
+    /// deliberately not in the scheduler's ready queue (that's what
+    /// distinguishes this from an ordinary preemption) until
+    /// `task::scheduler::wake_blocked_process` moves it back to `Ready`.
+    Blocked,
 }
 
 const KERNEL_STACK_PAGES: u64 = 4; // 16 KiB

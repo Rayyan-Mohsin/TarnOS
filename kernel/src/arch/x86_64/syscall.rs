@@ -20,7 +20,10 @@ use x86_64::VirtAddr;
 
 use super::context_switch::TrapFrame;
 use super::gdt;
-use crate::ipc::{KernelObjectRef, Rights};
+use crate::ipc::endpoint::{RecvResult, SendResult};
+use crate::ipc::{Endpoint, KernelObjectRef, Rights};
+use crate::task::scheduler;
+use crate::task::Pid;
 
 /// The kernel stack top for whichever process is about to run — updated
 /// by the scheduler on every switch, alongside `gdt::set_kernel_stack`.
@@ -134,21 +137,10 @@ fn syscall_entry_addr() -> VirtAddr {
 extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
     match regs.rax {
-        SYS_YIELD => crate::task::scheduler::on_syscall_yield(frame),
-        SYS_SEND => {
-            regs.rax = sys_send(regs) as u64;
-            frame
-        }
-        SYS_RECV => {
-            let (retval, tag, words) = sys_recv(regs);
-            regs.rax = retval as u64;
-            regs.rdi = tag;
-            regs.rsi = words[0];
-            regs.rdx = words[1];
-            regs.r10 = words[2];
-            frame
-        }
-        SYS_EXIT => crate::task::scheduler::on_syscall_exit(frame),
+        SYS_YIELD => scheduler::on_syscall_yield(frame),
+        SYS_SEND => sys_send(frame),
+        SYS_RECV => sys_recv(frame),
+        SYS_EXIT => scheduler::on_syscall_exit(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -156,55 +148,82 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     }
 }
 
-fn sys_send(regs: &TrapFrame) -> i64 {
+/// Resolves `cap_index` against the calling process's own table with
+/// `required` rights, returning a cloned handle to the endpoint plus the
+/// calling `Pid`. Kept to a short, self-contained critical section
+/// (borrowing the process only long enough to clone an `Arc` out of it)
+/// specifically so the actual send/recv below — which may call back into
+/// `task::scheduler` to wake a *different* blocked process — never runs
+/// while still holding the scheduler's lock `with_current_process`
+/// itself takes; doing both under one lock would be a single-core
+/// self-deadlock the moment a wake-up needs that same lock.
+fn resolve_endpoint(
+    cap_index: CapIndex,
+    required: Rights,
+) -> Result<(alloc::sync::Arc<Endpoint>, Pid), SyscallError> {
+    scheduler::with_current_process(|process| {
+        let slot = process.cap_table.lookup(cap_index, required)?;
+        let KernelObjectRef::Endpoint(endpoint) = &slot.object;
+        Ok((endpoint.clone(), process.pid))
+    })
+    .unwrap_or(Err(SyscallError::BadCapability))
+}
+
+fn sys_send(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
     let cap_index = CapIndex(regs.rdi as u32);
     let message = Message::new(regs.rsi, [regs.rdx, regs.r10, regs.r8, regs.r9]);
 
-    let result = crate::task::scheduler::with_current_process(|process| {
-        let slot = process.cap_table.lookup(cap_index, Rights::SEND)?;
-        let KernelObjectRef::Endpoint(endpoint) = &slot.object;
-        if endpoint.try_send(message, process.pid) {
-            Ok(())
-        } else {
-            // Blocking send (no receiver waiting) is not implemented
-            // this milestone — see ipc::endpoint's module docs. Every
-            // path this milestone exercises guarantees a receiver is
-            // already waiting, so this is not expected to trigger.
-            Err(SyscallError::WouldBlock)
+    let (endpoint, pid) = match resolve_endpoint(cap_index, Rights::SEND) {
+        Ok(pair) => pair,
+        Err(e) => {
+            regs.rax = e.as_retval() as u64;
+            return frame;
         }
-    });
+    };
 
-    match result {
-        Some(Ok(())) => 0,
-        Some(Err(e)) => e.as_retval(),
-        None => SyscallError::BadCapability.as_retval(),
+    match endpoint.try_send(message, pid) {
+        SendResult::Delivered => {
+            regs.rax = 0;
+            frame
+        }
+        // No receiver was ready: this process is now queued as a
+        // waiting sender and must actually suspend until one arrives.
+        SendResult::Blocked => scheduler::block_current_process(frame),
+        SendResult::QueueFull => {
+            regs.rax = SyscallError::ResourceExhausted.as_retval() as u64;
+            frame
+        }
     }
 }
 
-/// Returns `(retval, tag, words[0..3])` — only 3 of the 4 message words
-/// fit back in registers on return (RAX carries the status instead of a
-/// 5th word), matching this milestone's demo, which only ever needs to
-/// carry a short greeting string back out.
-fn sys_recv(regs: &TrapFrame) -> (i64, u64, [u64; 3]) {
+fn sys_recv(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
     let cap_index = CapIndex(regs.rdi as u32);
 
-    let result = crate::task::scheduler::with_current_process(|process| {
-        let slot = process.cap_table.lookup(cap_index, Rights::RECV)?;
-        let KernelObjectRef::Endpoint(endpoint) = &slot.object;
-        // Non-blocking only this milestone: a process blocking here
-        // would need the scheduler to suspend it and later re-wake it
-        // when a sender arrives, which nothing in this milestone's demo
-        // exercises (see ipc::endpoint's module docs on `Waiter::Process`).
-        endpoint.try_recv_nonblocking().ok_or(SyscallError::WouldBlock)
-    });
+    let (endpoint, pid) = match resolve_endpoint(cap_index, Rights::RECV) {
+        Ok(pair) => pair,
+        Err(e) => {
+            regs.rax = e.as_retval() as u64;
+            return frame;
+        }
+    };
 
-    match result {
-        Some(Ok(message)) => (
-            0,
-            message.tag,
-            [message.words[0], message.words[1], message.words[2]],
-        ),
-        Some(Err(e)) => (e.as_retval(), 0, [0; 3]),
-        None => (SyscallError::BadCapability.as_retval(), 0, [0; 3]),
+    match endpoint.try_recv(pid) {
+        RecvResult::Delivered(message) => {
+            regs.rax = 0;
+            regs.rdi = message.tag;
+            regs.rsi = message.words[0];
+            regs.rdx = message.words[1];
+            regs.r10 = message.words[2];
+            frame
+        }
+        // No sender was ready: this process is now queued as a waiting
+        // receiver and must actually suspend until one arrives.
+        RecvResult::Blocked => scheduler::block_current_process(frame),
+        RecvResult::QueueFull => {
+            regs.rax = SyscallError::ResourceExhausted.as_retval() as u64;
+            frame
+        }
     }
 }
