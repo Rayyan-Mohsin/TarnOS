@@ -166,8 +166,19 @@ impl Executor {
             return;
         }
 
-        while let Some(id) = READY_QUEUE.lock().pop() {
-            self.poll_task(id);
+        loop {
+            // Deliberately not `while let Some(id) = READY_QUEUE.lock().pop()`:
+            // a `while let` scrutinee's temporaries live for the whole loop
+            // body, which would hold this lock across `poll_task` — and
+            // polling a task can itself wake another one, re-entering this
+            // same lock and deadlocking the core against itself. Binding
+            // the popped value first lets the guard drop at the end of the
+            // `let` statement, before `poll_task` runs.
+            let id = READY_QUEUE.lock().pop();
+            match id {
+                Some(id) => self.poll_task(id),
+                None => break,
+            }
         }
     }
 

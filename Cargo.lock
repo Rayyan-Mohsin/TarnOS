@@ -99,6 +99,7 @@ version = "0.1.0"
 name = "tarnos-kernel"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "limine",
  "linked_list_allocator",
  "pic8259",

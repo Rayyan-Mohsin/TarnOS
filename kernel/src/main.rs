@@ -12,6 +12,7 @@ mod arch;
 mod driver;
 #[macro_use]
 mod earlycon;
+mod ipc;
 mod lang_items;
 mod memory;
 mod sync;
@@ -155,6 +156,55 @@ extern "C" fn _start() -> ! {
     let mut executor = task::executor::Executor::new();
     executor.spawn(task::executor::Task::new(driver::uart::echo_task()));
     earlyprintln!("[boot] async executor started (UART RX echo task spawned)");
+
+    // IPC smoke test: capability table rights-checking, plus the
+    // rendezvous endpoint exercised in both wait orderings — the
+    // scenario the real init -> console_server handoff (a later
+    // milestone task) relies on, and its mirror image, both covered here
+    // with two kernel tasks standing in for the eventual process.
+    {
+        use alloc::sync::Arc;
+        use ipc::{CapTable, CapabilitySlot, Endpoint, KernelObjectRef, Rights};
+        use tarnos_abi::{CapIndex, Message, CONSOLE_CAP};
+
+        let probe_endpoint = Arc::new(Endpoint::new());
+        let mut table = CapTable::new();
+        table.insert(
+            CONSOLE_CAP,
+            CapabilitySlot {
+                object: KernelObjectRef::Endpoint(probe_endpoint),
+                rights: Rights::SEND,
+            },
+        );
+        assert!(table.lookup(CONSOLE_CAP, Rights::SEND).is_ok());
+        assert!(table.lookup(CONSOLE_CAP, Rights::RECV).is_err());
+        assert!(table.get(CapIndex(99)).is_err());
+        earlyprintln!("[boot] capability table smoke test passed");
+
+        // Receiver spawned (and so polled) before the sender.
+        let receiver_first = Arc::new(Endpoint::new());
+        let rf_recv = receiver_first.clone();
+        executor.spawn(task::executor::Task::new(async move {
+            let msg = rf_recv.recv().await;
+            assert_eq!(msg.tag, 111);
+            earlyprintln!("[boot] IPC smoke test (receiver-first) passed");
+        }));
+        executor.spawn(task::executor::Task::new(async move {
+            receiver_first.send(Message::new(111, [0; 4])).await;
+        }));
+
+        // Sender spawned (and so polled) before the receiver.
+        let sender_first = Arc::new(Endpoint::new());
+        let sf_send = sender_first.clone();
+        executor.spawn(task::executor::Task::new(async move {
+            sf_send.send(Message::new(222, [0; 4])).await;
+        }));
+        executor.spawn(task::executor::Task::new(async move {
+            let msg = sender_first.recv().await;
+            assert_eq!(msg.tag, 222);
+            earlyprintln!("[boot] IPC smoke test (sender-first) passed");
+        }));
+    }
 
     earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
