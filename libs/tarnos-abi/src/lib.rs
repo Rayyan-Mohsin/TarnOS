@@ -111,6 +111,20 @@ impl SyscallError {
     pub const fn as_retval(self) -> i64 {
         -(self as u64 as i64)
     }
+
+    /// Decodes a negative syscall return value back into an error.
+    /// `retval` must be `< 0`; an unrecognized code maps to
+    /// [`SyscallError::NoSuchSyscall`] rather than panicking, since a
+    /// future kernel might return codes this build of `tarnos-abi`
+    /// doesn't know about yet.
+    pub fn from_retval(retval: i64) -> Self {
+        match (-retval) as u64 {
+            2 => SyscallError::BadCapability,
+            3 => SyscallError::PermissionDenied,
+            4 => SyscallError::WouldBlock,
+            _ => SyscallError::NoSuchSyscall,
+        }
+    }
 }
 
 /// Which ABI a process's syscalls are dispatched against.
