@@ -6,11 +6,19 @@
 //! `docs/adr/0003-ipc-message-format.md` for the full rationale.
 //!
 //! Both sides can wait either as a kernel task (a `Waker`, driven by the
-//! executor) or — once the scheduler exists — as a process (a `Pid`,
-//! driven by the scheduler). `Endpoint` itself only records which kind of
-//! waiter is pending and delivers to it; actually suspending a *process*
-//! until then is the syscall layer's job; a *task* suspends itself simply
-//! by returning [`core::task::Poll::Pending`] from its `Future::poll`.
+//! executor) or as a process (a `Pid`, driven by the scheduler).
+//! `Endpoint` itself only records which kind of waiter is pending and
+//! delivers to it; actually suspending a *process* until then would be
+//! the syscall layer's job (`arch::x86_64::syscall`), while a *task*
+//! suspends itself simply by returning [`core::task::Poll::Pending`]
+//! from its `Future::poll`. This milestone's syscall path only ever
+//! calls [`Endpoint::try_send`] (`sender_pid` names who to record if no
+//! receiver is waiting, but nothing yet re-wakes a blocked sender
+//! process) and the non-blocking [`Endpoint::try_recv_nonblocking`] —
+//! actually blocking a process on `recv` needs the scheduler to suspend
+//! and later resume it, which nothing in this milestone's demo exercises
+//! (the demo's boot ordering guarantees a receiver is always already
+//! waiting, so a process never actually needs to block on `send` either).
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -149,6 +157,30 @@ impl Endpoint {
     /// `main.rs`) and treat `false` as an error rather than a real block.
     pub fn try_send(&self, message: Message, sender_pid: Pid) -> bool {
         self.try_send_inner(message, Waiter::Process(sender_pid))
+    }
+
+    /// Non-blocking receive for the syscall path: returns a message if a
+    /// sender is already waiting, or `None` without registering any
+    /// waiter otherwise. A process cannot usefully "wait" here yet — see
+    /// [`Waiter::Process`]'s note on how a blocked process would need
+    /// the scheduler's cooperation to be woken later, which nothing in
+    /// this milestone's demo exercises — so this never blocks; it only
+    /// checks.
+    pub fn try_recv_nonblocking(&self) -> Option<Message> {
+        let mut guard = self.slot.lock();
+        match &*guard {
+            Slot::SenderWaiting { .. } => {
+                let Slot::SenderWaiting { message, sender } =
+                    core::mem::replace(&mut *guard, Slot::Empty)
+                else {
+                    unreachable!()
+                };
+                drop(guard);
+                sender.wake_if_task();
+                Some(message.into_inline())
+            }
+            _ => None,
+        }
     }
 
     /// Async send for kernel-task callers: suspends the calling task

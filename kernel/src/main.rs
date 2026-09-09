@@ -224,49 +224,99 @@ extern "C" fn _start() -> ! {
 
     earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
-    // Scheduler/context-switch smoke test: two ring-3 "dummy processes"
-    // (each just a tight, self-contained asm loop bumping one register —
-    // no ELF, no syscalls, nothing that depends on later milestone
-    // tasks), preempted purely by the timer interrupt. Isolates
-    // scheduler + context-switch correctness from ELF/syscall
-    // complexity, per the milestone plan. Real ELF-loaded processes are
-    // wired up in a later milestone task, reusing this same
-    // Process::new/on_timer_tick machinery unchanged.
+    // SYSCALL smoke test: two ring-3 "dummy processes" exercising every
+    // syscall this milestone defines. C sends a tagged message then
+    // exits (SYS_SEND, SYS_EXIT); D polls for it non-blockingly,
+    // yielding between attempts until it arrives (SYS_RECV, SYS_YIELD),
+    // then parks with the received tag in rbx — observable the same way
+    // the milestone-12 scheduler test observed its dummy processes'
+    // registers, proving the message's payload actually made the round
+    // trip through the syscall ABI and the rendezvous endpoint, not just
+    // that the instructions didn't crash. Both processes share one
+    // capability slot 0, pointing at the same endpoint with the rights
+    // each side actually needs (never both — that's the point of
+    // capabilities: C cannot receive on this endpoint, D cannot send).
     //
     // scheduler::start() never returns: once real processes exist, the
     // machine is theirs, driven by the timer's forced preemption between
-    // them — the kernel's own idle loop below never runs again after
+    // them — the kernel's own idle loop above never runs again after
     // this point. That's a real, if simplified, limitation of this
     // milestone (kernel tasks and processes aren't yet time-sliced
-    // against each other) rather than a bug; a later milestone task
+    // against processes) rather than a bug; a later milestone task
     // integrates them.
-    let pid_a = task::scheduler::allocate_pid();
-    let process_a =
-        task::process::Process::new_dummy(pid_a, dummy_process_a).expect("failed to build dummy process A");
-    task::scheduler::spawn(process_a);
+    let shared_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
 
-    let pid_b = task::scheduler::allocate_pid();
-    let process_b =
-        task::process::Process::new_dummy(pid_b, dummy_process_b).expect("failed to build dummy process B");
-    task::scheduler::spawn(process_b);
+    let pid_c = task::scheduler::allocate_pid();
+    let mut process_c = task::process::Process::new_dummy(pid_c, dummy_process_c)
+        .expect("failed to build dummy process C");
+    process_c.cap_table.insert(
+        tarnos_abi::CapIndex(0),
+        ipc::CapabilitySlot {
+            object: ipc::KernelObjectRef::Endpoint(shared_endpoint.clone()),
+            rights: ipc::Rights::SEND,
+        },
+    );
+    task::scheduler::spawn(process_c);
 
-    earlyprintln!("[boot] two dummy ring-3 processes spawned, starting scheduler...");
+    let pid_d = task::scheduler::allocate_pid();
+    let mut process_d = task::process::Process::new_dummy(pid_d, dummy_process_d)
+        .expect("failed to build dummy process D");
+    process_d.cap_table.insert(
+        tarnos_abi::CapIndex(0),
+        ipc::CapabilitySlot {
+            object: ipc::KernelObjectRef::Endpoint(shared_endpoint),
+            rights: ipc::Rights::RECV,
+        },
+    );
+    task::scheduler::spawn(process_d);
+
+    earlyprintln!("[boot] syscall smoke-test processes spawned, starting scheduler...");
     task::scheduler::start();
 }
 
-/// Self-contained: touches nothing but its own registers, so it fits
-/// comfortably within a single page and needs no working stack — a tight
-/// asm loop rather than ordinary Rust specifically to avoid the compiler
-/// introducing a prologue/epilogue or stack spills that would make the
-/// "one page, no stack needed" assumption fragile.
-unsafe extern "C" fn dummy_process_a() -> ! {
+/// Sends one tagged message on capability slot 0, then exits.
+/// Self-contained asm (not ordinary Rust) so it fits in a single page
+/// with no working stack, matching `Process::new_dummy`'s requirements.
+unsafe extern "C" fn dummy_process_c() -> ! {
     unsafe {
-        asm!("xor rax, rax", "2:", "add rax, 1", "jmp 2b", options(noreturn));
+        asm!(
+            "xor edi, edi",   // cap index 0
+            "mov esi, 12345", // tag
+            "xor edx, edx",
+            "xor r10d, r10d",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "mov eax, 1", // SYS_SEND
+            "syscall",
+            "xor edi, edi", // exit code 0
+            "mov eax, 3",   // SYS_EXIT
+            "syscall",
+            "2:",
+            "jmp 2b",
+            options(noreturn)
+        );
     }
 }
 
-unsafe extern "C" fn dummy_process_b() -> ! {
+/// Polls capability slot 0 for a message, yielding between non-blocking
+/// attempts, then parks with the received tag in `rbx` once one arrives.
+unsafe extern "C" fn dummy_process_d() -> ! {
     unsafe {
-        asm!("xor rbx, rbx", "2:", "add rbx, 1", "jmp 2b", options(noreturn));
+        asm!(
+            "2:",
+            "xor edi, edi", // cap index 0
+            "mov eax, 2",   // SYS_RECV
+            "syscall",
+            "test rax, rax",
+            "jz 3f",
+            "mov eax, 0", // SYS_YIELD
+            "syscall",
+            "jmp 2b",
+            "3:",
+            "mov rbx, rdi", // success: stash the received tag
+            "4:",
+            "jmp 4b",
+            options(noreturn)
+        );
     }
 }

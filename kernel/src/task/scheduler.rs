@@ -117,6 +117,10 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
         process.address_space.activate();
         gdt::set_kernel_stack(kernel_stack_top);
     }
+    // SYSCALL (unlike an interrupt) never switches stacks on its own, so
+    // the syscall entry trampoline needs its own record of "the current
+    // kernel stack," read directly rather than via the TSS.
+    crate::arch::x86_64::syscall::set_syscall_kernel_stack(kernel_stack_top);
 
     (
         &mut process.trap_frame as *mut TrapFrame,
@@ -175,6 +179,52 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     drop(sched);
     maybe_print_switch(next_pid, rax, rbx);
     frame_ptr
+}
+
+/// Called from the `SYS_YIELD` syscall path. Voluntarily giving up the
+/// timeslice is, from the scheduler's point of view, exactly the same
+/// event as the timer forcing a preemption — so this simply *is*
+/// [`on_timer_tick`], reused rather than duplicated.
+pub fn on_syscall_yield(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    on_timer_tick(current_frame)
+}
+
+/// Called from the `SYS_EXIT` syscall path: drops the calling process
+/// (no frame to preserve — it isn't coming back) and switches to
+/// whichever process is next ready. If none are, this milestone has no
+/// idle process to fall back to, so it halts the core here rather than
+/// returning into the caller's now-invalid stack.
+pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    let mut sched = SCHEDULER.lock();
+    if let Some(current_pid) = sched.current.take() {
+        sched.processes[current_pid.0 as usize] = None;
+    }
+
+    let Some(next_pid) = sched.ready.pop() else {
+        drop(sched);
+        crate::earlyprintln!("[sched] last process exited, halting.");
+        loop {
+            unsafe {
+                core::arch::asm!("cli", "hlt", options(nomem, nostack));
+            }
+        }
+    };
+
+    let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
+    drop(sched);
+    maybe_print_switch(next_pid, rax, rbx);
+    frame_ptr
+}
+
+/// Runs `f` against the currently-running process, e.g. to resolve a
+/// capability index during a syscall. `None` if there is no current
+/// process (should not happen when called from the syscall path, which
+/// only runs while some process is executing).
+pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current?;
+    let process = sched.processes[pid.0 as usize].as_mut()?;
+    Some(f(process))
 }
 
 /// Starts running processes: picks the first ready one and resumes it.

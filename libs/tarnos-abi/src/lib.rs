@@ -100,6 +100,10 @@ pub enum SyscallError {
     BadCapability = 2,
     /// The capability's rights do not permit the requested operation.
     PermissionDenied = 3,
+    /// The operation would need to block (e.g. `recv` with no sender
+    /// waiting), which this milestone's non-blocking-only syscall path
+    /// does not support.
+    WouldBlock = 4,
 }
 
 impl SyscallError {
