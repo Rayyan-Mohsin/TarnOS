@@ -25,10 +25,12 @@ fn main() {
         "test-fault-isolation" => test_fault_isolation(),
         "test-blocking-ipc" => test_blocking_ipc(),
         "test-double-send" => test_double_send(),
+        "test-uefi-boot" => test_uefi_boot(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
-            .and_then(|_| test_double_send()),
+            .and_then(|_| test_double_send())
+            .and_then(|_| test_uefi_boot()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -59,8 +61,10 @@ fn print_usage() {
          \x20                    no receiver ready, then resume once one arrives\n\
          \x20 test-double-send      Confirm two senders with no receiver both queue\n\
          \x20                    instead of panicking (the historical bug this milestone fixed)\n\
+         \x20 test-uefi-boot        Confirm the normal boot sequence also completes\n\
+         \x20                    end to end via UEFI/OVMF, not just BIOS\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
-         \x20                    and test-double-send in sequence"
+         \x20                    test-double-send, and test-uefi-boot in sequence"
     );
 }
 
@@ -266,17 +270,24 @@ fn iso(release: bool, kernel_features: &[&str]) -> Result<(), String> {
 }
 
 fn find_ovmf_code() -> Option<PathBuf> {
-    ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/ovmf/OVMF.fd"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/ovmf/OVMF.fd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
 fn find_ovmf_vars_template() -> Option<PathBuf> {
-    ["/usr/share/OVMF/OVMF_VARS_4M.fd"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
 fn run(flags: &[String]) -> Result<(), String> {
@@ -337,14 +348,20 @@ fn run(flags: &[String]) -> Result<(), String> {
 }
 
 /// Builds the kernel with `kernel_features` enabled, boots it in QEMU
-/// with serial output redirected to `<build>/<log_name>`, waits a fixed
-/// window (these test scenarios have no way to signal "done" on their
-/// own — most end in a deliberate halt loop — so this kills QEMU after
-/// giving it time to reach that point rather than waiting for it to
-/// exit), and returns the captured log. Shared by every milestone-2
-/// integration test scenario below; each one builds with its own
-/// feature and applies its own assertions to the returned log.
-fn run_scenario(kernel_features: &[&str], log_name: &str, timeout_secs: u64) -> Result<String, String> {
+/// (BIOS, unless `uefi` is set) with serial output redirected to
+/// `<build>/<log_name>`, waits a fixed window (these test scenarios
+/// have no way to signal "done" on their own — most end in a deliberate
+/// halt loop — so this kills QEMU after giving it time to reach that
+/// point rather than waiting for it to exit), and returns the captured
+/// log. Shared by every milestone-2 integration test scenario below;
+/// each one builds with its own feature and applies its own assertions
+/// to the returned log.
+fn run_scenario(
+    kernel_features: &[&str],
+    log_name: &str,
+    timeout_secs: u64,
+    uefi: bool,
+) -> Result<String, String> {
     let root = workspace_root();
     iso(false, kernel_features)?;
 
@@ -352,24 +369,43 @@ fn run_scenario(kernel_features: &[&str], log_name: &str, timeout_secs: u64) -> 
     let log_path = root.join("build").join(log_name);
     let _ = std::fs::remove_file(&log_path);
 
-    let mut child = Command::new("qemu-system-x86_64")
-        .current_dir(&root)
-        .args([
-            "-M",
-            "q35",
-            "-m",
-            "512M",
-            "-serial",
-            &format!("file:{}", log_path.display()),
-            "-display",
-            "none",
-            "-cdrom",
-            iso_path.to_str().unwrap(),
-            "-boot",
-            "d",
-            "-no-reboot",
-            "-no-shutdown",
-        ])
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.current_dir(&root).args([
+        "-M",
+        "q35",
+        "-m",
+        "512M",
+        "-serial",
+        &format!("file:{}", log_path.display()),
+        "-display",
+        "none",
+        "-cdrom",
+        iso_path.to_str().unwrap(),
+        "-boot",
+        "d",
+        "-no-reboot",
+        "-no-shutdown",
+    ]);
+
+    if uefi {
+        let code = find_ovmf_code()
+            .ok_or("OVMF firmware not found (looked for /usr/share/OVMF/OVMF_CODE_4M.fd)")?;
+        let vars_template = find_ovmf_vars_template()
+            .ok_or("OVMF vars template not found (looked for /usr/share/OVMF/OVMF_VARS_4M.fd)")?;
+        // A name distinct from `run`'s own `OVMF_VARS.fd` copy, so a
+        // `test-uefi-boot` run doesn't race a concurrent `run --uefi`
+        // over the same file.
+        let vars_copy = root.join("build").join("OVMF_VARS_test.fd");
+        std::fs::copy(&vars_template, &vars_copy).map_err(|e| e.to_string())?;
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", vars_copy.display()),
+        ]);
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
 
@@ -398,6 +434,32 @@ fn assert_booted_once(log: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Boots the normal (no test feature) kernel via UEFI/OVMF and confirms
+/// it reaches the same end-to-end result as a BIOS boot: init's greeting
+/// arriving over the full syscall/capability/IPC path. `xtask run --uefi`
+/// already exercises this manually, but with no automated pass/fail
+/// signal and no fixed timeout (it would hang a CI job forever once the
+/// kernel reaches its terminal halt) — this is the permanent, CI-safe
+/// form of that same check, added after this milestone's earlier
+/// (BIOS-only) test-fault regression test shipped without a UEFI
+/// counterpart, even though an intermittent UEFI-only boot hang was one
+/// of the very issues this milestone's hardening work fixed.
+fn test_uefi_boot() -> Result<(), String> {
+    let log = run_scenario(&[], "uefi-boot-test.log", 8, true)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic on a normal UEFI boot".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to arrive over UEFI, same as it does over BIOS"
+                .to_string(),
+        );
+    }
+    println!("xtask: test-uefi-boot PASSED — normal boot completed end to end via UEFI/OVMF");
+    Ok(())
+}
+
 /// Builds the kernel with a deliberate page-fault-at-boot injected (the
 /// `fault-injection-test` feature — see `kernel/src/main.rs`), boots it,
 /// and checks the serial output for a clean panic + halt rather than a
@@ -409,7 +471,7 @@ fn assert_booted_once(log: &str) -> Result<(), String> {
 /// panic the whole kernel — see `test_fault_isolation` for the
 /// ring-3 (process-only) case.
 fn test_fault() -> Result<(), String> {
-    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 3)?;
+    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 5, false)?;
     assert_booted_once(&log)?;
     if !log.contains("[KERNEL PANIC]") || !log.contains("page fault") {
         return Err(
@@ -431,7 +493,7 @@ fn test_fault() -> Result<(), String> {
 /// from merely not crashing: the machine keeps doing useful work after
 /// a process misbehaves.
 fn test_fault_isolation() -> Result<(), String> {
-    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 3)?;
+    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 5, false)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err(
@@ -470,7 +532,7 @@ fn test_fault_isolation() -> Result<(), String> {
 /// a process can actually suspend and later resume, not merely that the
 /// demo's usual ordering happens to avoid ever needing to.
 fn test_blocking_ipc() -> Result<(), String> {
-    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 5)?;
+    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 8, false)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -495,7 +557,7 @@ fn test_blocking_ipc() -> Result<(), String> {
 /// nobody receiving panicked the kernel. Confirms both sends queue and
 /// are eventually delivered instead.
 fn test_double_send() -> Result<(), String> {
-    let log = run_scenario(&["double-send-test"], "double-send-test.log", 5)?;
+    let log = run_scenario(&["double-send-test"], "double-send-test.log", 8, false)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err(

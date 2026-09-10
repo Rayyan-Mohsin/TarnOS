@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A stale run for the same branch/PR is pure waste (build + a handful of
+# QEMU boots each take real minutes) -- cancel it once a newer push
+# supersedes it instead of letting both finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Picks up rust-toolchain.toml's pinned nightly + components
+      # (rust-src, llvm-tools, clippy) automatically -- rustup is
+      # preinstalled on GitHub's Ubuntu runners.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install system dependencies (xorriso, QEMU, OVMF)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso qemu-system-x86 ovmf
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Host-testable crates: pure logic extracted specifically so it
+      # doesn't need QEMU or a custom target to verify (see
+      # docs/adr/0002-0003 and libs/tarnos-kcore's own doc comments).
+      - name: Run host-side unit tests (tarnos-kcore, tarnos-abi)
+        run: cargo test -p tarnos-kcore -p tarnos-abi
+
+      - name: Clippy (host-buildable crates)
+        run: cargo clippy -p tarnos-kcore -p tarnos-abi --all-targets -- -D warnings
+
+      - name: Build kernel + init (cross-compiled, custom no_std targets)
+        run: cargo run -p xtask -- build
+
+      # Each of these boots a purpose-built kernel variant in QEMU
+      # (software emulation -- no KVM needed or available on a hosted
+      # runner) for a fixed window and asserts on the captured serial
+      # log; see xtask/src/main.rs's test_* functions for what each one
+      # actually checks.
+      - name: xtask test-fault (kernel-mode fault stays a clean panic)
+        run: cargo run -p xtask -- test-fault
+
+      - name: xtask test-fault-isolation (usermode fault kills only that process)
+        run: cargo run -p xtask -- test-fault-isolation
+
+      - name: xtask test-blocking-ipc (a process can genuinely block and resume)
+        run: cargo run -p xtask -- test-blocking-ipc
+
+      - name: xtask test-double-send (two senders queue instead of panicking)
+        run: cargo run -p xtask -- test-double-send
+
+      - name: xtask test-uefi-boot (normal boot also completes via UEFI/OVMF)
+        run: cargo run -p xtask -- test-uefi-boot
