@@ -72,19 +72,18 @@ constraint call sites must mind until `OutOfLine` exists.
 
 - Every IPC round trip this milestone is provably bounded: no kernel
   buffer, no allocation on the send/receive path, no message loss modulo
-  the caller's own logic (a duplicate `try_send` on an already-waiting
-  slot is a panic, not silent data loss).
-- A process-side `recv` with no sender waiting, or a process-side `send`
-  with no receiver waiting, cannot actually block yet — `Endpoint::try_send`
-  records the process as a waiting sender but nothing re-wakes it later,
-  and there's no `SyscallError::WouldBlock`-driven suspend/resume path
-  wired to the scheduler. This milestone's demo works around this by
-  construction (the console server is always polled to its first
-  `recv().await` before `init` is created, so a receiver is always
-  already present) rather than by handling the general case. Making a
-  process actually block on IPC — suspending it in the scheduler and
-  resuming it when `Endpoint` later delivers — is unimplemented and is
-  the next real IPC milestone.
+  the caller's own logic.
+- **Update (milestone 2):** the two gaps this section originally
+  described here — a duplicate `try_send` on an already-waiting slot
+  panicking instead of queueing, and a process-side `send`/`recv` with
+  no partner unable to actually block — are now closed. See
+  `docs/adr/0005-fault-isolation-and-blocking-ipc.md` for the design:
+  the sender side became a bounded FIFO queue, and a blocked process is
+  genuinely suspended (via `task::scheduler::block_current_process`) and
+  resumed with its answer already in its saved registers once a partner
+  arrives. The receiver side intentionally remains single-valued, for a
+  reason specific to how a `Task` waiter can retrieve a value at all —
+  see that ADR.
 - Any future POSIX/Linux syscall that needs to move more than 40 bytes
   (`read`, `write`, `mmap`-backed transfers) will need `OutOfLine` (or
   something like it) actually built out, plus a decision about how a
