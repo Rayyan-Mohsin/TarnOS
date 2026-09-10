@@ -18,6 +18,25 @@ bench = false
 # fault. Exercised by `cargo run -p xtask -- test-fault`, never enabled
 # for a normal build/run.
 fault-injection-test = []
+# Spawns two dummy ring-3 processes at boot instead of the real init:
+# one that immediately dereferences a bad pointer, one that immediately
+# exits cleanly. Confirms the fault kills only the offending process --
+# no kernel panic, and the survivor still reaches a clean exit. Exercised
+# by `cargo run -p xtask -- test-fault-isolation`.
+fault-isolation-test = []
+# Spawns the real init process but skips priming the console server as a
+# waiting receiver before init runs, forcing init's first sys_send to
+# find nobody ready and genuinely block. Confirms a process can suspend
+# and later resume correctly, rather than merely that the always-primed-
+# receiver demo path happens to work. Exercised by
+# `cargo run -p xtask -- test-blocking-ipc`.
+blocking-ipc-test = []
+# Spawns two dummy ring-3 processes that both send on the same endpoint
+# before a receiver is ever polled, reproducing the historical bug where
+# a second sender with nobody receiving panicked the kernel. Confirms
+# both sends queue and are eventually delivered instead. Exercised by
+# `cargo run -p xtask -- test-double-send`.
+double-send-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

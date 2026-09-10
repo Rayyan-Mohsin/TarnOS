@@ -6,8 +6,9 @@ use x86_64::VirtAddr;
 use crate::arch::x86_64::context_switch::TrapFrame;
 use crate::ipc::CapTable;
 use crate::memory::phys::GlobalFrameAllocator;
-use crate::memory::virt::{self, AddressSpace, MapError};
+use crate::memory::virt::{self, AddressSpace};
 
+use super::scheduler::MAX_PROCESSES;
 use super::Pid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,16 +32,29 @@ const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 /// Fixed virtual base for per-process kernel stacks, one
 /// `KERNEL_STACK_SLOT_STRIDE`-sized slot per `Pid` — chosen clear of the
 /// kernel heap (`0xffff_9000_0000_0000`) and the double-fault stack
-/// (`0xffff_9400_0000_0000`, see `arch::x86_64::gdt`). Mapped through
-/// each process's own `AddressSpace` rather than carved from the heap
-/// (as earlier milestones did with a plain `Box<[u8]>`) specifically so
-/// a guard page can sit immediately below every stack: a kernel-stack
-/// overflow reliably page-faults instead of silently corrupting whatever
-/// heap allocation happened to land next to it. Never accessed except
-/// while its owning process's address space is active (see
-/// `task::scheduler::switch_to`), so — unlike the heap — this mapping
-/// only ever needs to exist in that one process's own page tables, not
-/// shared with anyone else's.
+/// (`0xffff_9400_0000_0000`, see `arch::x86_64::gdt`).
+///
+/// Mapped into the *shared* kernel half via [`init_kernel_stacks`] —
+/// eagerly, for every one of the `MAX_PROCESSES` possible slots, once at
+/// boot, before any process's own `AddressSpace` is ever created —
+/// rather than lazily into each process's own address space the way an
+/// earlier version of this milestone did it. That first attempt looked
+/// reasonable (a stack is "owned" by one process, only ever touched
+/// while that process's CR3 is active) but was wrong in a way that only
+/// showed up once a second real process existed to switch to: the code
+/// that performs a switch — `task::scheduler::switch_to` and its callers
+/// — is still executing *on the outgoing process's own kernel stack*
+/// for a while after `AddressSpace::activate()` changes CR3. If that
+/// stack only existed in the outgoing process's own page tables, the
+/// very next stack access after the switch (a `push`, a local variable,
+/// the next `ret`) page-faults, because the address the CPU's RSP
+/// already points at just became unmapped out from under it — observed
+/// in practice as a double fault immediately after a fault handler
+/// killed one process and tried to switch to another. Mapping every
+/// slot into the shared kernel half up front — exactly like the heap
+/// and the double-fault stack — means every process's page tables see
+/// every stack identically, so a CR3 switch can never make the
+/// currently-in-use stack disappear.
 const KERNEL_STACKS_BASE: u64 = 0xffff_9800_0000_0000;
 const KERNEL_STACK_SLOT_STRIDE: u64 = 4096 * (1 + KERNEL_STACK_PAGES); // guard page + stack
 
@@ -48,18 +62,24 @@ fn kernel_stack_slot_base(pid: Pid) -> u64 {
     KERNEL_STACKS_BASE + pid.0 * KERNEL_STACK_SLOT_STRIDE
 }
 
-/// Maps this process's kernel stack pages into `address_space`, leaving
-/// the page at the slot's base address unmapped as a guard page.
-fn map_kernel_stack(pid: Pid, address_space: &AddressSpace) -> Result<(), MapError> {
+/// Maps every possible process's kernel stack (with its guard page) into
+/// the shared kernel half. Must run once, after `memory::init()` and
+/// before the first `AddressSpace::new()` call — see the module-level
+/// doc comment on [`KERNEL_STACKS_BASE`] for why eager and shared,
+/// rather than lazy and per-process, is load-bearing here.
+pub fn init_kernel_stacks() {
     let mut allocator = GlobalFrameAllocator;
-    let slot_base = kernel_stack_slot_base(pid);
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    for i in 1..=KERNEL_STACK_PAGES {
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
-        let frame = allocator.allocate_frame().ok_or(MapError::OutOfMemory)?;
-        address_space.map(page, frame, flags)?;
+    for slot in 0..MAX_PROCESSES as u64 {
+        let slot_base = KERNEL_STACKS_BASE + slot * KERNEL_STACK_SLOT_STRIDE;
+        for i in 1..=KERNEL_STACK_PAGES {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
+            let frame = allocator
+                .allocate_frame()
+                .expect("out of memory mapping kernel stacks");
+            virt::map(page, frame, flags).expect("failed to map a kernel stack page");
+        }
     }
-    Ok(())
 }
 
 pub struct Process {
@@ -99,8 +119,6 @@ impl Process {
                 .map(page, frame, flags)
                 .map_err(|_| "failed to map user stack")?;
         }
-
-        map_kernel_stack(pid, &address_space).map_err(|_| "failed to map kernel stack")?;
 
         let trap_frame = TrapFrame::initial_user_frame(entry, stack_top);
 

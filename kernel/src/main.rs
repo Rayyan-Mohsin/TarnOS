@@ -16,6 +16,7 @@ mod elf;
 mod ipc;
 mod lang_items;
 mod memory;
+mod milestone2_tests;
 mod sync;
 mod task;
 
@@ -133,6 +134,13 @@ extern "C" fn _start() -> ! {
     }
     earlyprintln!("[boot] memory management initialized (frame allocator, page mapper, heap)");
 
+    // Must run before any process's AddressSpace is created (none exist
+    // yet at this point in boot) — see the doc comment on
+    // `task::process`'s `KERNEL_STACKS_BASE` for why every possible
+    // process's kernel stack has to be mapped into the shared kernel
+    // half eagerly, right now, rather than lazily per-process later.
+    task::process::init_kernel_stacks();
+
     arch::x86_64::init();
     earlyprintln!("[boot] GDT/TSS/IDT initialized");
 
@@ -243,17 +251,93 @@ extern "C" fn _start() -> ! {
 
     earlyprintln!("TarnOS kernel skeleton alive, idling.");
 
+    // Milestone 2 integration test: two dummy ring-3 processes, one
+    // that immediately faults and one that immediately exits cleanly —
+    // confirms the fault kills only the offending process (see
+    // `xtask test-fault-isolation`). Never enabled for a normal build.
+    #[cfg(feature = "fault-isolation-test")]
+    {
+        let bad_pid = task::scheduler::allocate_pid();
+        let bad_process =
+            task::process::Process::new_dummy(bad_pid, milestone2_tests::faulting_process)
+                .expect("failed to create the faulting dummy process");
+        task::scheduler::spawn(bad_process).expect("spawn failed");
+
+        let good_pid = task::scheduler::allocate_pid();
+        let good_process =
+            task::process::Process::new_dummy(good_pid, milestone2_tests::survivor_process)
+                .expect("failed to create the survivor dummy process");
+        task::scheduler::spawn(good_process).expect("spawn failed");
+
+        earlyprintln!("[boot] fault-isolation-test: spawned faulting + survivor processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 2 integration test: two dummy ring-3 processes both
+    // send on the same endpoint before any receiver is ever polled —
+    // reproduces the historical double-send-panics bug, now expected to
+    // queue both instead (see `xtask test-double-send`). Never enabled
+    // for a normal build.
+    #[cfg(feature = "double-send-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+        // Deliberately not polled yet -- both sends below must queue
+        // (and not panic) before anything drains the console server.
+
+        let pid_a = task::scheduler::allocate_pid();
+        let mut process_a =
+            task::process::Process::new_dummy(pid_a, milestone2_tests::sender_process_a)
+                .expect("failed to create sender process A");
+        process_a.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint.clone()),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(process_a).expect("spawn failed");
+
+        let pid_b = task::scheduler::allocate_pid();
+        let mut process_b =
+            task::process::Process::new_dummy(pid_b, milestone2_tests::sender_process_b)
+                .expect("failed to create sender process B");
+        process_b.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(process_b).expect("spawn failed");
+
+        earlyprintln!("[boot] double-send-test: spawned two senders, no receiver polled yet");
+        task::scheduler::start();
+    }
+
     // The real boot sequence: spawn and poll the console server to its
     // first `recv().await` (so it's registered as a waiting receiver)
     // *before* init is created and scheduled — eliminating the
     // sender-before-receiver race by construction rather than by
     // handling both orderings at runtime.
+    //
+    // Milestone 2 integration test (`blocking-ipc-test`, see
+    // `xtask test-blocking-ipc`): skips priming the console server here,
+    // forcing init's first `sys_send` below to find nobody ready and
+    // genuinely block — proving a process can actually suspend and
+    // later resume, not just that this always-primed-receiver ordering
+    // happens to work. Never enabled for a normal build.
     let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
     task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
         console_endpoint.clone(),
     )));
-    task::executor::run_ready_tasks();
-    earlyprintln!("[boot] console server started, waiting for messages");
+    #[cfg(not(feature = "blocking-ipc-test"))]
+    {
+        task::executor::run_ready_tasks();
+        earlyprintln!("[boot] console server started, waiting for messages");
+    }
 
     let init_module = MODULES_REQUEST
         .response()

@@ -22,6 +22,13 @@ fn main() {
         "iso" => iso(false, &[]),
         "run" => run(rest),
         "test-fault" => test_fault(),
+        "test-fault-isolation" => test_fault_isolation(),
+        "test-blocking-ipc" => test_blocking_ipc(),
+        "test-double-send" => test_double_send(),
+        "test-all" => test_fault()
+            .and_then(|_| test_fault_isolation())
+            .and_then(|_| test_blocking_ipc())
+            .and_then(|_| test_double_send()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -45,7 +52,15 @@ fn print_usage() {
          \x20                    --uefi    boot via OVMF instead of legacy BIOS\n\
          \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot\n\
          \x20 test-fault       Build with a deliberate page fault injected at boot and\n\
-         \x20                    confirm it produces a clean panic + halt, not a triple fault"
+         \x20                    confirm it produces a clean panic + halt, not a triple fault\n\
+         \x20 test-fault-isolation  Confirm a faulting ring-3 process is killed alone,\n\
+         \x20                    not the kernel, and a second process still runs afterward\n\
+         \x20 test-blocking-ipc     Confirm a process can genuinely block on sys_send with\n\
+         \x20                    no receiver ready, then resume once one arrives\n\
+         \x20 test-double-send      Confirm two senders with no receiver both queue\n\
+         \x20                    instead of panicking (the historical bug this milestone fixed)\n\
+         \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
+         \x20                    and test-double-send in sequence"
     );
 }
 
@@ -321,23 +336,20 @@ fn run(flags: &[String]) -> Result<(), String> {
     run_cmd(&mut cmd)
 }
 
-/// Builds the kernel with a deliberate page-fault-at-boot injected (the
-/// `fault-injection-test` feature — see `kernel/src/main.rs`), boots it,
-/// and checks the serial output for a clean panic + halt rather than a
-/// triple fault (which under QEMU with `-no-reboot` would otherwise show
-/// up as the guest resetting instead of printing a diagnostic). This is
-/// the permanent, repeatable form of the same check done by hand back
-/// when the double-fault IST stack was first wired up.
-///
-/// The kernel has no way to signal "done" on its own here (the fault
-/// handler halts forever by design), so this runs QEMU for a fixed
-/// window and then kills it, rather than waiting for it to exit.
-fn test_fault() -> Result<(), String> {
+/// Builds the kernel with `kernel_features` enabled, boots it in QEMU
+/// with serial output redirected to `<build>/<log_name>`, waits a fixed
+/// window (these test scenarios have no way to signal "done" on their
+/// own — most end in a deliberate halt loop — so this kills QEMU after
+/// giving it time to reach that point rather than waiting for it to
+/// exit), and returns the captured log. Shared by every milestone-2
+/// integration test scenario below; each one builds with its own
+/// feature and applies its own assertions to the returned log.
+fn run_scenario(kernel_features: &[&str], log_name: &str, timeout_secs: u64) -> Result<String, String> {
     let root = workspace_root();
-    iso(false, &["fault-injection-test"])?;
+    iso(false, kernel_features)?;
 
     let iso_path = root.join("build").join("tarnos.iso");
-    let log_path = root.join("build").join("fault-test.log");
+    let log_path = root.join("build").join(log_name);
     let _ = std::fs::remove_file(&log_path);
 
     let mut child = Command::new("qemu-system-x86_64")
@@ -361,24 +373,44 @@ fn test_fault() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
 
-    // The fault happens within the first handful of boot instructions,
-    // and QEMU flushes the file-backed serial backend continuously, so a
-    // few seconds is generous rather than tight.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
     let _ = child.kill();
     let _ = child.wait();
 
     let log = std::fs::read_to_string(&log_path)
         .map_err(|e| format!("reading {}: {e}", log_path.display()))?;
     println!("xtask: captured serial output:\n{log}");
+    Ok(log)
+}
 
+/// Confirms the guest booted exactly once — the guest resetting instead
+/// of cleanly halting (a triple fault, or a panic loop under
+/// `-no-reboot` somehow not actually halting) would show up as a second
+/// "TarnOS booting" line.
+fn assert_booted_once(log: &str) -> Result<(), String> {
     let boot_lines = log.matches("TarnOS booting").count();
     if boot_lines != 1 {
         return Err(format!(
             "expected exactly one boot (\"TarnOS booting\" once); saw {boot_lines} — \
-             looks like the guest reset instead of halting after the fault"
+             looks like the guest reset instead of halting"
         ));
     }
+    Ok(())
+}
+
+/// Builds the kernel with a deliberate page-fault-at-boot injected (the
+/// `fault-injection-test` feature — see `kernel/src/main.rs`), boots it,
+/// and checks the serial output for a clean panic + halt rather than a
+/// triple fault (which under QEMU with `-no-reboot` would otherwise show
+/// up as the guest resetting instead of printing a diagnostic). This is
+/// the permanent, repeatable form of the same check done by hand back
+/// when the double-fault IST stack was first wired up. Reaches this
+/// fault while still in ring 0 (early boot code), so it must still
+/// panic the whole kernel — see `test_fault_isolation` for the
+/// ring-3 (process-only) case.
+fn test_fault() -> Result<(), String> {
+    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 3)?;
+    assert_booted_once(&log)?;
     if !log.contains("[KERNEL PANIC]") || !log.contains("page fault") {
         return Err(
             "expected a \"[KERNEL PANIC] ... page fault ...\" line in the serial output, \
@@ -386,9 +418,105 @@ fn test_fault() -> Result<(), String> {
                 .to_string(),
         );
     }
+    println!("xtask: test-fault PASSED — one clean panic + halt, no triple fault / reboot loop");
+    Ok(())
+}
 
+/// Milestone 2 workstream B: builds the kernel with two dummy ring-3
+/// processes (the `fault-isolation-test` feature) — one that
+/// dereferences a bad pointer, one that exits cleanly — and confirms
+/// the fault kills only the offending process: no kernel panic, and the
+/// survivor still reaches the scheduler's normal "last process exited"
+/// halt afterward. This is what distinguishes real process isolation
+/// from merely not crashing: the machine keeps doing useful work after
+/// a process misbehaves.
+fn test_fault_isolation() -> Result<(), String> {
+    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 3)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a ring-3 fault should kill only the offending \
+             process, not the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("[fault]") || !log.contains("killed") {
+        return Err(
+            "expected a \"[fault] pid ... killed: ...\" line showing the faulting process \
+             was terminated"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err(
+            "expected the survivor process to still reach a clean exit after the other \
+             process faulted"
+                .to_string(),
+        );
+    }
     println!(
-        "xtask: test-fault PASSED — one clean panic + halt, no triple fault / reboot loop"
+        "xtask: test-fault-isolation PASSED — faulting process killed, survivor still ran \
+         to completion, no kernel panic"
+    );
+    Ok(())
+}
+
+/// Milestone 2 workstream C: builds the kernel with the console server
+/// deliberately left unpolled before init runs (the `blocking-ipc-test`
+/// feature), forcing init's first `sys_send` to find nobody receiving
+/// and genuinely block, rather than the normal boot's always-primed-
+/// receiver ordering. Confirms init's message still arrives once the
+/// scheduler gives the console server its first chance to run — proving
+/// a process can actually suspend and later resume, not merely that the
+/// demo's usual ordering happens to avoid ever needing to.
+fn test_blocking_ipc() -> Result<(), String> {
+    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 5)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to still arrive after genuinely blocking on sys_send"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-blocking-ipc PASSED — init's send blocked with no receiver ready and \
+         still delivered once the console server was polled"
+    );
+    Ok(())
+}
+
+/// Milestone 2 workstream C (the specific bug it fixes): builds the
+/// kernel with two dummy ring-3 processes that both send on the same
+/// endpoint before any receiver is ever polled (the `double-send-test`
+/// feature) — the exact historical scenario where a second sender with
+/// nobody receiving panicked the kernel. Confirms both sends queue and
+/// are eventually delivered instead.
+fn test_double_send() -> Result<(), String> {
+    let log = run_scenario(&["double-send-test"], "double-send-test.log", 5)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a second sender with nobody receiving must queue, \
+             not panic"
+                .to_string(),
+        );
+    }
+    if !log.contains("MSGA") || !log.contains("MSGB") {
+        return Err(
+            "expected both queued senders' messages (\"MSGA\" and \"MSGB\") to have been \
+             delivered"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both sender processes to reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-double-send PASSED — two senders with no receiver both queued and were \
+         delivered, no kernel panic"
     );
     Ok(())
 }
