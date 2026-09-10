@@ -13,7 +13,10 @@
 //! one "current kernel stack," so a plain global suffices.
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tarnos_abi::{CapIndex, Message, SyscallError, SYS_EXIT, SYS_RECV, SYS_SEND, SYS_YIELD};
+use tarnos_abi::{
+    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_EXIT, SYS_GRANT, SYS_PROCESS_START,
+    SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_YIELD,
+};
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
@@ -21,7 +24,8 @@ use x86_64::VirtAddr;
 use super::context_switch::TrapFrame;
 use super::gdt;
 use crate::ipc::endpoint::{RecvResult, SendResult};
-use crate::ipc::{Endpoint, KernelObjectRef, Rights};
+use crate::ipc::{CapabilitySlot, Endpoint, KernelObjectRef, Rights};
+use crate::task::process::ProcessState;
 use crate::task::scheduler;
 use crate::task::Pid;
 
@@ -141,6 +145,9 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_SEND => sys_send(frame),
         SYS_RECV => sys_recv(frame),
         SYS_EXIT => scheduler::on_syscall_exit(frame),
+        SYS_SPAWN => sys_spawn(frame),
+        SYS_GRANT => sys_grant(frame),
+        SYS_PROCESS_START => sys_process_start(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -226,4 +233,105 @@ fn sys_recv(frame: *mut TrapFrame) -> *mut TrapFrame {
             frame
         }
     }
+}
+
+/// `SYS_SPAWN`: creates a new, `Suspended` process from a boot-shipped
+/// program named by `rdi`/`rsi`/`rdx` (packed via
+/// `tarnos_abi::pack_program_name`), recording the caller as its parent.
+/// Never blocks — always returns `frame` directly. On success, `rax`
+/// holds the new process's raw `Pid`; there is no capability wrapping it
+/// (a `Pid` alone confers no authority — only `SYS_GRANT`/
+/// `SYS_PROCESS_START`'s parent-of-a-Suspended-child check does), so
+/// there is nothing to guard against a forged value here beyond what
+/// those two syscalls already check.
+fn sys_spawn(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let mut name_buf = [0u8; PROGRAM_NAME_MAX];
+    let name = tarnos_abi::unpack_program_name(regs.rdi, regs.rsi, regs.rdx, &mut name_buf);
+
+    let result: Result<u64, SyscallError> = (|| {
+        let caller_pid = scheduler::with_current_process(|p| p.pid)
+            .ok_or(SyscallError::InvalidTarget)?;
+        let elf_bytes =
+            crate::task::process::lookup_spawnable_module(name).ok_or(SyscallError::NoSuchProgram)?;
+        let child_pid = scheduler::allocate_pid();
+        let mut child = crate::task::process::Process::from_elf(child_pid, elf_bytes, Some(caller_pid))
+            .map_err(|_| SyscallError::SpawnFailed)?;
+        child.state = ProcessState::Suspended;
+        scheduler::spawn_suspended(child)?;
+        Ok(child_pid.0)
+    })();
+
+    regs.rax = match result {
+        Ok(pid) => pid,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_GRANT`: clones a capability from the caller's own table into
+/// `target_pid`'s table, narrowed to `requested` rights. Only permitted
+/// while `target_pid` is a `Suspended` child of the caller. Resolves the
+/// caller's own capability first, in its own short critical section
+/// (mirroring [`resolve_endpoint`]'s reasoning), fully releasing that
+/// lock before a second, separate `with_process` call touches the
+/// target — the two scheduler-lock acquisitions never nest.
+fn sys_grant(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let target_pid = Pid(regs.rdi);
+    let src_cap = CapIndex(regs.rsi as u32);
+    let dest_cap = CapIndex(regs.rdx as u32);
+    let requested = Rights::from_bits_truncate(regs.r10 as u8);
+
+    let resolved: Result<(KernelObjectRef, Pid), SyscallError> = scheduler::with_current_process(
+        |process| {
+            let slot = process.cap_table.get(src_cap)?;
+            if !slot.rights.contains(requested) {
+                return Err(SyscallError::PermissionDenied);
+            }
+            Ok((slot.object.clone(), process.pid))
+        },
+    )
+    .unwrap_or(Err(SyscallError::BadCapability));
+
+    let outcome = resolved.and_then(|(object, caller_pid)| {
+        scheduler::with_process(target_pid, |child| {
+            if child.parent != Some(caller_pid) || child.state != ProcessState::Suspended {
+                return Err(SyscallError::InvalidTarget);
+            }
+            child.cap_table.insert(
+                dest_cap,
+                CapabilitySlot {
+                    object,
+                    rights: requested,
+                },
+            );
+            Ok(())
+        })
+        .unwrap_or(Err(SyscallError::InvalidTarget))
+    });
+
+    regs.rax = match outcome {
+        Ok(()) => 0,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_PROCESS_START`: releases a `Suspended` child of the caller into
+/// the scheduler's ready queue. See [`scheduler::start_child`] for the
+/// ownership check.
+fn sys_process_start(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let target_pid = Pid(regs.rdi);
+
+    let outcome = scheduler::with_current_process(|p| p.pid)
+        .ok_or(SyscallError::InvalidTarget)
+        .and_then(|caller_pid| scheduler::start_child(target_pid, caller_pid));
+
+    regs.rax = match outcome {
+        Ok(()) => 0,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
 }

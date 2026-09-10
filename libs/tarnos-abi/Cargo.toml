@@ -7,3 +7,6 @@ publish = false
 [lib]
 name = "tarnos_abi"
 path = "src/lib.rs"
+
+[dependencies]
+bitflags = "2"

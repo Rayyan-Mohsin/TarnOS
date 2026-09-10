@@ -36,7 +36,6 @@ struct Inner {
     processes: [Option<Box<Process>>; MAX_PROCESSES],
     ready: ReadyQueue,
     current: Option<Pid>,
-    next_pid: u64,
 }
 
 impl Inner {
@@ -46,19 +45,37 @@ impl Inner {
             processes: [NONE; MAX_PROCESSES],
             ready: ReadyQueue::new(),
             current: None,
-            next_pid: 0,
         }
     }
 }
 
 static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 
-/// Reserves the next `Pid`. Normal-code-only.
+/// Reserves the next `Pid`: the index of the lowest currently-empty slot
+/// in the process table, so a terminated process's slot is available for
+/// reuse rather than the table filling up after `MAX_PROCESSES`
+/// processes have ever existed, cumulatively, over the kernel's whole
+/// lifetime. Returns `Pid(MAX_PROCESSES as u64)` — deliberately
+/// out-of-range — if every slot is occupied, so the existing bounds
+/// check in [`spawn`]/[`spawn_suspended`] rejects it with
+/// `ResourceExhausted` the same way an in-range but already-taken index
+/// never could.
+///
+/// Safe to call without reserving the slot atomically against a second
+/// `allocate_pid()` racing in before the first's matching `spawn`/
+/// `spawn_suspended` runs: every caller (trusted boot code, and
+/// `SYS_SPAWN`'s handler, which runs with interrupts disabled for its
+/// entire duration — see `arch::x86_64::syscall`) allocates and spawns
+/// in the same straight-line sequence with nothing else able to run in
+/// between on this single core.
 pub fn allocate_pid() -> Pid {
-    let mut sched = SCHEDULER.lock();
-    let pid = Pid(sched.next_pid);
-    sched.next_pid += 1;
-    pid
+    let sched = SCHEDULER.lock();
+    let index = sched
+        .processes
+        .iter()
+        .position(|slot| slot.is_none())
+        .unwrap_or(MAX_PROCESSES);
+    Pid(index as u64)
 }
 
 /// Registers a fully constructed process and marks it ready to run.
@@ -67,11 +84,8 @@ pub fn allocate_pid() -> Pid {
 /// interrupt context.
 ///
 /// Returns `Err(ResourceExhausted)` instead of panicking if the process
-/// table is already full. Not reachable by any process today — there is
-/// no spawn syscall yet, so this only ever runs from trusted boot code
-/// with exactly one process to create — but a real `Result` here means
-/// the syscall a later milestone adds inherits a safe primitive instead
-/// of a kernel-wide panic the moment `MAX_PROCESSES` processes exist.
+/// table is already full — reachable today via `SYS_SPAWN` once every
+/// process slot is occupied.
 pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let pid = process.pid;
     let index = pid.0 as usize;
@@ -81,6 +95,46 @@ pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let mut sched = SCHEDULER.lock();
     sched.processes[index] = Some(Box::new(process));
     sched.ready.push(pid);
+    Ok(())
+}
+
+/// Registers a fully constructed process **without** making it
+/// schedulable — used by `SYS_SPAWN`, which must create a child in
+/// [`ProcessState::Suspended`](super::process::ProcessState::Suspended)
+/// so its parent can grant it capabilities before anything runs it. The
+/// process occupies its process-table slot immediately (so a second
+/// `allocate_pid()` can't be handed the same index), it's just absent
+/// from the ready queue until [`start_child`] releases it.
+pub fn spawn_suspended(process: Process) -> Result<(), tarnos_abi::SyscallError> {
+    let pid = process.pid;
+    let index = pid.0 as usize;
+    if index >= MAX_PROCESSES {
+        return Err(tarnos_abi::SyscallError::ResourceExhausted);
+    }
+    let mut sched = SCHEDULER.lock();
+    sched.processes[index] = Some(Box::new(process));
+    Ok(())
+}
+
+/// Releases a `Suspended` child into the ready queue — `SYS_PROCESS_START`'s
+/// implementation. Permitted only when `target` is currently `Suspended`
+/// *and* its recorded `parent` is `caller`: the same structural check
+/// [`with_process`] backs `SYS_GRANT` with, checked and mutated under one
+/// lock acquisition so there's no window between "checked" and "acted on."
+/// Once released, `target.parent` still names the creator for the
+/// record, but no further syscall treats that as authority — the child
+/// is an ordinary independent process from here on.
+pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
+    let mut sched = SCHEDULER.lock();
+    let index = target.0 as usize;
+    let Some(process) = sched.processes.get_mut(index).and_then(|slot| slot.as_mut()) else {
+        return Err(tarnos_abi::SyscallError::InvalidTarget);
+    };
+    if process.parent != Some(caller) || process.state != ProcessState::Suspended {
+        return Err(tarnos_abi::SyscallError::InvalidTarget);
+    }
+    process.state = ProcessState::Ready;
+    sched.ready.push(target);
     Ok(())
 }
 
@@ -259,15 +313,29 @@ pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
     terminate_current_process()
 }
 
+/// Runs `f` against whichever process `pid` names, e.g. to check or
+/// mutate a specific process's capability table during a syscall like
+/// `SYS_GRANT`. `None` if `pid` doesn't currently name a live process —
+/// `pid` may be attacker-controlled input from a syscall register (an
+/// arbitrary `u64`), so this looks up via `.get_mut()` rather than
+/// direct indexing, unlike internal-only callers that already know
+/// their index is in range.
+pub fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let mut sched = SCHEDULER.lock();
+    let process = sched.processes.get_mut(pid.0 as usize)?.as_mut()?;
+    Some(f(process))
+}
+
 /// Runs `f` against the currently-running process, e.g. to resolve a
 /// capability index during a syscall. `None` if there is no current
 /// process (should not happen when called from the syscall path, which
 /// only runs while some process is executing).
 pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
-    let mut sched = SCHEDULER.lock();
-    let pid = sched.current?;
-    let process = sched.processes[pid.0 as usize].as_mut()?;
-    Some(f(process))
+    let pid = {
+        let sched = SCHEDULER.lock();
+        sched.current?
+    };
+    with_process(pid, f)
 }
 
 /// What to write into a blocked process's saved registers before waking

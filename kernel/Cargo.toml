@@ -37,6 +37,13 @@ blocking-ipc-test = []
 # both sends queue and are eventually delivered instead. Exercised by
 # `cargo run -p xtask -- test-double-send`.
 double-send-test = []
+# Spawns two dummy ring-3 processes: a bystander that just idles, and a
+# test process that adversarially probes SYS_GRANT/SYS_PROCESS_START --
+# a grant against a real process that isn't its child, a grant
+# requesting rights it doesn't hold, then a legitimate spawn+grant+start
+# to prove the mechanism still works. Exercised by
+# `cargo run -p xtask -- test-spawn-boundary`.
+spawn-boundary-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

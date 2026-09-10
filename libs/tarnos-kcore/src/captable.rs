@@ -13,13 +13,11 @@ use alloc::vec::Vec;
 
 use tarnos_abi::{CapIndex, SyscallError};
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub struct Rights: u8 {
-        const SEND = 0b01;
-        const RECV = 0b10;
-    }
-}
+/// `Rights` is a wire type shared between kernel and userland (a process
+/// must be able to *express* the rights it's requesting in `sys_grant`),
+/// so it's defined once in `tarnos-abi` alongside `Message`/`SyscallError`
+/// rather than here.
+pub use tarnos_abi::Rights;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilitySlot<T> {

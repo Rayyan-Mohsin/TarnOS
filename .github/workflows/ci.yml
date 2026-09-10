@@ -71,3 +71,9 @@ jobs:
 
       - name: xtask test-uefi-boot (normal boot also completes via UEFI/OVMF)
         run: cargo run -p xtask -- test-uefi-boot
+
+      - name: xtask test-spawn-ipc (dynamic process creation + capability transfer + IPC)
+        run: cargo run -p xtask -- test-spawn-ipc
+
+      - name: xtask test-spawn-boundary (SYS_GRANT/SYS_PROCESS_START enforce ownership + rights)
+        run: cargo run -p xtask -- test-spawn-boundary

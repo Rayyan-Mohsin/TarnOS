@@ -85,3 +85,8 @@ code before either runs.
   where processes need to be handed new capabilities dynamically (e.g.
   spawning a child and handing it one specific endpoint) — that syscall
   is deferred, explicitly, to whenever a milestone actually needs it.
+  **Update (milestone 3):** closed. See
+  `docs/adr/0006-dynamic-process-creation-and-capability-transfer.md` —
+  `SYS_SPAWN`/`SYS_GRANT`/`SYS_PROCESS_START` let a running process
+  create a child and hand it capabilities of its own choosing, narrowed
+  to rights it itself holds.

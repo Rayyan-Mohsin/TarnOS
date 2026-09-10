@@ -17,6 +17,7 @@ mod ipc;
 mod lang_items;
 mod memory;
 mod milestone2_tests;
+mod milestone3_tests;
 mod sync;
 mod task;
 
@@ -141,6 +142,22 @@ extern "C" fn _start() -> ! {
     // half eagerly, right now, rather than lazily per-process later.
     task::process::init_kernel_stacks();
 
+    // Every boot module besides "init" itself becomes a program
+    // SYS_SPAWN can create a process from by name — there is no
+    // filesystem yet, so this fixed, boot-time set is the only source a
+    // running process has for a new process's code. See
+    // docs/adr/0006-dynamic-process-creation-and-capability-transfer.md.
+    // Populated here (needs the heap, so after `memory::init()`) rather
+    // than down by the real boot sequence below, since milestone-2/3's
+    // test-only boot branches (which run instead of, not before, that
+    // real sequence) need it too — `spawn-boundary-test` exercises
+    // SYS_SPAWN directly.
+    let boot_modules = MODULES_REQUEST
+        .response()
+        .expect("Limine did not honor the modules request")
+        .modules();
+    task::process::init_spawnable_modules(boot_modules);
+
     arch::x86_64::init();
     earlyprintln!("[boot] GDT/TSS/IDT initialized");
 
@@ -259,13 +276,13 @@ extern "C" fn _start() -> ! {
     {
         let bad_pid = task::scheduler::allocate_pid();
         let bad_process =
-            task::process::Process::new_dummy(bad_pid, milestone2_tests::faulting_process)
+            task::process::Process::new_dummy(bad_pid, milestone2_tests::faulting_process, None)
                 .expect("failed to create the faulting dummy process");
         task::scheduler::spawn(bad_process).expect("spawn failed");
 
         let good_pid = task::scheduler::allocate_pid();
         let good_process =
-            task::process::Process::new_dummy(good_pid, milestone2_tests::survivor_process)
+            task::process::Process::new_dummy(good_pid, milestone2_tests::survivor_process, None)
                 .expect("failed to create the survivor dummy process");
         task::scheduler::spawn(good_process).expect("spawn failed");
 
@@ -289,7 +306,7 @@ extern "C" fn _start() -> ! {
 
         let pid_a = task::scheduler::allocate_pid();
         let mut process_a =
-            task::process::Process::new_dummy(pid_a, milestone2_tests::sender_process_a)
+            task::process::Process::new_dummy(pid_a, milestone2_tests::sender_process_a, None)
                 .expect("failed to create sender process A");
         process_a.cap_table.insert(
             tarnos_abi::CONSOLE_CAP,
@@ -302,7 +319,7 @@ extern "C" fn _start() -> ! {
 
         let pid_b = task::scheduler::allocate_pid();
         let mut process_b =
-            task::process::Process::new_dummy(pid_b, milestone2_tests::sender_process_b)
+            task::process::Process::new_dummy(pid_b, milestone2_tests::sender_process_b, None)
                 .expect("failed to create sender process B");
         process_b.cap_table.insert(
             tarnos_abi::CONSOLE_CAP,
@@ -314,6 +331,54 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(process_b).expect("spawn failed");
 
         earlyprintln!("[boot] double-send-test: spawned two senders, no receiver polled yet");
+        task::scheduler::start();
+    }
+
+    // Milestone 3 integration test: an idle bystander process plus a
+    // test process that adversarially probes SYS_GRANT/SYS_PROCESS_START
+    // — a grant against a real process that isn't its child, a grant
+    // requesting rights it doesn't hold, then a legitimate spawn+grant+
+    // start to prove the mechanism still works (see
+    // `xtask test-spawn-boundary`). Never enabled for a normal build.
+    #[cfg(feature = "spawn-boundary-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        // Allocated first, so it gets Pid(0) — the fixed value
+        // `milestone3_tests::boundary_test_process`'s raw asm hardcodes
+        // as "a real process that is not my child."
+        let bystander_pid = task::scheduler::allocate_pid();
+        let bystander_process = task::process::Process::new_dummy(
+            bystander_pid,
+            milestone3_tests::boundary_bystander_process,
+            None,
+        )
+        .expect("failed to create the bystander dummy process");
+        task::scheduler::spawn(bystander_process).expect("spawn failed");
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process = task::process::Process::new_dummy(
+            test_pid,
+            milestone3_tests::boundary_test_process,
+            None,
+        )
+        .expect("failed to create the boundary-test dummy process");
+        // Only SEND, never RECV -- the process's own second check relies
+        // on not holding RECV to prove a grant can't request more than
+        // the granter itself has.
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] spawn-boundary-test: spawned bystander + boundary-test processes");
         task::scheduler::start();
     }
 
@@ -339,22 +404,29 @@ extern "C" fn _start() -> ! {
         earlyprintln!("[boot] console server started, waiting for messages");
     }
 
-    let init_module = MODULES_REQUEST
-        .response()
-        .expect("Limine did not honor the modules request")
-        .modules()
+    let init_module = boot_modules
         .iter()
         .find(|module| module.cmdline() == "init")
         .expect("no boot module with cmdline \"init\" (check limine.conf's module_string)");
 
     let init_pid = task::scheduler::allocate_pid();
-    let mut init_process = task::process::Process::from_elf(init_pid, init_module.data())
+    let mut init_process = task::process::Process::from_elf(init_pid, init_module.data(), None)
         .expect("failed to load init's ELF image");
     init_process.cap_table.insert(
         tarnos_abi::CONSOLE_CAP,
         ipc::CapabilitySlot {
             object: ipc::KernelObjectRef::Endpoint(console_endpoint),
             rights: ipc::Rights::SEND,
+        },
+    );
+    // init otherwise only holds SEND (on CONSOLE_CAP) — without a RECV
+    // right of its own to grant, it would have nothing to hand a
+    // spawned child to talk back with.
+    init_process.cap_table.insert(
+        tarnos_abi::CHILD_LINK_CAP,
+        ipc::CapabilitySlot {
+            object: ipc::KernelObjectRef::Endpoint(alloc::sync::Arc::new(ipc::Endpoint::new())),
+            rights: ipc::Rights::SEND | ipc::Rights::RECV,
         },
     );
     task::scheduler::spawn(init_process).expect("process table exhausted spawning the very first process");

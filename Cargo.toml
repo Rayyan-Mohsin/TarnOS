@@ -7,6 +7,7 @@ members = [
     "libs/tarnos-rt",
     "kernel",
     "userland/init",
+    "userland/echo-child",
 ]
 
 # The kernel and userland binaries build against custom no_std target JSONs

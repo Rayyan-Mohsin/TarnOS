@@ -15,6 +15,20 @@ pub const SYS_SEND: u64 = 1;
 pub const SYS_RECV: u64 = 2;
 /// `sys_exit(code)` — terminate the calling process.
 pub const SYS_EXIT: u64 = 3;
+/// `sys_spawn(name_lo, name_hi, name_len)` — create a new process from a
+/// boot-shipped program named `name`, `Suspended` (not yet scheduled),
+/// with the caller recorded as its parent. Returns the new `Pid`.
+pub const SYS_SPAWN: u64 = 4;
+/// `sys_grant(target_pid, src_cap, dest_cap, rights)` — clones the
+/// capability at `src_cap` in the caller's own table into `dest_cap` in
+/// `target_pid`'s table, narrowed to `rights` (which must be a subset of
+/// what the caller holds). Only permitted while `target_pid` is a
+/// `Suspended` child of the caller.
+pub const SYS_GRANT: u64 = 5;
+/// `sys_process_start(target_pid)` — releases a `Suspended` child of the
+/// caller into the scheduler's ready queue. Once started, the child is
+/// an ordinary independent process.
+pub const SYS_PROCESS_START: u64 = 6;
 
 /// An index into the *calling process's own* capability table.
 ///
@@ -30,6 +44,15 @@ pub struct CapIndex(pub u32);
 /// granting send rights to the console server's endpoint. Analogous to a
 /// seL4 root task's kernel-populated initial CSpace slot.
 pub const CONSOLE_CAP: CapIndex = CapIndex(0);
+
+/// `init`'s second boot-seeded capability: `SEND | RECV` on a fresh
+/// endpoint reserved for talking to whatever child it spawns. Boot code
+/// only ever seeds `init` with `SEND` on [`CONSOLE_CAP`] — without this
+/// second slot `init` would hold no `RECV` right to grant a spawned
+/// child in the first place. A spawned child itself starts with an
+/// *empty* capability table; it receives whatever its parent grants it
+/// at whatever index the parent chooses, which need not be this one.
+pub const CHILD_LINK_CAP: CapIndex = CapIndex(1);
 
 /// Maximum number of inline `u64` payload words carried by a `Message`.
 ///
@@ -88,6 +111,52 @@ impl Message {
     }
 }
 
+bitflags::bitflags! {
+    /// What a capability slot permits. Lives here, not in `tarnos-kcore`,
+    /// because `sys_grant` makes it part of the wire contract between
+    /// kernel and userland — a process must be able to *express* which
+    /// rights it's requesting a grant with, the same way `Message` and
+    /// `SyscallError` are shared wire types. `tarnos-kcore::captable`
+    /// re-exports this rather than defining its own copy.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Rights: u8 {
+        const SEND = 0b01;
+        const RECV = 0b10;
+    }
+}
+
+/// Longest program name `sys_spawn` accepts, packed into two `u64`
+/// registers alongside a length — enough for every name this milestone's
+/// fixed, boot-shipped set of spawnable programs uses. Not a general
+/// bounded-string mechanism (there is no user-pointer validation
+/// anywhere in this kernel yet, by design — see
+/// `docs/adr/0003-ipc-message-format.md`); this mirrors `Message`'s own
+/// register-packing idiom rather than introducing a new one.
+pub const PROGRAM_NAME_MAX: usize = 16;
+
+/// Packs a program name into `(lo, hi, len)` for `sys_spawn`'s three
+/// register arguments, little-endian, truncated (not just padded) to
+/// [`PROGRAM_NAME_MAX`] bytes — mirrors [`Message::from_str_lossy`].
+pub fn pack_program_name(name: &str) -> (u64, u64, u64) {
+    let bytes = name.as_bytes();
+    let len = core::cmp::min(bytes.len(), PROGRAM_NAME_MAX);
+    let mut buf = [0u8; PROGRAM_NAME_MAX];
+    buf[..len].copy_from_slice(&bytes[..len]);
+    let lo = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    (lo, hi, len as u64)
+}
+
+/// Inverse of [`pack_program_name`]: reinterprets `lo`/`hi` as `len`
+/// bytes of UTF-8, lossily replacing invalid sequences — mirrors
+/// [`Message::as_str_lossy`].
+pub fn unpack_program_name(lo: u64, hi: u64, len: u64, buf: &mut [u8; PROGRAM_NAME_MAX]) -> &str {
+    buf[0..8].copy_from_slice(&lo.to_le_bytes());
+    buf[8..16].copy_from_slice(&hi.to_le_bytes());
+    let len = core::cmp::min(len as usize, buf.len());
+    core::str::from_utf8(&buf[..len]).unwrap_or("<invalid utf-8>")
+}
+
 /// Syscall error codes, returned as `-(code as i64)` in RAX so success
 /// (`>= 0`) and failure are distinguishable with a single sign check, the
 /// same convention Linux's x86_64 syscall ABI uses.
@@ -106,6 +175,15 @@ pub enum SyscallError {
     /// instead of blocking, since blocking here would mean waiting with
     /// no way for anything to ever wake the caller.
     ResourceExhausted = 4,
+    /// `sys_spawn`'s name did not match any boot-shipped program.
+    NoSuchProgram = 5,
+    /// `sys_grant`/`sys_process_start`'s `target_pid` does not name a
+    /// `Suspended` child of the caller — either it isn't a child at all,
+    /// or it already left the `Suspended` window (already started).
+    InvalidTarget = 6,
+    /// `sys_spawn` found the named program but could not construct a
+    /// process from it (ELF load failure or the process table is full).
+    SpawnFailed = 7,
 }
 
 impl SyscallError {
@@ -124,6 +202,9 @@ impl SyscallError {
             2 => SyscallError::BadCapability,
             3 => SyscallError::PermissionDenied,
             4 => SyscallError::ResourceExhausted,
+            5 => SyscallError::NoSuchProgram,
+            6 => SyscallError::InvalidTarget,
+            7 => SyscallError::SpawnFailed,
             _ => SyscallError::NoSuchSyscall,
         }
     }

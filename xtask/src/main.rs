@@ -26,11 +26,15 @@ fn main() {
         "test-blocking-ipc" => test_blocking_ipc(),
         "test-double-send" => test_double_send(),
         "test-uefi-boot" => test_uefi_boot(),
+        "test-spawn-ipc" => test_spawn_ipc(),
+        "test-spawn-boundary" => test_spawn_boundary(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
             .and_then(|_| test_double_send())
-            .and_then(|_| test_uefi_boot()),
+            .and_then(|_| test_uefi_boot())
+            .and_then(|_| test_spawn_ipc())
+            .and_then(|_| test_spawn_boundary()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -63,8 +67,15 @@ fn print_usage() {
          \x20                    instead of panicking (the historical bug this milestone fixed)\n\
          \x20 test-uefi-boot        Confirm the normal boot sequence also completes\n\
          \x20                    end to end via UEFI/OVMF, not just BIOS\n\
+         \x20 test-spawn-ipc        Confirm init can dynamically spawn a second process,\n\
+         \x20                    grant it a capability, release it, and complete a real IPC\n\
+         \x20                    round trip with it -- not boot-choreographed\n\
+         \x20 test-spawn-boundary   Confirm SYS_GRANT/SYS_PROCESS_START reject a non-child\n\
+         \x20                    target and a rights-amplifying grant, while a legitimate\n\
+         \x20                    grant+start still succeeds\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
-         \x20                    test-double-send, and test-uefi-boot in sequence"
+         \x20                    test-double-send, test-uefi-boot, test-spawn-ipc, and\n\
+         \x20                    test-spawn-boundary in sequence"
     );
 }
 
@@ -116,12 +127,19 @@ fn build_kernel(root: &Path, release: bool, extra_features: &[&str]) -> Result<(
     run_cmd(&mut cmd)
 }
 
-fn build_init(root: &Path, release: bool) -> Result<(), String> {
+/// Builds one userland crate against the custom `x86_64-tarnos-user`
+/// target. `package` is the Cargo package name (e.g. `"init"`,
+/// `"echo-child"`) — every userland binary built this way ends up at
+/// the same `target/x86_64-tarnos-user/<profile>/<package>` path
+/// `user_elf_path` computes, since Cargo names the output after the
+/// `[[bin]]` target, which every userland `Cargo.toml` here sets equal
+/// to its package name.
+fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root).args([
         "build",
         "-p",
-        "init",
+        package,
         "--target",
         USER_TARGET_JSON,
         "-Zjson-target-spec",
@@ -134,10 +152,22 @@ fn build_init(root: &Path, release: bool) -> Result<(), String> {
     run_cmd(&mut cmd)
 }
 
+/// Every userland binary the ISO ships — `init` (boot-loaded directly)
+/// plus every program `SYS_SPAWN` can create a process from by name
+/// (see `task::process::init_spawnable_modules`). Building and shipping
+/// all of them unconditionally, for every scenario, keeps `limine.conf`
+/// (which declares a fixed set of boot modules) valid regardless of
+/// which kernel feature a given `xtask` command builds with — none of
+/// the existing milestone-2 test scenarios exercise spawning, but they
+/// still boot the same `limine.conf`.
+const USER_CRATES: &[&str] = &["init", "echo-child"];
+
 fn build(release: bool) -> Result<(), String> {
     let root = workspace_root();
     build_kernel(&root, release, &[])?;
-    build_init(&root, release)?;
+    for package in USER_CRATES {
+        build_user_crate(&root, release, package)?;
+    }
     println!("xtask: build OK");
     Ok(())
 }
@@ -157,11 +187,11 @@ fn kernel_elf_path(root: &Path, release: bool) -> PathBuf {
         .join("tarnos-kernel")
 }
 
-fn init_elf_path(root: &Path, release: bool) -> PathBuf {
+fn user_elf_path(root: &Path, release: bool, package: &str) -> PathBuf {
     root.join("target")
         .join("x86_64-tarnos-user")
         .join(profile_dir_name(release))
-        .join("init")
+        .join(package)
 }
 
 /// Ensures a working Limine checkout (with prebuilt binaries and the built
@@ -201,7 +231,9 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
 fn iso(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
     build_kernel(&root, release, kernel_features)?;
-    build_init(&root, release)?;
+    for package in USER_CRATES {
+        build_user_crate(&root, release, package)?;
+    }
     let limine_dir = ensure_limine(&root)?;
 
     let iso_root = root.join("build").join("iso_root");
@@ -217,7 +249,12 @@ fn iso(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     };
 
     copy(&kernel_elf_path(&root, release), &boot_dir.join("kernel"))?;
-    copy(&init_elf_path(&root, release), &boot_dir.join("init"))?;
+    for package in USER_CRATES {
+        copy(
+            &user_elf_path(&root, release, package),
+            &boot_dir.join(package),
+        )?;
+    }
     copy(&root.join("limine.conf"), &boot_dir.join("limine.conf"))?;
     copy(
         &limine_dir.join("limine-bios.sys"),
@@ -579,6 +616,75 @@ fn test_double_send() -> Result<(), String> {
     println!(
         "xtask: test-double-send PASSED — two senders with no receiver both queued and were \
          delivered, no kernel panic"
+    );
+    Ok(())
+}
+
+/// Milestone 3: boots the *normal, unconditional* boot sequence (no test
+/// feature — `init` always does this now) and confirms the whole
+/// dynamic-process-creation chain works end to end: `init` spawns
+/// `echo-child` (a process boot code never mentions at all), grants it a
+/// capability it starts with none of, releases it with
+/// `SYS_PROCESS_START`, and completes a genuine rendezvous with it —
+/// none of it boot-choreographed the way the console-server handoff is.
+fn test_spawn_ipc() -> Result<(), String> {
+    let log = run_scenario(&[], "spawn-ipc-test.log", 8, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err("expected init's own greeting (regression check)".to_string());
+    }
+    if !log.contains("child replied: pong") {
+        return Err(
+            "expected \"child replied: pong\" -- init's dynamically spawned echo-child should \
+             have replied over the granted capability"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both init and its spawned child to reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-spawn-ipc PASSED — init dynamically spawned echo-child, granted it a \
+         capability, and completed a real IPC round trip with it"
+    );
+    Ok(())
+}
+
+/// Milestone 3, adversarially: builds the kernel with two dummy ring-3
+/// processes (the `spawn-boundary-test` feature) — an idle bystander,
+/// and a test process that probes `SYS_GRANT`/`SYS_PROCESS_START`'s
+/// ownership and rights checks directly (a grant against a real
+/// process that isn't its child, a grant requesting rights it doesn't
+/// hold, then a legitimate spawn+grant+start) — and confirms all four
+/// checks matched their expected result. Complements `test_spawn_ipc`:
+/// that one proves the happy path works, this one proves the boundary
+/// is actually enforced, not merely unexercised.
+fn test_spawn_boundary() -> Result<(), String> {
+    let log = run_scenario(&["spawn-boundary-test"], "spawn-boundary-test.log", 5, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("BOUNDARY_FAIL") {
+        return Err(
+            "boundary-test process reported BOUNDARY_FAIL -- SYS_GRANT/SYS_PROCESS_START did \
+             not enforce ownership/rights the way it should have"
+                .to_string(),
+        );
+    }
+    if !log.contains("BOUNDARY_OK") {
+        return Err(
+            "expected \"BOUNDARY_OK\" -- the boundary-test process never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-spawn-boundary PASSED — a grant against a non-child and a rights-\
+         amplifying grant were both rejected, while a legitimate grant+start still succeeded"
     );
     Ok(())
 }

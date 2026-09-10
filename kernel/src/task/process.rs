@@ -1,5 +1,10 @@
 //! A process: an address space, a saved CPU state, a kernel stack to trap
 //! into, and the capabilities it holds.
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+use spin::Once;
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -20,6 +25,15 @@ pub enum ProcessState {
     /// distinguishes this from an ordinary preemption) until
     /// `task::scheduler::wake_blocked_process` moves it back to `Ready`.
     Blocked,
+    /// Created by `SYS_SPAWN`, not yet in the scheduler's ready queue —
+    /// invisible to the scheduler until `SYS_PROCESS_START` releases it.
+    /// While in this state, only its `parent` may touch its capability
+    /// table (`SYS_GRANT`) or release it (`SYS_PROCESS_START`) — see
+    /// `task::scheduler::with_process` and
+    /// `docs/adr/0006-dynamic-process-creation-and-capability-transfer.md`.
+    /// Once released, the child is an ordinary independent process; the
+    /// parent relationship confers no further authority.
+    Suspended,
 }
 
 const KERNEL_STACK_PAGES: u64 = 4; // 16 KiB
@@ -88,6 +102,13 @@ pub struct Process {
     pub trap_frame: TrapFrame,
     pub cap_table: CapTable,
     pub state: ProcessState,
+    /// The process that created this one via `SYS_SPAWN`, if any —
+    /// `None` for every process boot code creates directly. Only
+    /// meaningful while `state == Suspended`: it names the one process
+    /// permitted to grant capabilities into this one or release it (see
+    /// `task::scheduler::with_process`/`start_child`). Confers no
+    /// authority once the child leaves `Suspended`.
+    pub parent: Option<Pid>,
 }
 
 impl Process {
@@ -101,7 +122,12 @@ impl Process {
     /// a real ELF-loaded process (wired up in a later milestone task)
     /// build on this one path — there is exactly one way a process's
     /// initial state gets constructed.
-    fn new(pid: Pid, address_space: AddressSpace, entry: VirtAddr) -> Result<Self, &'static str> {
+    fn new(
+        pid: Pid,
+        address_space: AddressSpace,
+        entry: VirtAddr,
+        parent: Option<Pid>,
+    ) -> Result<Self, &'static str> {
         let mut allocator = GlobalFrameAllocator;
         let stack_top = VirtAddr::new(USER_STACK_TOP);
         let stack_bottom = VirtAddr::new(USER_STACK_TOP - USER_STACK_PAGES * 4096);
@@ -128,6 +154,7 @@ impl Process {
             trap_frame,
             cap_table: CapTable::new(),
             state: ProcessState::Ready,
+            parent,
         })
     }
 
@@ -141,7 +168,11 @@ impl Process {
     /// `entry_fn` must be a short, self-contained function — its code
     /// must not cross a page boundary, since only the single page
     /// containing its start address is remapped.
-    pub fn new_dummy(pid: Pid, entry_fn: unsafe extern "C" fn() -> !) -> Result<Self, &'static str> {
+    pub fn new_dummy(
+        pid: Pid,
+        entry_fn: unsafe extern "C" fn() -> !,
+        parent: Option<Pid>,
+    ) -> Result<Self, &'static str> {
         let address_space = AddressSpace::new().map_err(|_| "out of memory creating address space")?;
 
         let kernel_vaddr = VirtAddr::new(entry_fn as *const () as u64);
@@ -160,7 +191,7 @@ impl Process {
             .map_err(|_| "failed to map dummy code page")?;
 
         let entry = VirtAddr::new(DUMMY_CODE_BASE + page_offset);
-        Self::new(pid, address_space, entry)
+        Self::new(pid, address_space, entry, parent)
     }
 
     /// Builds a process by loading a real static ELF64 `ET_EXEC` image —
@@ -168,7 +199,11 @@ impl Process {
     /// `new_dummy` above only exists because this milestone bootstraps
     /// scheduler/syscall validation before `init`'s ELF bytes are wired
     /// up as a boot module.
-    pub fn from_elf(pid: Pid, elf_bytes: &[u8]) -> Result<Self, &'static str> {
+    ///
+    /// `parent` is `None` for a process boot code creates directly (e.g.
+    /// `init`), or `Some(caller_pid)` when created via `SYS_SPAWN` —
+    /// see [`ProcessState::Suspended`].
+    pub fn from_elf(pid: Pid, elf_bytes: &[u8], parent: Option<Pid>) -> Result<Self, &'static str> {
         let address_space =
             AddressSpace::new().map_err(|_| "out of memory creating address space")?;
         let mut allocator = GlobalFrameAllocator;
@@ -178,6 +213,48 @@ impl Process {
                 .map_err(|_| "failed to load ELF image")?
                 .entry
         };
-        Self::new(pid, address_space, entry)
+        Self::new(pid, address_space, entry, parent)
     }
+}
+
+/// The boot-shipped programs `SYS_SPAWN` may create a process from,
+/// keyed by the same `module_string` cmdline Limine tags each one with
+/// in `limine.conf` — everything `MODULES_REQUEST` handed the kernel
+/// except the module named `"init"`, which boot code loads directly
+/// rather than through this spawn-by-name path.
+///
+/// Held for the kernel's entire lifetime with no unsafe code beyond
+/// what boot already does: `ModulesRequest::response()` returns
+/// `Option<&'static Response<..>>`, so every `&File`/`&[u8]` obtained
+/// from it is already `'static`, and it's safe to hold that memory
+/// forever — Limine tags module regions `MEMMAP_EXECUTABLE_AND_MODULES`,
+/// which `memory::phys::BitmapFrameAllocator::populate` never reclaims
+/// (it only ever frees `MEMMAP_USABLE` regions).
+static SPAWNABLE_MODULES: Once<Vec<(&'static str, &'static [u8])>> = Once::new();
+
+/// Populates the spawn-by-name registry from Limine's modules response.
+/// Must run once at boot, after the `MODULES_REQUEST` response is
+/// available. There is no filesystem yet — this fixed, boot-time set is
+/// the only source `SYS_SPAWN` has for a new process's code (see
+/// `docs/adr/0006-dynamic-process-creation-and-capability-transfer.md`).
+pub fn init_spawnable_modules(modules: &'static [&'static limine::file::File]) {
+    SPAWNABLE_MODULES.call_once(|| {
+        modules
+            .iter()
+            .filter(|m| m.cmdline() != "init")
+            .map(|m| (m.cmdline(), m.data()))
+            .collect()
+    });
+}
+
+/// Looks up a boot-shipped program's ELF bytes by its `module_string`
+/// name, for `SYS_SPAWN`. `None` if no such module was shipped (or
+/// [`init_spawnable_modules`] hasn't run yet, which should never happen
+/// once boot completes).
+pub fn lookup_spawnable_module(name: &str) -> Option<&'static [u8]> {
+    SPAWNABLE_MODULES
+        .get()?
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, data)| *data)
 }
