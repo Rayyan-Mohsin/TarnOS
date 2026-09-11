@@ -9,8 +9,8 @@
 use spin::{Mutex, Once};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper as X86Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
-    PhysFrame, Size4KiB, Translate,
+    FrameAllocator, FrameDeallocator, Mapper as X86Mapper, OffsetPageTable, Page, PageTable,
+    PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -186,5 +186,76 @@ impl AddressSpace {
         unsafe {
             Cr3::write(self.pml4_frame, Cr3Flags::empty());
         }
+    }
+}
+
+/// Recursively frees every frame in the page-table subtree rooted at
+/// `frame` — including `frame` itself — down through leaf mappings.
+/// `level` is `frame`'s own page-table level (3=PDPT, 2=PD, 1=PT): a
+/// level-1 table (a PT)'s entries are leaf page mappings, not further
+/// tables, so they're freed directly rather than recursed into as if
+/// they were another table's frame — recursing into a leaf data page as
+/// though it were a `PageTable` would walk whatever that page's actual
+/// contents happen to be, corrupting or crashing on unrelated memory.
+///
+/// Only ever called on frames that belong to an `AddressSpace` being
+/// torn down in its entirety (see `Drop for AddressSpace` below) — by
+/// that point nothing else can still be relying on this subtree.
+fn free_table_subtree(frame: PhysFrame<Size4KiB>, level: u8) {
+    // SAFETY: `frame` is a live page-table frame (guaranteed by the
+    // caller — see this function's doc comment), so its HHDM alias is a
+    // valid `PageTable`.
+    let table: &PageTable = unsafe { &*phys_to_virt(frame.start_address()).as_ptr() };
+    let mut allocator = GlobalFrameAllocator;
+    for entry in table.iter() {
+        // `entry.frame()` is `Err` for a not-present entry, and
+        // (defensively — this kernel never creates one) for a huge
+        // page, which has no child table to recurse into.
+        if let Ok(child) = entry.frame() {
+            if level > 1 {
+                free_table_subtree(child, level - 1);
+            } else {
+                // SAFETY: `child` is a leaf page this address space is
+                // being torn down in its entirety, so nothing else
+                // still references it — same as `frame` below.
+                unsafe { allocator.deallocate_frame(child) };
+            }
+        }
+    }
+    // SAFETY: same as above — `frame` is being freed as part of tearing
+    // down the whole address space it belongs to, so nothing else still
+    // references it.
+    unsafe { allocator.deallocate_frame(frame) };
+}
+
+/// Frees every physical frame this address space owns: every mapped
+/// user page (ELF segments, the user stack), every intermediate
+/// PDPT/PD/PT frame `AddressSpace::map`'s calls to `map_to` allocated
+/// along the way (never tracked anywhere else — this walk is the only
+/// way to find them again), and the PML4 frame itself.
+///
+/// Walks only PML4 indices `0..256` — the user half. Indices `256..512`
+/// (the kernel half every `AddressSpace` shares, copied by value at
+/// construction — see `AddressSpace::new`) are never touched or
+/// recursed into, so the heap, every process's kernel stack, and the
+/// double-fault stack (all reachable only through that shared upper
+/// half, per `docs/adr/0005`) are structurally unreachable from this
+/// walk and can never be freed by it.
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        // SAFETY: this is this `AddressSpace`'s own PML4 frame, valid
+        // for as long as `self` is (i.e. right up until this drop).
+        let table: &PageTable =
+            unsafe { &*phys_to_virt(self.pml4_frame.start_address()).as_ptr() };
+        for entry in table.iter().take(256) {
+            if let Ok(child) = entry.frame() {
+                free_table_subtree(child, 3);
+            }
+        }
+        let mut allocator = GlobalFrameAllocator;
+        // SAFETY: every reference into the subtrees above is gone (they
+        // were just freed), and this is the last use of `pml4_frame`
+        // before `self` itself goes away.
+        unsafe { allocator.deallocate_frame(self.pml4_frame) };
     }
 }

@@ -63,13 +63,23 @@ pub unsafe extern "C" fn boundary_test_process() -> ! {
     const WORD0: u64 = u64::from_le_bytes(*b"BOUNDARY");
     const OK_WORD1: u64 = u64::from_le_bytes(*b"_OK\0\0\0\0\0");
     const FAIL_WORD1: u64 = u64::from_le_bytes(*b"_FAIL\0\0\0");
+    // The bystander is always the very first `Pid` this feature's boot
+    // path ever allocates (table index 0), and `allocate_pid` bumps a
+    // slot's generation to 1 before handing out its first-ever `Pid`
+    // there — see `task::scheduler::allocate_pid`'s doc comment. A bare
+    // `0` would name generation 0 at index 0, which no process is ever
+    // assigned, so this has to pack the generation in too — otherwise
+    // the check below would still (correctly) see `InvalidTarget`, but
+    // from a generation mismatch rather than the parent check it's
+    // actually meant to exercise.
+    const BYSTANDER_PID: u64 = 0 | (1u64 << 32);
 
     unsafe {
         asm!(
-            // Check 1: SYS_GRANT(target=0 [the bystander, not our
-            // child], src_cap=CONSOLE_CAP=0, dest_cap=0, rights=SEND).
+            // Check 1: SYS_GRANT(target=bystander [not our child],
+            // src_cap=CONSOLE_CAP=0, dest_cap=0, rights=SEND).
             "mov rax, 5",
-            "mov rdi, 0",
+            "mov rdi, {bystander_pid}",
             "mov rsi, 0",
             "mov rdx, 0",
             "mov r10, 1",
@@ -139,6 +149,7 @@ pub unsafe extern "C" fn boundary_test_process() -> ! {
             word0 = const WORD0,
             ok_word1 = const OK_WORD1,
             fail_word1 = const FAIL_WORD1,
+            bystander_pid = const BYSTANDER_PID,
             options(noreturn, nostack)
         );
     }

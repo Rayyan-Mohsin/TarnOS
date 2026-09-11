@@ -8,6 +8,7 @@ members = [
     "kernel",
     "userland/init",
     "userland/echo-child",
+    "userland/exit-code-child",
 ]
 
 # The kernel and userland binaries build against custom no_std target JSONs

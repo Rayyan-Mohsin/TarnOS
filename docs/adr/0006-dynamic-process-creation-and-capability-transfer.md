@@ -142,6 +142,14 @@ so a stale reference can't alias a reused slot.
   far — a `SYS_RECV`-based reply, as `echo-child` already does, is
   sufficient synchronization for a parent that needs to know its child
   reached some point.
+  **Update (milestone 4):** closed. See
+  `docs/adr/0007-process-lifecycle-and-termination.md` — `SYS_WAIT`,
+  `SYS_KILL`, and a process-table `Zombie` state now exist; an orphaned
+  `Suspended` child is killed outright when its parent terminates,
+  rather than left stuck forever. That ADR also revises the "confers no
+  further authority" claim two paragraphs above it in this document:
+  `SYS_KILL`/`SYS_WAIT` treat `parent` as authority for a child's entire
+  life, not only its `Suspended` window.
 - The `Rights` bitflags moved from `tarnos-kcore::captable` into
   `tarnos-abi` (re-exported from its old location unchanged), since
   `SYS_GRANT` makes it part of the wire contract between kernel and

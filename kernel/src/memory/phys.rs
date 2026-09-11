@@ -85,6 +85,14 @@ pub fn init(entries: &[&Entry]) {
     ALLOCATOR.lock().populate(entries);
 }
 
+/// Number of physical frames currently free. Exists for leak-regression
+/// testing (`xtask test-process-lifecycle`): a sequence of process
+/// creation/destruction that doesn't actually leak memory should leave
+/// this exactly where it started.
+pub fn free_frame_count() -> usize {
+    ALLOCATOR.lock().bitmap.free_count()
+}
+
 /// A thin handle implementing the `x86_64` crate's [`FrameAllocator`] /
 /// [`FrameDeallocator`] traits by delegating to the global bitmap
 /// allocator. Zero-sized — construct one wherever those traits are

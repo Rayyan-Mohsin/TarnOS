@@ -77,3 +77,12 @@ jobs:
 
       - name: xtask test-spawn-boundary (SYS_GRANT/SYS_PROCESS_START enforce ownership + rights)
         run: cargo run -p xtask -- test-spawn-boundary
+
+      - name: xtask test-process-lifecycle (process teardown frees its table slot + memory)
+        run: cargo run -p xtask -- test-process-lifecycle
+
+      - name: xtask test-wait-exit-code (SYS_WAIT genuinely blocks and reports the right status)
+        run: cargo run -p xtask -- test-wait-exit-code
+
+      - name: xtask test-kill-boundary (SYS_KILL enforces ownership across every process state)
+        run: cargo run -p xtask -- test-kill-boundary

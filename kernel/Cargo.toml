@@ -44,6 +44,26 @@ double-send-test = []
 # to prove the mechanism still works. Exercised by
 # `cargo run -p xtask -- test-spawn-boundary`.
 spawn-boundary-test = []
+# Spawns a single dummy ring-3 process that repeatedly spawns a
+# Suspended echo-child and immediately kills it, 3 * MAX_PROCESSES times
+# in a row -- a process-table/physical-memory leak would exhaust the
+# table long before the loop completes. Confirms process teardown
+# actually frees what it allocated. Exercised by
+# `cargo run -p xtask -- test-process-lifecycle`.
+process-lifecycle-test = []
+# Spawns a single dummy ring-3 process that spawns exit-code-child,
+# releases it, and immediately SYS_WAITs on it (before the child has
+# run even once), forcing the wait to genuinely block and later resume.
+# Confirms the reported exit status matches what the child actually
+# passed to sys_exit. Exercised by
+# `cargo run -p xtask -- test-wait-exit-code`.
+wait-exit-code-test = []
+# Spawns a bystander dummy process plus a test process that
+# adversarially probes SYS_KILL -- a kill against a real process that
+# isn't its child, then legitimate kills against both a Suspended and a
+# genuinely Blocked real child. Exercised by
+# `cargo run -p xtask -- test-kill-boundary`.
+kill-boundary-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

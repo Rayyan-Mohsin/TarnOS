@@ -73,7 +73,7 @@ const KERNEL_STACKS_BASE: u64 = 0xffff_9800_0000_0000;
 const KERNEL_STACK_SLOT_STRIDE: u64 = 4096 * (1 + KERNEL_STACK_PAGES); // guard page + stack
 
 fn kernel_stack_slot_base(pid: Pid) -> u64 {
-    KERNEL_STACKS_BASE + pid.0 * KERNEL_STACK_SLOT_STRIDE
+    KERNEL_STACKS_BASE + pid.index() as u64 * KERNEL_STACK_SLOT_STRIDE
 }
 
 /// Maps every possible process's kernel stack (with its guard page) into
@@ -103,12 +103,22 @@ pub struct Process {
     pub cap_table: CapTable,
     pub state: ProcessState,
     /// The process that created this one via `SYS_SPAWN`, if any —
-    /// `None` for every process boot code creates directly. Only
-    /// meaningful while `state == Suspended`: it names the one process
-    /// permitted to grant capabilities into this one or release it (see
-    /// `task::scheduler::with_process`/`start_child`). Confers no
-    /// authority once the child leaves `Suspended`.
+    /// `None` for every process boot code creates directly. While
+    /// `state == Suspended`, it's the one process permitted to grant
+    /// capabilities into this one or release it (see
+    /// `task::scheduler::with_process`/`start_child`). It remains
+    /// authoritative for the rest of this process's life for `SYS_KILL`/
+    /// `SYS_WAIT` (see `docs/adr/0007-process-lifecycle-and-termination.md`),
+    /// even though it confers no further *grant/start* authority once
+    /// the child leaves `Suspended`.
     pub parent: Option<Pid>,
+    /// Set by `SYS_WAIT` when some other process — always `parent`,
+    /// since only `parent` is ever permitted to wait on this one — is
+    /// currently blocked waiting for this process to terminate. Since
+    /// at most one process can ever legitimately hold that role, this
+    /// is a single field, not a queue; see
+    /// `task::scheduler::wait_for_child`/`take_and_finalize_slot`.
+    pub wait_waiter: Option<Pid>,
 }
 
 impl Process {
@@ -155,40 +165,73 @@ impl Process {
             cap_table: CapTable::new(),
             state: ProcessState::Ready,
             parent,
+            wait_waiter: None,
         })
     }
 
-    /// Builds a process by remapping an existing kernel-compiled
-    /// function's code page as user-executable in a fresh address space,
-    /// standing in for a real ELF-loaded process before the boot
-    /// sequence loads one (a later milestone task). Validates the
-    /// scheduler and context-switch machinery in isolation from ELF and
-    /// syscall complexity, per the milestone plan.
+    /// Builds a process by copying an existing kernel-compiled
+    /// function's machine code into fresh, process-owned pages in a new
+    /// address space, standing in for a real ELF-loaded process before
+    /// the boot sequence loads one (a later milestone task). Validates
+    /// the scheduler and context-switch machinery in isolation from ELF
+    /// and syscall complexity, per the milestone plan.
     ///
-    /// `entry_fn` must be a short, self-contained function — its code
-    /// must not cross a page boundary, since only the single page
-    /// containing its start address is remapped.
+    /// Copies rather than remaps the kernel's own `.text` frame
+    /// directly: `AddressSpace::drop` frees every leaf frame it finds
+    /// mapped when a process's address space is torn down (see
+    /// `memory::virt`), so remapping a live kernel code frame into a
+    /// process would make that process's exit incorrectly free running
+    /// kernel code back to the allocator — silent corruption the next
+    /// time that frame got handed out for something else. Copying gives
+    /// the process its own frames, safe to free like any other.
+    ///
+    /// `entry_fn` must be a short, self-contained function, comfortably
+    /// under one page in compiled size — two consecutive pages are
+    /// copied (see below) specifically because a function's start
+    /// offset within its own original page is whatever the compiler and
+    /// linker happened to place it at, never guaranteed to be
+    /// page-aligned, so its tail can spill into the following page for
+    /// any function longer than the room remaining from that offset.
     pub fn new_dummy(
         pid: Pid,
         entry_fn: unsafe extern "C" fn() -> !,
         parent: Option<Pid>,
     ) -> Result<Self, &'static str> {
         let address_space = AddressSpace::new().map_err(|_| "out of memory creating address space")?;
+        let mut allocator = GlobalFrameAllocator;
 
         let kernel_vaddr = VirtAddr::new(entry_fn as *const () as u64);
         let phys = virt::translate(kernel_vaddr).ok_or("dummy entry function is not mapped")?;
-        let frame = PhysFrame::<Size4KiB>::containing_address(phys);
-        let page_offset = phys.as_u64() - frame.start_address().as_u64();
+        let source_frame = PhysFrame::<Size4KiB>::containing_address(phys);
+        let page_offset = phys.as_u64() - source_frame.start_address().as_u64();
 
         const DUMMY_CODE_BASE: u64 = 0x0000_0000_0040_0000;
-        let user_code_page = Page::<Size4KiB>::containing_address(VirtAddr::new(DUMMY_CODE_BASE));
-        address_space
-            .map(
-                user_code_page,
-                frame,
-                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
-            )
-            .map_err(|_| "failed to map dummy code page")?;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+
+        // Two pages (see this function's doc comment for why), each
+        // copied byte-for-byte from the kernel's own compiled code at
+        // the same relative offset, so the function's internal
+        // (PC-relative) jumps and its `const`-baked-as-immediate
+        // operands all remain correct at the new address.
+        for i in 0..2u64 {
+            let dest_frame = allocator
+                .allocate_frame()
+                .ok_or("out of memory copying dummy code")?;
+            // SAFETY: both addresses are HHDM aliases of real physical
+            // frames — `source_frame + i` is still-live kernel code,
+            // `dest_frame` was just allocated (so exclusively ours) —
+            // and neither range overlaps the other.
+            unsafe {
+                let source = virt::phys_to_virt(source_frame.start_address() + i * 4096).as_ptr::<u8>();
+                let dest = virt::phys_to_virt(dest_frame.start_address()).as_mut_ptr::<u8>();
+                core::ptr::copy_nonoverlapping(source, dest, 4096);
+            }
+
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(DUMMY_CODE_BASE + i * 4096));
+            address_space
+                .map(page, dest_frame, flags)
+                .map_err(|_| "failed to map dummy code page")?;
+        }
 
         let entry = VirtAddr::new(DUMMY_CODE_BASE + page_offset);
         Self::new(pid, address_space, entry, parent)

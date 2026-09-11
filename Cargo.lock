@@ -29,6 +29,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "exit-code-child"
+version = "0.1.0"
+dependencies = [
+ "tarnos-abi",
+ "tarnos-rt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [

@@ -29,6 +29,18 @@ pub const SYS_GRANT: u64 = 5;
 /// caller into the scheduler's ready queue. Once started, the child is
 /// an ordinary independent process.
 pub const SYS_PROCESS_START: u64 = 6;
+/// `sys_wait(target_pid)` — blocks until `target_pid` (a child of the
+/// caller, by `Pid`, not restricted to `Suspended`) exits, then returns
+/// its [`ExitStatus`]. If `target_pid` already exited before this call,
+/// returns immediately instead of blocking.
+pub const SYS_WAIT: u64 = 7;
+/// `sys_kill(target_pid)` — immediately terminates `target_pid`, a
+/// child of the caller, regardless of its current state (`Ready`,
+/// `Blocked`, or `Suspended`). Only permitted against the caller's own
+/// child — the same structural-authority model `SYS_GRANT`/
+/// `SYS_PROCESS_START` already use, extended to cover a child's whole
+/// lifetime rather than only its `Suspended` window.
+pub const SYS_KILL: u64 = 8;
 
 /// An index into the *calling process's own* capability table.
 ///
@@ -108,6 +120,45 @@ impl Message {
         }
         let len = core::cmp::min(self.tag as usize, buf.len());
         core::str::from_utf8(&buf[..len]).unwrap_or("<invalid utf-8>")
+    }
+}
+
+/// How a process's execution ended, reported to its parent via
+/// `sys_wait`. Lives here, not just inside the kernel, because it's
+/// part of `sys_wait`'s return-value wire contract — a process needs to
+/// be able to decode what it's handed back, the same way it decodes a
+/// `SyscallError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// Voluntarily called `sys_exit(code)`.
+    Exited(i32),
+    /// Killed by a CPU exception it caused (see `arch::x86_64::idt`'s
+    /// CPL-3 fault handlers).
+    Faulted,
+    /// Terminated by its parent's `sys_kill`.
+    Killed,
+}
+
+impl ExitStatus {
+    /// Packs into `sys_wait`'s two return registers, `(kind, code)` —
+    /// `code` is only meaningful when `kind == 0`.
+    pub const fn to_regs(self) -> (u64, u64) {
+        match self {
+            ExitStatus::Exited(code) => (0, code as u32 as u64),
+            ExitStatus::Faulted => (1, 0),
+            ExitStatus::Killed => (2, 0),
+        }
+    }
+
+    /// Inverse of [`ExitStatus::to_regs`]. An unrecognized `kind` maps
+    /// to `Killed` rather than panicking, for the same forward-
+    /// compatibility reason [`SyscallError::from_retval`] does.
+    pub fn from_regs(kind: u64, code: u64) -> Self {
+        match kind {
+            0 => ExitStatus::Exited(code as u32 as i32),
+            1 => ExitStatus::Faulted,
+            _ => ExitStatus::Killed,
+        }
     }
 }
 

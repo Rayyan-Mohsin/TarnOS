@@ -28,13 +28,19 @@ fn main() {
         "test-uefi-boot" => test_uefi_boot(),
         "test-spawn-ipc" => test_spawn_ipc(),
         "test-spawn-boundary" => test_spawn_boundary(),
+        "test-process-lifecycle" => test_process_lifecycle(),
+        "test-wait-exit-code" => test_wait_exit_code(),
+        "test-kill-boundary" => test_kill_boundary(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
             .and_then(|_| test_double_send())
             .and_then(|_| test_uefi_boot())
             .and_then(|_| test_spawn_ipc())
-            .and_then(|_| test_spawn_boundary()),
+            .and_then(|_| test_spawn_boundary())
+            .and_then(|_| test_process_lifecycle())
+            .and_then(|_| test_wait_exit_code())
+            .and_then(|_| test_kill_boundary()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -73,9 +79,16 @@ fn print_usage() {
          \x20 test-spawn-boundary   Confirm SYS_GRANT/SYS_PROCESS_START reject a non-child\n\
          \x20                    target and a rights-amplifying grant, while a legitimate\n\
          \x20                    grant+start still succeeds\n\
+         \x20 test-process-lifecycle  Confirm repeated spawn+kill cycles well beyond\n\
+         \x20                    MAX_PROCESSES never exhaust the process table or leak memory\n\
+         \x20 test-wait-exit-code    Confirm SYS_WAIT genuinely blocks on a not-yet-run\n\
+         \x20                    child and reports the exit code it actually passed to sys_exit\n\
+         \x20 test-kill-boundary     Confirm SYS_KILL rejects a non-child target, while\n\
+         \x20                    legitimate kills against a Suspended and a Blocked child succeed\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
-         \x20                    test-double-send, test-uefi-boot, test-spawn-ipc, and\n\
-         \x20                    test-spawn-boundary in sequence"
+         \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
+         \x20                    test-spawn-boundary, test-process-lifecycle,\n\
+         \x20                    test-wait-exit-code, and test-kill-boundary in sequence"
     );
 }
 
@@ -160,7 +173,7 @@ fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), Str
 /// which kernel feature a given `xtask` command builds with — none of
 /// the existing milestone-2 test scenarios exercise spawning, but they
 /// still boot the same `limine.conf`.
-const USER_CRATES: &[&str] = &["init", "echo-child"];
+const USER_CRATES: &[&str] = &["init", "echo-child", "exit-code-child"];
 
 fn build(release: bool) -> Result<(), String> {
     let root = workspace_root();
@@ -456,6 +469,18 @@ fn run_scenario(
     Ok(log)
 }
 
+/// Extracts every `free_frames=<N>` value the kernel logged, in the
+/// order they appear — `task::scheduler::switch_to_next_or_halt` prints
+/// one at every halt, and `process-lifecycle-test`'s boot block prints
+/// a matching one right before the scheduler starts, giving
+/// `test_process_lifecycle` a before/after pair to compare.
+fn extract_free_frame_counts(log: &str) -> Vec<u64> {
+    log.lines()
+        .filter_map(|line| line.split("free_frames=").nth(1))
+        .filter_map(|rest| rest.trim().parse::<u64>().ok())
+        .collect()
+}
+
 /// Confirms the guest booted exactly once — the guest resetting instead
 /// of cleanly halting (a triple fault, or a panic loop under
 /// `-no-reboot` somehow not actually halting) would show up as a second
@@ -685,6 +710,129 @@ fn test_spawn_boundary() -> Result<(), String> {
     println!(
         "xtask: test-spawn-boundary PASSED — a grant against a non-child and a rights-\
          amplifying grant were both rejected, while a legitimate grant+start still succeeded"
+    );
+    Ok(())
+}
+
+/// Milestone 4: builds the kernel with a single dummy ring-3 process
+/// (the `process-lifecycle-test` feature) that repeatedly spawns a
+/// `Suspended` `echo-child` and immediately kills it, 3 * `MAX_PROCESSES`
+/// times in a row — far more than the process table's 16 slots could
+/// ever survive if terminating a process didn't actually free its slot
+/// and physical memory. Confirms the loop completes (no
+/// `ResourceExhausted`/`SpawnFailed` partway through) and that the
+/// physical frame allocator reports the exact same free-frame count
+/// before the loop starts and after the run halts.
+fn test_process_lifecycle() -> Result<(), String> {
+    let log = run_scenario(
+        &["process-lifecycle-test"],
+        "process-lifecycle-test.log",
+        8,
+        false,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("LIFECYCLE_FAIL") {
+        return Err(
+            "lifecycle-test process reported LIFECYCLE_FAIL -- a spawn or kill failed \
+             partway through the loop, suggesting the process table is leaking"
+                .to_string(),
+        );
+    }
+    if !log.contains("LIFECYCLE_OK") {
+        return Err(
+            "expected \"LIFECYCLE_OK\" -- the lifecycle-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    match extract_free_frame_counts(&log).as_slice() {
+        [before, after] if before == after => {}
+        [before, after] => {
+            return Err(format!(
+                "expected the free physical frame count to return to its starting value \
+                 after 48 spawn+kill cycles, but it went from {before} to {after} -- \
+                 AddressSpace teardown is leaking physical memory"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "expected exactly two \"free_frames=\" log lines (before and after), found {}",
+                other.len()
+            ));
+        }
+    }
+    println!(
+        "xtask: test-process-lifecycle PASSED — 48 spawn+kill cycles completed without \
+         exhausting the process table, and physical memory usage returned to baseline"
+    );
+    Ok(())
+}
+
+/// Milestone 4: builds the kernel with a single dummy ring-3 process
+/// (the `wait-exit-code-test` feature) that spawns `exit-code-child`,
+/// releases it, and immediately `SYS_WAIT`s on it before it has ever
+/// run — deterministically forcing the wait to genuinely block and
+/// later resume, rather than merely reading an already-`Zombie` slot.
+/// Confirms the reported status matches the exact code
+/// `exit-code-child` passes to `sys_exit`.
+fn test_wait_exit_code() -> Result<(), String> {
+    let log = run_scenario(&["wait-exit-code-test"], "wait-exit-code-test.log", 8, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("WAIT_FAIL") {
+        return Err(
+            "wait-test process reported WAIT_FAIL -- SYS_WAIT did not report the exit code \
+             exit-code-child actually passed to sys_exit"
+                .to_string(),
+        );
+    }
+    if !log.contains("WAIT_OK") {
+        return Err(
+            "expected \"WAIT_OK\" -- the wait-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-wait-exit-code PASSED — SYS_WAIT genuinely blocked on a not-yet-run \
+         child and reported its correct exit code once it exited"
+    );
+    Ok(())
+}
+
+/// Milestone 4, adversarially: builds the kernel with two dummy ring-3
+/// processes (the `kill-boundary-test` feature) — an idle bystander,
+/// and a test process that probes `SYS_KILL`'s ownership check directly
+/// (a kill against a real process that isn't its child), then proves a
+/// legitimate kill still works against both a `Suspended` child and a
+/// genuinely `Blocked` one. Complements `test_spawn_boundary`'s bar for
+/// adversarial proof, applied to termination instead of grant/start.
+fn test_kill_boundary() -> Result<(), String> {
+    let log = run_scenario(&["kill-boundary-test"], "kill-boundary-test.log", 5, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("KILL_FAIL") {
+        return Err(
+            "kill-test process reported KILL_FAIL -- SYS_KILL did not enforce ownership, or \
+             a legitimate kill against a Suspended/Blocked child did not succeed"
+                .to_string(),
+        );
+    }
+    if !log.contains("KILL_OK") {
+        return Err(
+            "expected \"KILL_OK\" -- the kill-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-kill-boundary PASSED — a kill against a non-child was rejected, while \
+         legitimate kills against both a Suspended and a genuinely Blocked child succeeded"
     );
     Ok(())
 }

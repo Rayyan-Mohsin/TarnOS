@@ -58,6 +58,15 @@ impl<const WORDS: usize> Bitmap<WORDS> {
         index < Self::CAPACITY && (self.words[index / 64] & (1 << (index % 64))) != 0
     }
 
+    /// Number of indices currently marked free. Independent of
+    /// `CAPACITY` (which includes indices never seeded at all) — this is
+    /// "how much is actually available right now," the figure a
+    /// leak-regression test compares before and after a sequence of
+    /// allocate/free cycles that should leave it unchanged.
+    pub fn free_count(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
     /// Finds and claims the lowest-indexed free slot, or `None` if
     /// nothing is free.
     pub fn allocate(&mut self) -> Option<usize> {
@@ -168,6 +177,20 @@ mod tests {
         // One past the top is out of range and must not alias index 0.
         b.set_free(Bitmap::<1>::CAPACITY);
         assert!(!b.is_free(0));
+    }
+
+    #[test]
+    fn free_count_tracks_allocate_and_set_free() {
+        let mut b: Bitmap<2> = Bitmap::new();
+        assert_eq!(b.free_count(), 0);
+        b.set_free(0);
+        b.set_free(5);
+        b.set_free(9);
+        assert_eq!(b.free_count(), 3);
+        b.allocate();
+        assert_eq!(b.free_count(), 2);
+        b.set_free(0);
+        assert_eq!(b.free_count(), 3);
     }
 
     #[test]

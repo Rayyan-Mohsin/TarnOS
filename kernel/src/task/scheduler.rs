@@ -8,9 +8,13 @@
 //! hot preemption path never allocates, so it can never deadlock against
 //! normal code caught mid-allocation when the timer fires. Process
 //! *creation* ([`spawn`]) does allocate (`Box::new`), but only ever runs
-//! from normal, non-interrupt code.
+//! from normal, non-interrupt code. Process *termination* similarly
+//! allocates a small, bounded `Vec` (see [`terminate_slot`]) for the
+//! same reason — never from interrupt context.
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
+use tarnos_abi::ExitStatus;
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::context_switch::TrapFrame;
@@ -32,17 +36,39 @@ pub const MAX_PROCESSES: usize = 16;
 /// `task::executor`).
 type ReadyQueue = tarnos_kcore::RingBuffer<Pid, MAX_PROCESSES>;
 
+/// One process-table slot's state.
+///
+/// `Zombie` exists only for the window between a process exiting and
+/// its recorded `parent` reaping it via `SYS_WAIT` — a bounded,
+/// single-slot cost (it can sit there forever if never reaped, but
+/// never grows), not the unbounded leak `Empty`-with-no-tracking would
+/// otherwise reintroduce. `parent` here is never optional: a slot only
+/// ever becomes a `Zombie` when someone could legitimately reap it — a
+/// process with no parent goes straight to `Empty` on exit instead. See
+/// `docs/adr/0007-process-lifecycle-and-termination.md`.
+enum Slot {
+    Empty,
+    Occupied(Box<Process>),
+    Zombie { parent: Pid, status: ExitStatus },
+}
+
 struct Inner {
-    processes: [Option<Box<Process>>; MAX_PROCESSES],
+    processes: [Slot; MAX_PROCESSES],
+    /// Generation counter per table slot, independent of whatever
+    /// `processes` currently holds there (so it survives
+    /// `Occupied` -> `Zombie` -> `Empty` transitions without resetting)
+    /// — see `Pid`'s doc comment.
+    generations: [u32; MAX_PROCESSES],
     ready: ReadyQueue,
     current: Option<Pid>,
 }
 
 impl Inner {
     const fn new() -> Self {
-        const NONE: Option<Box<Process>> = None;
+        const EMPTY: Slot = Slot::Empty;
         Self {
-            processes: [NONE; MAX_PROCESSES],
+            processes: [EMPTY; MAX_PROCESSES],
+            generations: [0; MAX_PROCESSES],
             ready: ReadyQueue::new(),
             current: None,
         }
@@ -55,11 +81,14 @@ static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 /// in the process table, so a terminated process's slot is available for
 /// reuse rather than the table filling up after `MAX_PROCESSES`
 /// processes have ever existed, cumulatively, over the kernel's whole
-/// lifetime. Returns `Pid(MAX_PROCESSES as u64)` — deliberately
-/// out-of-range — if every slot is occupied, so the existing bounds
-/// check in [`spawn`]/[`spawn_suspended`] rejects it with
-/// `ResourceExhausted` the same way an in-range but already-taken index
-/// never could.
+/// lifetime. Returns an out-of-range `Pid` if every slot is occupied, so
+/// the existing bounds check in [`spawn`]/[`spawn_suspended`] rejects it
+/// with `ResourceExhausted` the same way an in-range but already-taken
+/// index never could.
+///
+/// Bumps that slot's generation counter before handing back its `Pid` —
+/// see `Pid`'s doc comment for why a stale reference to whatever
+/// *previously* occupied this slot can never alias the new occupant.
 ///
 /// Safe to call without reserving the slot atomically against a second
 /// `allocate_pid()` racing in before the first's matching `spawn`/
@@ -69,13 +98,17 @@ static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 /// in the same straight-line sequence with nothing else able to run in
 /// between on this single core.
 pub fn allocate_pid() -> Pid {
-    let sched = SCHEDULER.lock();
+    let mut sched = SCHEDULER.lock();
     let index = sched
         .processes
         .iter()
-        .position(|slot| slot.is_none())
+        .position(|slot| matches!(slot, Slot::Empty))
         .unwrap_or(MAX_PROCESSES);
-    Pid(index as u64)
+    if index >= MAX_PROCESSES {
+        return Pid::new(MAX_PROCESSES, 0);
+    }
+    sched.generations[index] = sched.generations[index].wrapping_add(1);
+    Pid::new(index, sched.generations[index])
 }
 
 /// Registers a fully constructed process and marks it ready to run.
@@ -88,12 +121,12 @@ pub fn allocate_pid() -> Pid {
 /// process slot is occupied.
 pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let pid = process.pid;
-    let index = pid.0 as usize;
+    let index = pid.index();
     if index >= MAX_PROCESSES {
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
     let mut sched = SCHEDULER.lock();
-    sched.processes[index] = Some(Box::new(process));
+    sched.processes[index] = Slot::Occupied(Box::new(process));
     sched.ready.push(pid);
     Ok(())
 }
@@ -107,13 +140,28 @@ pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
 /// from the ready queue until [`start_child`] releases it.
 pub fn spawn_suspended(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let pid = process.pid;
-    let index = pid.0 as usize;
+    let index = pid.index();
     if index >= MAX_PROCESSES {
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
     let mut sched = SCHEDULER.lock();
-    sched.processes[index] = Some(Box::new(process));
+    sched.processes[index] = Slot::Occupied(Box::new(process));
     Ok(())
+}
+
+/// Looks up `pid`'s process only if it's both in range and still the
+/// generation the table currently holds at that index — the combined
+/// check every caller that might be handed a stale or
+/// attacker-controlled `Pid` needs (see `Pid`'s doc comment).
+fn occupied_mut(sched: &mut Inner, pid: Pid) -> Option<&mut Process> {
+    let index = pid.index();
+    if index >= MAX_PROCESSES || sched.generations[index] != pid.generation() {
+        return None;
+    }
+    match &mut sched.processes[index] {
+        Slot::Occupied(process) => Some(process),
+        _ => None,
+    }
 }
 
 /// Releases a `Suspended` child into the ready queue — `SYS_PROCESS_START`'s
@@ -122,12 +170,12 @@ pub fn spawn_suspended(process: Process) -> Result<(), tarnos_abi::SyscallError>
 /// [`with_process`] backs `SYS_GRANT` with, checked and mutated under one
 /// lock acquisition so there's no window between "checked" and "acted on."
 /// Once released, `target.parent` still names the creator for the
-/// record, but no further syscall treats that as authority — the child
-/// is an ordinary independent process from here on.
+/// record — `SYS_WAIT`/`SYS_KILL` still treat that as authority for the
+/// rest of the child's life (see `docs/adr/0007`), but no further
+/// *grant/start*-shaped syscall does.
 pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
     let mut sched = SCHEDULER.lock();
-    let index = target.0 as usize;
-    let Some(process) = sched.processes.get_mut(index).and_then(|slot| slot.as_mut()) else {
+    let Some(process) = occupied_mut(&mut sched, target) else {
         return Err(tarnos_abi::SyscallError::InvalidTarget);
     };
     if process.parent != Some(caller) || process.state != ProcessState::Suspended {
@@ -145,9 +193,10 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     sched.current = Some(pid);
-    let process = sched.processes[pid.0 as usize]
-        .as_mut()
-        .expect("switch_to named a process that does not exist");
+    let process = match &mut sched.processes[pid.index()] {
+        Slot::Occupied(process) => process,
+        _ => panic!("switch_to named a process that does not exist"),
+    };
     process.state = ProcessState::Running;
 
     let kernel_stack_top: VirtAddr = process.kernel_stack_top();
@@ -171,7 +220,9 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
 /// the round-robin queue picked and its register state at that point, so
 /// alternation (and each process's counter actually changing between
 /// picks, not just staying at its initial value) is directly observable
-/// rather than merely "didn't crash."
+/// rather than merely "didn't crash." Prints `pid.index()`, not the raw
+/// packed value, since the generation half is an internal safety detail
+/// no diagnostic reader needs to see.
 fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
     use core::sync::atomic::{AtomicU64, Ordering};
     static LAST_PRINT_TICK: AtomicU64 = AtomicU64::new(0);
@@ -182,7 +233,10 @@ fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
     let now = crate::arch::x86_64::interrupts::ticks();
     if now >= LAST_PRINT_TICK.load(Ordering::Relaxed) + 51 {
         LAST_PRINT_TICK.store(now, Ordering::Relaxed);
-        crate::earlyprintln!("[sched] switched to pid {} (rax={rax}, rbx={rbx})", pid.0);
+        crate::earlyprintln!(
+            "[sched] switched to pid {} (rax={rax}, rbx={rbx})",
+            pid.index()
+        );
     }
 }
 
@@ -195,8 +249,7 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
 
     if let Some(current_pid) = sched.current {
-        let index = current_pid.0 as usize;
-        if let Some(process) = sched.processes[index].as_mut() {
+        if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
             process.trap_frame = unsafe { *current_frame };
@@ -250,7 +303,7 @@ pub fn on_syscall_yield(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 /// the other side (see `ipc::endpoint::Endpoint::wake_receiver`), which
 /// pushes that process into `ready` as a direct side effect of the
 /// drain, so a process can genuinely become schedulable only *because*
-/// of that one drain. Nothing en route to this function's two callers
+/// of that one drain. Nothing en route to this function's callers
 /// (a process terminating or blocking) allocates or holds another lock
 /// across the drain, so one pass is enough to observe everything it
 /// could produce — a second pass would only ever find the same, already
@@ -272,6 +325,10 @@ fn switch_to_next_or_halt(
 
     drop(sched);
     crate::earlyprintln!("{halt_message}");
+    crate::earlyprintln!(
+        "[memtest] free_frames={}",
+        crate::memory::phys::free_frame_count()
+    );
     loop {
         unsafe {
             core::arch::asm!("cli", "hlt", options(nomem, nostack));
@@ -287,42 +344,228 @@ fn finish_switch(mut sched: crate::sync::SpinLockGuard<'_, Inner>, next_pid: Pid
     frame_ptr
 }
 
+/// Rebuilds the ready queue with `target` removed, if it was present.
+/// `tarnos_kcore::RingBuffer` has no remove-by-value, so this drains and
+/// re-pushes everything else — bounded to `MAX_PROCESSES` pop/push
+/// cycles, no allocation, and only ever called once per termination, not
+/// from a hot path like [`on_timer_tick`]. Safe to call even when
+/// `target` was never in the queue at all (self-exit/fault-kill's own
+/// pid never is) — the rebuild is then just a no-op copy.
+fn remove_from_ready_queue(sched: &mut Inner, target: Pid) {
+    let mut kept = ReadyQueue::new();
+    while let Some(pid) = sched.ready.pop() {
+        if pid != target {
+            let _ = kept.push(pid);
+        }
+    }
+    sched.ready = kept;
+}
+
+/// Extracts the process at `pid` (a no-op if its slot isn't currently
+/// `Occupied` — defensive, shouldn't happen for any real caller), and
+/// finalizes everything its termination cascades into:
+/// - removes it from the ready queue if it was there;
+/// - clears `sched.current` if it was the running process;
+/// - if another process is already blocked in `SYS_WAIT` for this one
+///   specifically (`process.wait_waiter`), resolves it immediately with
+///   `status` — no `Zombie` needed, that's the one party who could ever
+///   have claimed it;
+/// - otherwise, if it has a parent that *could* someday `SYS_WAIT` it,
+///   turns its slot into `Slot::Zombie`; if it has no parent, nobody
+///   ever could, so the slot goes straight to `Empty`;
+/// - sweeps its own leftover children the same way (see
+///   [`reap_children_of`]).
+///
+/// The extracted `Box<Process>` (and any orphaned children's) is pushed
+/// onto `pending_drops` rather than dropped here — see [`terminate_slot`]
+/// for why that has to happen after the scheduler lock is released.
+fn take_and_finalize_slot(
+    sched: &mut Inner,
+    pid: Pid,
+    status: ExitStatus,
+    pending_drops: &mut Vec<Box<Process>>,
+) {
+    let index = pid.index();
+    let process = match core::mem::replace(&mut sched.processes[index], Slot::Empty) {
+        Slot::Occupied(process) => process,
+        other => {
+            sched.processes[index] = other;
+            return;
+        }
+    };
+
+    remove_from_ready_queue(sched, pid);
+    if sched.current == Some(pid) {
+        sched.current = None;
+    }
+
+    if let Some(waiter) = process.wait_waiter {
+        wake_blocked_process_locked(sched, waiter, WakeResult::WaitCompleted(status));
+    } else if let Some(parent) = process.parent {
+        sched.processes[index] = Slot::Zombie { parent, status };
+    }
+    // else: no parent and nobody waiting — the slot stays `Empty`
+    // (already set by the `mem::replace` above).
+
+    reap_children_of(sched, pid, pending_drops);
+    pending_drops.push(process);
+}
+
+/// Sweeps the table once for children `exiting_pid` leaves behind:
+/// - an orphaned `Suspended` child (never released via
+///   `SYS_PROCESS_START`, so nothing but its now-gone parent could ever
+///   have released it) is killed outright, recursively via
+///   [`take_and_finalize_slot`] — closing the gap
+///   `docs/adr/0006-dynamic-process-creation-and-capability-transfer.md`
+///   named, now that a teardown primitive exists to close it with;
+/// - an orphaned `Zombie` child (its recorded parent — the one exiting
+///   right now — is the only process that could ever have `SYS_WAIT`ed
+///   it) is reaped straight to `Empty`, since leaving it would make its
+///   slot a *permanent* leak, worse than the bounded one a still-live
+///   parent leaves;
+/// - an ordinary running/blocked child is left alone — same as a real
+///   OS not killing a process just because its parent died.
+fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec<Box<Process>>) {
+    for index in 0..MAX_PROCESSES {
+        let is_orphaned_suspended = matches!(
+            &sched.processes[index],
+            Slot::Occupied(process)
+                if process.parent == Some(exiting_pid) && process.state == ProcessState::Suspended
+        );
+        if is_orphaned_suspended {
+            let child_pid = Pid::new(index, sched.generations[index]);
+            take_and_finalize_slot(sched, child_pid, ExitStatus::Killed, pending_drops);
+            continue;
+        }
+        if let Slot::Zombie { parent, .. } = &sched.processes[index] {
+            if *parent == exiting_pid {
+                sched.processes[index] = Slot::Empty;
+            }
+        }
+    }
+}
+
+/// Shared core of self-exit, fault-kill, and `SYS_KILL`: finalizes the
+/// process named by `pid` and everything that cascades from it (see
+/// [`take_and_finalize_slot`]), then drops its `Box<Process>` — freeing
+/// its `AddressSpace`'s physical frames via `Drop for AddressSpace`
+/// (`memory::virt`) — only *after* releasing the scheduler lock, since
+/// that walk is a variable-length operation this codebase's convention
+/// keeps off the lock's critical path (see `resolve_endpoint`'s and
+/// `sys_grant`'s doc comments for the same rule applied elsewhere).
+fn terminate_slot(pid: Pid, status: ExitStatus) {
+    let mut pending_drops = Vec::new();
+    {
+        let mut sched = SCHEDULER.lock();
+        take_and_finalize_slot(&mut sched, pid, status, &mut pending_drops);
+    }
+    drop(pending_drops); // outside the lock: frees every AddressSpace's frames
+}
+
 /// Drops the calling process (no frame to preserve — it isn't coming
 /// back) and switches to whichever process is next ready. If none are,
 /// this milestone has no idle process to fall back to, so it halts the
 /// core here rather than returning into the caller's now-invalid stack.
 ///
 /// Shared by two callers that are, from the scheduler's point of view,
-/// exactly the same event: a process voluntarily exiting (`SYS_EXIT`,
-/// via [`on_syscall_exit`]) and a process being forcibly killed after a
-/// CPU exception it caused (see `arch::x86_64::idt`'s process-facing
-/// fault handlers) — neither has a frame worth preserving, and both
-/// need the same "drop it, run whatever's next" handling.
-pub fn terminate_current_process() -> *mut TrapFrame {
-    let mut sched = SCHEDULER.lock();
-    if let Some(current_pid) = sched.current.take() {
-        sched.processes[current_pid.0 as usize] = None;
+/// exactly the same event modulo `status`: a process voluntarily exiting
+/// (`SYS_EXIT`, via [`on_syscall_exit`], `status = Exited(code)`) and a
+/// process being forcibly killed after a CPU exception it caused (see
+/// `arch::x86_64::idt`'s process-facing fault handlers, `status =
+/// Faulted`) — neither has a frame worth preserving, and both need the
+/// same "finalize it, run whatever's next" handling.
+pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
+    let current = {
+        let sched = SCHEDULER.lock();
+        sched.current
+    };
+    if let Some(pid) = current {
+        terminate_slot(pid, status);
     }
+    let sched = SCHEDULER.lock();
     switch_to_next_or_halt(sched, "[sched] last process exited, halting.")
 }
 
 /// Called from the `SYS_EXIT` syscall path: exiting voluntarily is
 /// exactly [`terminate_current_process`]'s event, just reached from a
-/// different entry stub.
-pub fn on_syscall_exit(_current_frame: *mut TrapFrame) -> *mut TrapFrame {
-    terminate_current_process()
+/// different entry stub. Reads the exit code the process placed in
+/// `rdi` — previously computed by userland and then silently dropped by
+/// the kernel; see `docs/adr/0007`.
+pub fn on_syscall_exit(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    // SAFETY: `current_frame` is the same valid, fully-initialized
+    // TrapFrame the syscall entry trampoline built for this trap.
+    let code = unsafe { (*current_frame).rdi } as i32;
+    terminate_current_process(ExitStatus::Exited(code))
+}
+
+/// `SYS_KILL`'s implementation: immediately terminates `target`,
+/// regardless of its current state (`Ready`, `Blocked`, or `Suspended`
+/// — not restricted to `Suspended` the way `SYS_GRANT`/`SYS_PROCESS_START`
+/// are), as long as it's a live child of `caller`. Rejects a target that
+/// isn't a live child of the caller at all, or one that's already a
+/// `Zombie` — reaping one of those is `SYS_WAIT`'s job, not this one's.
+///
+/// Since nothing is its own parent, and there's exactly one running
+/// process on this single core, `target` can never be `caller` itself —
+/// this never needs to trigger a scheduler switch, matching
+/// `sys_grant`/`sys_process_start`'s shape.
+pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
+    {
+        let mut sched = SCHEDULER.lock();
+        let Some(process) = occupied_mut(&mut sched, target) else {
+            return Err(tarnos_abi::SyscallError::InvalidTarget);
+        };
+        if process.parent != Some(caller) {
+            return Err(tarnos_abi::SyscallError::InvalidTarget);
+        }
+    }
+    terminate_slot(target, ExitStatus::Killed);
+    Ok(())
+}
+
+/// `SYS_WAIT`'s implementation. If `target` (a child of `caller`) has
+/// already exited (`Slot::Zombie`), reaps it immediately and returns its
+/// status (`Ok(Some(status))`). If `target` is still alive, records
+/// `caller` as its `wait_waiter` — so [`take_and_finalize_slot`] can
+/// resolve it directly once `target` actually terminates, whatever the
+/// cause — and returns `Ok(None)`, telling the caller (`sys_wait`'s
+/// syscall handler) to block via [`block_current_process`], exactly
+/// like a blocking `sys_send`/`sys_recv`. Since only `target.parent` is
+/// ever permitted to become its `wait_waiter`, at most one process can
+/// ever legitimately be waiting on a given target — no wait *queue* is
+/// needed, just this one field.
+pub fn wait_for_child(
+    target: Pid,
+    caller: Pid,
+) -> Result<Option<ExitStatus>, tarnos_abi::SyscallError> {
+    let mut sched = SCHEDULER.lock();
+    let index = target.index();
+    if index >= MAX_PROCESSES || sched.generations[index] != target.generation() {
+        return Err(tarnos_abi::SyscallError::InvalidTarget);
+    }
+    match &mut sched.processes[index] {
+        Slot::Zombie { parent, status } if *parent == caller => {
+            let status = *status;
+            sched.processes[index] = Slot::Empty;
+            Ok(Some(status))
+        }
+        Slot::Occupied(process) if process.parent == Some(caller) => {
+            process.wait_waiter = Some(caller);
+            Ok(None)
+        }
+        _ => Err(tarnos_abi::SyscallError::InvalidTarget),
+    }
 }
 
 /// Runs `f` against whichever process `pid` names, e.g. to check or
 /// mutate a specific process's capability table during a syscall like
 /// `SYS_GRANT`. `None` if `pid` doesn't currently name a live process —
 /// `pid` may be attacker-controlled input from a syscall register (an
-/// arbitrary `u64`), so this looks up via `.get_mut()` rather than
-/// direct indexing, unlike internal-only callers that already know
-/// their index is in range.
+/// arbitrary `u64`), so this looks up via [`occupied_mut`] (bounds- and
+/// generation-checked) rather than direct indexing.
 pub fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
     let mut sched = SCHEDULER.lock();
-    let process = sched.processes.get_mut(pid.0 as usize)?.as_mut()?;
+    let process = occupied_mut(&mut sched, pid)?;
     Some(f(process))
 }
 
@@ -339,28 +582,22 @@ pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
 }
 
 /// What to write into a blocked process's saved registers before waking
-/// it — the two ways a `SYS_SEND`/`SYS_RECV` that had to block can later
-/// complete. Built by whichever `ipc::Endpoint` operation displaces a
-/// `Waiter::Process`, since only it knows which of the two just happened
-/// and (for a receiver) what was actually delivered.
+/// it. Built by whichever operation displaces the corresponding wait —
+/// `ipc::Endpoint` for a `Waiter::Process` (send/recv), or
+/// [`take_and_finalize_slot`] for a `SYS_WAIT` waiter — since only the
+/// caller knows which of these just happened and (for a receiver, or a
+/// wait) what was actually delivered.
 pub enum WakeResult {
     /// A blocked sender's message was just taken by a receiver.
     SendCompleted,
     /// A blocked receiver was just handed a message.
     RecvCompleted { tag: u64, words: [u64; 3] },
+    /// A blocked `SYS_WAIT` caller's target just terminated.
+    WaitCompleted(ExitStatus),
 }
 
-/// Moves a `Blocked` process back to `Ready` and into the ready queue,
-/// having already written the syscall return value its blocked
-/// `SYS_SEND`/`SYS_RECV` should see once resumed. Called by
-/// `ipc::Endpoint` when a send or receive completes a rendezvous with a
-/// process that was blocked on the other side — `Endpoint` itself has no
-/// notion of a scheduler, so it hands the bookkeeping here instead of
-/// doing it directly. A no-op if `pid` no longer exists (e.g. it was
-/// killed by a fault while blocked — see `arch::x86_64::idt`).
-pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
-    let mut sched = SCHEDULER.lock();
-    let Some(process) = sched.processes[pid.0 as usize].as_mut() else {
+fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) {
+    let Some(process) = occupied_mut(sched, pid) else {
         return;
     };
     match result {
@@ -374,15 +611,35 @@ pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
             process.trap_frame.rdx = words[1];
             process.trap_frame.r10 = words[2];
         }
+        WakeResult::WaitCompleted(status) => {
+            let (kind, code) = status.to_regs();
+            process.trap_frame.rax = 0;
+            process.trap_frame.rdi = kind;
+            process.trap_frame.rsi = code;
+        }
     }
     process.state = ProcessState::Ready;
     sched.ready.push(pid);
 }
 
-/// Suspends the calling process inside a blocking `SYS_SEND`/`SYS_RECV`
-/// that found no partner ready: persists `current_frame` into the
-/// process's own `trap_frame` (so `wake_blocked_process` can resume it
-/// later, exactly like a preempted process's frame is persisted in
+/// Moves a `Blocked` process back to `Ready` and into the ready queue,
+/// having already written the syscall return value its blocked call
+/// should see once resumed. Called by `ipc::Endpoint` when a send or
+/// receive completes a rendezvous with a process that was blocked on
+/// the other side — `Endpoint` itself has no notion of a scheduler, so
+/// it hands the bookkeeping here instead of doing it directly. A no-op
+/// if `pid` no longer names the same process (e.g. it was killed while
+/// blocked — see `arch::x86_64::idt`/`SYS_KILL` — or its slot has since
+/// been reused by an unrelated process; see `Pid`'s doc comment).
+pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
+    let mut sched = SCHEDULER.lock();
+    wake_blocked_process_locked(&mut sched, pid, result);
+}
+
+/// Suspends the calling process inside a blocking `SYS_SEND`/`SYS_RECV`/
+/// `SYS_WAIT` that found no partner ready: persists `current_frame` into
+/// the process's own `trap_frame` (so `wake_blocked_process` can resume
+/// it later, exactly like a preempted process's frame is persisted in
 /// `on_timer_tick`), marks it `Blocked`, and — the one thing that
 /// actually distinguishes this from an ordinary preemption — does *not*
 /// push it back into the ready queue, so it can never be scheduled again
@@ -392,7 +649,7 @@ pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
 pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
     if let Some(current_pid) = sched.current {
-        if let Some(process) = sched.processes[current_pid.0 as usize].as_mut() {
+        if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame -- it's the same frame the syscall entry
             // trampoline built for this process's own trap.

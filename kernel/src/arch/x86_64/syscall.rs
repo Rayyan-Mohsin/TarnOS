@@ -14,8 +14,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tarnos_abi::{
-    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_EXIT, SYS_GRANT, SYS_PROCESS_START,
-    SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_YIELD,
+    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_EXIT, SYS_GRANT, SYS_KILL,
+    SYS_PROCESS_START, SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -148,6 +148,8 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_SPAWN => sys_spawn(frame),
         SYS_GRANT => sys_grant(frame),
         SYS_PROCESS_START => sys_process_start(frame),
+        SYS_WAIT => sys_wait(frame),
+        SYS_KILL => sys_kill(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -328,6 +330,55 @@ fn sys_process_start(frame: *mut TrapFrame) -> *mut TrapFrame {
     let outcome = scheduler::with_current_process(|p| p.pid)
         .ok_or(SyscallError::InvalidTarget)
         .and_then(|caller_pid| scheduler::start_child(target_pid, caller_pid));
+
+    regs.rax = match outcome {
+        Ok(()) => 0,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_WAIT`: blocks until `target_pid` (a child of the caller, in any
+/// state) terminates, then returns its exit status —
+/// `rdi`=kind (`0`=`Exited`, `1`=`Faulted`, `2`=`Killed`), `rsi`=code
+/// (`Exited` only). Non-blocking if `target_pid` already terminated
+/// before this call. See [`scheduler::wait_for_child`].
+fn sys_wait(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let target_pid = Pid(regs.rdi);
+
+    let outcome = scheduler::with_current_process(|p| p.pid)
+        .ok_or(SyscallError::InvalidTarget)
+        .and_then(|caller_pid| scheduler::wait_for_child(target_pid, caller_pid));
+
+    match outcome {
+        Ok(Some(status)) => {
+            let (kind, code) = status.to_regs();
+            regs.rax = 0;
+            regs.rdi = kind;
+            regs.rsi = code;
+            frame
+        }
+        Ok(None) => scheduler::block_current_process(frame),
+        Err(e) => {
+            regs.rax = e.as_retval() as u64;
+            frame
+        }
+    }
+}
+
+/// `SYS_KILL`: immediately terminates `target_pid`, a child of the
+/// caller, regardless of its current state. See
+/// [`scheduler::terminate_process`] for the ownership check. Never
+/// blocks or switches — a caller can never target itself (see that
+/// function's doc comment) — so this always returns `frame` directly.
+fn sys_kill(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let target_pid = Pid(regs.rdi);
+
+    let outcome = scheduler::with_current_process(|p| p.pid)
+        .ok_or(SyscallError::InvalidTarget)
+        .and_then(|caller_pid| scheduler::terminate_process(target_pid, caller_pid));
 
     regs.rax = match outcome {
         Ok(()) => 0,

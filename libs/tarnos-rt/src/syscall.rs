@@ -6,8 +6,8 @@
 use core::arch::asm;
 
 use tarnos_abi::{
-    CapIndex, Message, Rights, SyscallError, SYS_EXIT, SYS_GRANT, SYS_PROCESS_START, SYS_RECV,
-    SYS_SEND, SYS_SPAWN, SYS_YIELD,
+    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_EXIT, SYS_GRANT, SYS_KILL,
+    SYS_PROCESS_START, SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 
 pub fn sys_yield() {
@@ -144,6 +144,52 @@ pub fn sys_process_start(target_pid: u64) -> Result<(), SyscallError> {
         asm!(
             "syscall",
             inout("rax") SYS_PROCESS_START => retval,
+            in("rdi") target_pid,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Blocks until `target_pid` (a child of the caller, in any state)
+/// terminates, then returns how. Non-blocking if `target_pid` already
+/// terminated before this call.
+pub fn sys_wait(target_pid: u64) -> Result<ExitStatus, SyscallError> {
+    let retval: i64;
+    let (kind, code): (u64, u64);
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_WAIT => retval,
+            in("rdi") target_pid,
+            out("rsi") kind,
+            out("rdx") code,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(ExitStatus::from_regs(kind, code))
+    }
+}
+
+/// Immediately terminates `target_pid`, a child of the caller,
+/// regardless of its current state.
+pub fn sys_kill(target_pid: u64) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_KILL => retval,
             in("rdi") target_pid,
             out("rcx") _,
             out("r11") _,

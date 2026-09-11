@@ -68,10 +68,10 @@ extern "x86-interrupt" fn double_fault_handler(
 /// from that process exiting itself.
 fn kill_faulting_process_and_reschedule(description: core::fmt::Arguments) -> *mut TrapFrame {
     match crate::task::scheduler::with_current_process(|p| p.pid) {
-        Some(pid) => earlyprintln!("[fault] pid {} killed: {}", pid.0, description),
+        Some(pid) => earlyprintln!("[fault] pid {} killed: {}", pid.index(), description),
         None => earlyprintln!("[fault] killed (no current process?): {}", description),
     }
-    crate::task::scheduler::terminate_current_process()
+    crate::task::scheduler::terminate_current_process(tarnos_abi::ExitStatus::Faulted)
 }
 
 #[unsafe(no_mangle)]

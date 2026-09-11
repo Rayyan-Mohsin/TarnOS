@@ -18,6 +18,7 @@ mod lang_items;
 mod memory;
 mod milestone2_tests;
 mod milestone3_tests;
+mod milestone4_tests;
 mod sync;
 mod task;
 
@@ -379,6 +380,126 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(test_process).expect("spawn failed");
 
         earlyprintln!("[boot] spawn-boundary-test: spawned bystander + boundary-test processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 4: repeatedly spawns a Suspended echo-child and
+    // immediately kills it, well beyond MAX_PROCESSES times in a row —
+    // confirms process teardown actually frees the process-table slot
+    // and physical memory it used, instead of leaking either (see
+    // `xtask test-process-lifecycle`). Never enabled for a normal build.
+    #[cfg(feature = "process-lifecycle-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        earlyprintln!(
+            "[memtest] free_frames={}",
+            memory::phys::free_frame_count()
+        );
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process = task::process::Process::new_dummy(
+            test_pid,
+            milestone4_tests::lifecycle_test_process,
+            None,
+        )
+        .expect("failed to create the process-lifecycle-test dummy process");
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] process-lifecycle-test: spawned lifecycle-test process");
+        task::scheduler::start();
+    }
+
+    // Milestone 4: spawns exit-code-child, releases it, and immediately
+    // SYS_WAITs on it before it has ever run — forcing the wait to
+    // genuinely block and later resume with the correct exit status
+    // (see `xtask test-wait-exit-code`). Never enabled for a normal
+    // build.
+    #[cfg(feature = "wait-exit-code-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process =
+            task::process::Process::new_dummy(test_pid, milestone4_tests::wait_test_process, None)
+                .expect("failed to create the wait-exit-code-test dummy process");
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] wait-exit-code-test: spawned wait-test process");
+        task::scheduler::start();
+    }
+
+    // Milestone 4: an idle bystander process plus a test process that
+    // adversarially probes SYS_KILL — a kill against a real process
+    // that isn't its child, then legitimate kills against both a
+    // Suspended and a genuinely Blocked real child (see
+    // `xtask test-kill-boundary`). Never enabled for a normal build.
+    #[cfg(feature = "kill-boundary-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        // Allocated first, so it gets the fixed Pid (index 0, generation
+        // 1) `milestone4_tests::kill_boundary_test_process`'s raw asm
+        // hardcodes as "a real process that is not my child."
+        let bystander_pid = task::scheduler::allocate_pid();
+        let bystander_process = task::process::Process::new_dummy(
+            bystander_pid,
+            milestone4_tests::kill_test_bystander_process,
+            None,
+        )
+        .expect("failed to create the bystander dummy process");
+        task::scheduler::spawn(bystander_process).expect("spawn failed");
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process = task::process::Process::new_dummy(
+            test_pid,
+            milestone4_tests::kill_boundary_test_process,
+            None,
+        )
+        .expect("failed to create the kill-boundary-test dummy process");
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        // A private SEND|RECV endpoint this process can grant into a
+        // child it spawns, so that child can genuinely block on recv
+        // (see check 3's doc comment on kill_boundary_test_process).
+        test_process.cap_table.insert(
+            tarnos_abi::CapIndex(1),
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(alloc::sync::Arc::new(ipc::Endpoint::new())),
+                rights: ipc::Rights::SEND | ipc::Rights::RECV,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] kill-boundary-test: spawned bystander + kill-test processes");
         task::scheduler::start();
     }
 
