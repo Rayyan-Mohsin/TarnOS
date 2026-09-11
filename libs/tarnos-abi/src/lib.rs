@@ -41,6 +41,11 @@ pub const SYS_WAIT: u64 = 7;
 /// `SYS_PROCESS_START` already use, extended to cover a child's whole
 /// lifetime rather than only its `Suspended` window.
 pub const SYS_KILL: u64 = 8;
+/// `sys_sbrk(increment)` — grows the caller's heap by `increment` bytes
+/// (must be `>= 0` this milestone — see [`SyscallError::InvalidArgument`])
+/// and returns the *previous* break address. `increment == 0` is a
+/// side-effect-free query of the current break.
+pub const SYS_SBRK: u64 = 9;
 
 /// An index into the *calling process's own* capability table.
 ///
@@ -235,6 +240,10 @@ pub enum SyscallError {
     /// `sys_spawn` found the named program but could not construct a
     /// process from it (ELF load failure or the process table is full).
     SpawnFailed = 7,
+    /// `sys_sbrk`'s `increment` is negative (shrinking is not supported
+    /// this milestone), would overflow the break address, or would grow
+    /// the heap past its fixed per-process ceiling.
+    InvalidArgument = 8,
 }
 
 impl SyscallError {
@@ -256,6 +265,7 @@ impl SyscallError {
             5 => SyscallError::NoSuchProgram,
             6 => SyscallError::InvalidTarget,
             7 => SyscallError::SpawnFailed,
+            8 => SyscallError::InvalidArgument,
             _ => SyscallError::NoSuchSyscall,
         }
     }

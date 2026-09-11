@@ -31,6 +31,8 @@ fn main() {
         "test-process-lifecycle" => test_process_lifecycle(),
         "test-wait-exit-code" => test_wait_exit_code(),
         "test-kill-boundary" => test_kill_boundary(),
+        "test-heap-growth" => test_heap_growth(),
+        "test-sbrk-boundary" => test_sbrk_boundary(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
@@ -40,7 +42,9 @@ fn main() {
             .and_then(|_| test_spawn_boundary())
             .and_then(|_| test_process_lifecycle())
             .and_then(|_| test_wait_exit_code())
-            .and_then(|_| test_kill_boundary()),
+            .and_then(|_| test_kill_boundary())
+            .and_then(|_| test_heap_growth())
+            .and_then(|_| test_sbrk_boundary()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -85,10 +89,16 @@ fn print_usage() {
          \x20                    child and reports the exit code it actually passed to sys_exit\n\
          \x20 test-kill-boundary     Confirm SYS_KILL rejects a non-child target, while\n\
          \x20                    legitimate kills against a Suspended and a Blocked child succeed\n\
+         \x20 test-heap-growth      Confirm heap-child's sys_sbrk-backed Vec<u64> allocation\n\
+         \x20                    survives several heap growths and exits cleanly\n\
+         \x20 test-sbrk-boundary     Confirm SYS_SBRK rejects an absurd increment and a\n\
+         \x20                    negative one, while a valid grow and a zero-increment query\n\
+         \x20                    behave correctly\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
-         \x20                    test-wait-exit-code, and test-kill-boundary in sequence"
+         \x20                    test-wait-exit-code, test-kill-boundary, test-heap-growth,\n\
+         \x20                    and test-sbrk-boundary in sequence"
     );
 }
 
@@ -173,7 +183,7 @@ fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), Str
 /// which kernel feature a given `xtask` command builds with — none of
 /// the existing milestone-2 test scenarios exercise spawning, but they
 /// still boot the same `limine.conf`.
-const USER_CRATES: &[&str] = &["init", "echo-child", "exit-code-child"];
+const USER_CRATES: &[&str] = &["init", "echo-child", "exit-code-child", "heap-child"];
 
 fn build(release: bool) -> Result<(), String> {
     let root = workspace_root();
@@ -833,6 +843,72 @@ fn test_kill_boundary() -> Result<(), String> {
     println!(
         "xtask: test-kill-boundary PASSED — a kill against a non-child was rejected, while \
          legitimate kills against both a Suspended and a genuinely Blocked child succeeded"
+    );
+    Ok(())
+}
+
+/// Milestone 5: builds the kernel with a single dummy ring-3 process
+/// (the `heap-growth-test` feature) that spawns `heap-child` — a real
+/// ELF process that builds a 512 KiB `Vec<u64>` via `sys_sbrk`-backed
+/// `alloc`, forcing dozens of separate heap growths, then verifies
+/// every value it wrote is still intact — and confirms it exits `0`.
+fn test_heap_growth() -> Result<(), String> {
+    let log = run_scenario(&["heap-growth-test"], "heap-growth-test.log", 8, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("HEAP_FAIL") {
+        return Err(
+            "heap-growth-test process reported HEAP_FAIL -- heap-child's Vec<u64> either \
+             failed to grow via sys_sbrk or lost data it had already written"
+                .to_string(),
+        );
+    }
+    if !log.contains("HEAP_OK") {
+        return Err(
+            "expected \"HEAP_OK\" -- the heap-growth-test process never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-heap-growth PASSED — heap-child's multi-page Vec<u64>, backed by \
+         sys_sbrk and tarnos-rt's userland allocator, grew and stayed intact end to end"
+    );
+    Ok(())
+}
+
+/// Milestone 5, adversarially: builds the kernel with a single dummy
+/// ring-3 process (the `sbrk-boundary-test` feature) that calls
+/// `SYS_SBRK` directly — an increment comfortably over the fixed 64 MiB
+/// heap ceiling is rejected before any frame is touched, a valid grow
+/// succeeds, a negative increment is rejected (grow-only this
+/// milestone), and a zero-increment query returns the unchanged current
+/// break, proving the rejected calls truly had no side effects.
+fn test_sbrk_boundary() -> Result<(), String> {
+    let log = run_scenario(&["sbrk-boundary-test"], "sbrk-boundary-test.log", 5, false)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("SBRK_FAIL") {
+        return Err(
+            "sbrk-boundary-test process reported SBRK_FAIL -- SYS_SBRK did not enforce its \
+             heap ceiling or grow-only contract, or a legitimate grow/query misbehaved"
+                .to_string(),
+        );
+    }
+    if !log.contains("SBRK_OK") {
+        return Err(
+            "expected \"SBRK_OK\" -- the sbrk-boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-sbrk-boundary PASSED — an absurd increment and a negative increment were \
+         both rejected, while a valid grow and a side-effect-free query behaved correctly"
     );
     Ok(())
 }

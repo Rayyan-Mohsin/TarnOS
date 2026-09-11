@@ -10,3 +10,4 @@ path = "src/lib.rs"
 
 [dependencies]
 tarnos-abi = { path = "../tarnos-abi" }
+linked_list_allocator = "0.10"

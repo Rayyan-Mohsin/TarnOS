@@ -86,3 +86,9 @@ jobs:
 
       - name: xtask test-kill-boundary (SYS_KILL enforces ownership across every process state)
         run: cargo run -p xtask -- test-kill-boundary
+
+      - name: xtask test-heap-growth (sys_sbrk-backed userland alloc survives multi-page growth)
+        run: cargo run -p xtask -- test-heap-growth
+
+      - name: xtask test-sbrk-boundary (SYS_SBRK enforces its heap ceiling and grow-only contract)
+        run: cargo run -p xtask -- test-sbrk-boundary

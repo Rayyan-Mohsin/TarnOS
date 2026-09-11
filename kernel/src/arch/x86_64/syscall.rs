@@ -15,19 +15,34 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tarnos_abi::{
     CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_EXIT, SYS_GRANT, SYS_KILL,
-    SYS_PROCESS_START, SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
+use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::context_switch::TrapFrame;
 use super::gdt;
 use crate::ipc::endpoint::{RecvResult, SendResult};
 use crate::ipc::{CapabilitySlot, Endpoint, KernelObjectRef, Rights};
-use crate::task::process::ProcessState;
+use crate::memory::phys::GlobalFrameAllocator;
+use crate::task::process::{ProcessState, USER_HEAP_START};
 use crate::task::scheduler;
 use crate::task::Pid;
+
+/// Fixed per-process ceiling on total heap size, checked before any
+/// frame is touched by [`sys_sbrk`]. Without this, a single process
+/// requesting an astronomically large (but non-overflowing) increment
+/// would have the kernel allocate physical frames until all of RAM is
+/// committed to that one process's heap before finally failing on a
+/// genuine OOM — a syscall-triggerable denial-of-service against every
+/// other process. 64 MiB comfortably covers anything built so far.
+const USER_HEAP_MAX_SIZE: u64 = 64 * 1024 * 1024;
+
+fn align_up(addr: u64, align: u64) -> u64 {
+    (addr + align - 1) & !(align - 1)
+}
 
 /// The kernel stack top for whichever process is about to run — updated
 /// by the scheduler on every switch, alongside `gdt::set_kernel_stack`.
@@ -150,6 +165,7 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_PROCESS_START => sys_process_start(frame),
         SYS_WAIT => sys_wait(frame),
         SYS_KILL => sys_kill(frame),
+        SYS_SBRK => sys_sbrk(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -382,6 +398,75 @@ fn sys_kill(frame: *mut TrapFrame) -> *mut TrapFrame {
 
     regs.rax = match outcome {
         Ok(()) => 0,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_SBRK`: grows the caller's heap by `increment` (`rdi`, as `i64`)
+/// bytes and returns the previous break, or a negative `SyscallError` —
+/// `increment == 0` is a side-effect-free query.
+///
+/// Grow-only this milestone: a negative `increment` is rejected rather
+/// than actually shrinking (see `docs/adr/0008`). `increment` is also
+/// rejected if it would overflow the break address or grow the heap
+/// past [`USER_HEAP_MAX_SIZE`] — checked *before* touching the frame
+/// allocator, so an adversarial request never allocates anything before
+/// being rejected.
+///
+/// This is the first syscall handler to call something that takes a
+/// second lock (`GlobalFrameAllocator`'s, inside `p.address_space.map`)
+/// from *inside* `with_current_process`'s closure, i.e. while the
+/// scheduler's lock is already held. Every earlier handler
+/// (`resolve_endpoint`, `sys_grant`) deliberately avoided this. It's
+/// safe here because nothing in `memory::phys`/`memory::virt` ever
+/// calls back into `task::scheduler` — the lock order
+/// `SCHEDULER` -> phys-allocator is strictly one-directional, audited,
+/// with no cycle. Any *future* syscall that wants to nest a second lock
+/// inside `with_current_process` must repeat this same audit, not
+/// assume it's now generally safe.
+fn sys_sbrk(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let increment = regs.rdi as i64;
+
+    let outcome: Result<u64, SyscallError> = scheduler::with_current_process(|p| {
+        if increment < 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let old_end = p.heap_end;
+        let new_end = old_end
+            .checked_add(increment as u64)
+            .ok_or(SyscallError::InvalidArgument)?;
+        if new_end - USER_HEAP_START > USER_HEAP_MAX_SIZE {
+            return Err(SyscallError::InvalidArgument);
+        }
+
+        let old_top = align_up(old_end, 4096);
+        let new_top = align_up(new_end, 4096);
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        let mut addr = old_top;
+        while addr < new_top {
+            let mut allocator = GlobalFrameAllocator;
+            let new_frame = allocator
+                .allocate_frame()
+                .ok_or(SyscallError::ResourceExhausted)?;
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            p.address_space
+                .map(page, new_frame, flags)
+                .map_err(|_| SyscallError::ResourceExhausted)?;
+            addr += 4096;
+        }
+
+        p.heap_end = new_end;
+        Ok(old_end)
+    })
+    .unwrap_or(Err(SyscallError::InvalidTarget));
+
+    regs.rax = match outcome {
+        Ok(old_end) => old_end,
         Err(e) => e.as_retval() as u64,
     };
     frame

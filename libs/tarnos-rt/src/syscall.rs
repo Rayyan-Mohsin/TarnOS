@@ -7,7 +7,7 @@ use core::arch::asm;
 
 use tarnos_abi::{
     CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_EXIT, SYS_GRANT, SYS_KILL,
-    SYS_PROCESS_START, SYS_RECV, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 
 pub fn sys_yield() {
@@ -200,6 +200,30 @@ pub fn sys_kill(target_pid: u64) -> Result<(), SyscallError> {
         Err(SyscallError::from_retval(retval))
     } else {
         Ok(())
+    }
+}
+
+/// Grows the caller's heap by `increment` bytes (must be `>= 0` — see
+/// `SyscallError::InvalidArgument`) and returns the previous break
+/// address. `increment == 0` is a side-effect-free query of the current
+/// break. Used by [`crate::heap`]'s global allocator; most callers
+/// should just use `alloc::*` types instead of calling this directly.
+pub fn sys_sbrk(increment: i64) -> Result<u64, SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_SBRK => retval,
+            in("rdi") increment,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(retval as u64)
     }
 }
 

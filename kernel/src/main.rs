@@ -19,6 +19,7 @@ mod memory;
 mod milestone2_tests;
 mod milestone3_tests;
 mod milestone4_tests;
+mod milestone5_tests;
 mod sync;
 mod task;
 
@@ -500,6 +501,69 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(test_process).expect("spawn failed");
 
         earlyprintln!("[boot] kill-boundary-test: spawned bystander + kill-test processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 5: spawns heap-child (a real ELF process that proves
+    // sys_sbrk-backed alloc works by building a multi-page Vec<u64>),
+    // releases it, and SYS_WAITs for it to report success via its exit
+    // code (see `xtask test-heap-growth`). Never enabled for a normal
+    // build.
+    #[cfg(feature = "heap-growth-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process = task::process::Process::new_dummy(
+            test_pid,
+            milestone5_tests::heap_growth_test_process,
+            None,
+        )
+        .expect("failed to create the heap-growth-test dummy process");
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] heap-growth-test: spawned heap-growth-test process");
+        task::scheduler::start();
+    }
+
+    // Milestone 5: adversarially probes SYS_SBRK directly — an absurd
+    // increment over the fixed heap ceiling, a valid grow, a rejected
+    // negative increment, and a side-effect-free zero-increment query
+    // (see `xtask test-sbrk-boundary`). Never enabled for a normal build.
+    #[cfg(feature = "sbrk-boundary-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let test_pid = task::scheduler::allocate_pid();
+        let mut test_process = task::process::Process::new_dummy(
+            test_pid,
+            milestone5_tests::sbrk_boundary_test_process,
+            None,
+        )
+        .expect("failed to create the sbrk-boundary-test dummy process");
+        test_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(test_process).expect("spawn failed");
+
+        earlyprintln!("[boot] sbrk-boundary-test: spawned sbrk-boundary-test process");
         task::scheduler::start();
     }
 

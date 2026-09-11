@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "heap-child"
+version = "0.1.0"
+dependencies = [
+ "tarnos-abi",
+ "tarnos-rt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -139,6 +147,7 @@ dependencies = [
 name = "tarnos-rt"
 version = "0.1.0"
 dependencies = [
+ "linked_list_allocator",
  "tarnos-abi",
 ]
 

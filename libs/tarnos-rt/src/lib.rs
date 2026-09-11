@@ -4,6 +4,7 @@
 //! TarnOS-native binary is `#![no_std]` and statically linked.
 #![no_std]
 
+mod heap;
 pub mod syscall;
 
 use core::panic::PanicInfo;

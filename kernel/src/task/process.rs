@@ -38,10 +38,16 @@ pub enum ProcessState {
 
 const KERNEL_STACK_PAGES: u64 = 4; // 16 KiB
 const USER_STACK_PAGES: u64 = 4; // 16 KiB
-/// Just under the top of the canonical lower half — the same permitted
-/// range `elf::load` validates PT_LOAD segments against — leaving a
-/// large gap below it for a future heap/mmap region.
+/// Just under the top of the canonical lower half.
 const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
+
+/// Fixed virtual base for every process's heap — 1 GiB, comfortably
+/// above where any current or near-term `tarnos-rt`-linked binary's
+/// `PT_LOAD` segments land (`elf::load` now rejects a segment that would
+/// reach this high — see `elf.rs`), and comfortably below the user stack
+/// at [`USER_STACK_TOP`]. `sys_sbrk` is the only thing that ever moves a
+/// process's break above this address; see `Process::heap_end`.
+pub const USER_HEAP_START: u64 = 0x0000_0000_4000_0000;
 
 /// Fixed virtual base for per-process kernel stacks, one
 /// `KERNEL_STACK_SLOT_STRIDE`-sized slot per `Pid` — chosen clear of the
@@ -119,6 +125,14 @@ pub struct Process {
     /// is a single field, not a queue; see
     /// `task::scheduler::wait_for_child`/`take_and_finalize_slot`.
     pub wait_waiter: Option<Pid>,
+    /// The current end of this process's heap — its `sys_sbrk` break.
+    /// Starts at [`USER_HEAP_START`] (an empty heap) and only ever grows
+    /// (see `arch::x86_64::syscall::sys_sbrk` — shrinking is not
+    /// supported this milestone). Pages between `USER_HEAP_START` and
+    /// this address, rounded up to the containing page, are mapped into
+    /// `address_space`; nothing beyond that rounded-up page is ever
+    /// mapped ahead of need.
+    pub heap_end: u64,
 }
 
 impl Process {
@@ -166,6 +180,7 @@ impl Process {
             state: ProcessState::Ready,
             parent,
             wait_waiter: None,
+            heap_end: USER_HEAP_START,
         })
     }
 

@@ -13,6 +13,7 @@ use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, S
 use x86_64::VirtAddr;
 
 use crate::memory::virt::phys_to_virt;
+use crate::task::process::USER_HEAP_START as USER_SPACE_MAX;
 
 const EI_MAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
@@ -29,11 +30,13 @@ const PHDR_SIZE: usize = 56;
 /// Lowest permitted user virtual address — excludes the null-page guard
 /// range so a null-pointer dereference in userland reliably faults.
 const USER_SPACE_MIN: u64 = 0x1000;
-/// Highest permitted user virtual address: just under the top of the
-/// canonical lower half, leaving the rest of that half for a future user
-/// stack/mmap region and keeping well clear of the canonical upper half
-/// the kernel and HHDM occupy.
-const USER_SPACE_MAX: u64 = 0x0000_7fff_ffff_f000;
+// Highest permitted user virtual address for a `PT_LOAD` segment is
+// `USER_SPACE_MAX` (imported above as an alias for
+// `task::process::USER_HEAP_START`): the fixed start of every process's
+// heap. A segment may never reach the heap or (further up) the user
+// stack — without this, a malformed ELF could declare a segment landing
+// in either region and silently collide with them once they're actually
+// mapped.
 
 #[derive(Debug)]
 pub enum ElfError {

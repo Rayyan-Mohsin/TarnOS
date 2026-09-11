@@ -64,6 +64,18 @@ wait-exit-code-test = []
 # genuinely Blocked real child. Exercised by
 # `cargo run -p xtask -- test-kill-boundary`.
 kill-boundary-test = []
+# Spawns a single dummy ring-3 process that spawns heap-child, releases
+# it, and SYS_WAITs for it to report success via its exit code --
+# heap-child itself builds a multi-page Vec<u64> backed by sys_sbrk and
+# tarnos-rt's userland allocator, proving real, multi-page heap growth
+# works end to end. Exercised by `cargo run -p xtask -- test-heap-growth`.
+heap-growth-test = []
+# Spawns a single dummy ring-3 process that adversarially probes
+# SYS_SBRK directly -- an increment over the fixed 64 MiB heap ceiling,
+# a valid grow, a rejected negative increment, and a side-effect-free
+# zero-increment query. Exercised by
+# `cargo run -p xtask -- test-sbrk-boundary`.
+sbrk-boundary-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
