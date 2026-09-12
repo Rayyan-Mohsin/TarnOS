@@ -26,7 +26,7 @@ mod task;
 use core::arch::asm;
 use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest,
-    RsdpRequest, StackSizeRequest,
+    MpRequest, RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
 
@@ -91,6 +91,15 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
+/// Enumerates every CPU core Limine found (including the BSP itself) and
+/// gives a `bootstrap()` handshake for starting each additional one — see
+/// `arch::x86_64::smp`. Flags `0`: plain MMIO xAPIC access, not x2APIC
+/// (`limine::mp::MP_FLAG_X2APIC`) — the simpler option, sufficient for
+/// this milestone's core counts.
+#[used]
+#[link_section = ".requests"]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
+
 #[no_mangle]
 extern "C" fn _start() -> ! {
     assert!(
@@ -114,6 +123,13 @@ extern "C" fn _start() -> ! {
     }
     if RSDP_REQUEST.response().is_some() {
         earlyprintln!("[boot] RSDP received");
+    }
+    if let Some(resp) = MP_REQUEST.response() {
+        earlyprintln!(
+            "[boot] MP info received ({} CPU(s), BSP LAPIC ID {})",
+            resp.cpus().len(),
+            resp.bsp_lapic_id
+        );
     }
 
     // Runs before `arch::x86_64::init()` now (it didn't in earlier
@@ -162,6 +178,102 @@ extern "C" fn _start() -> ! {
 
     arch::x86_64::init();
     earlyprintln!("[boot] GDT/TSS/IDT initialized");
+
+    // Starts every additional CPU core Limine reported (if MP_REQUEST
+    // was honored) and waits for each to report itself ready. Must run
+    // before anything spawns a process: process-switch paths resolve
+    // "which core is this" via `arch::x86_64::percpu::core_index()`,
+    // which needs this call's `percpu::assign_slot(0, ..)` for the BSP
+    // itself to have already run.
+    match MP_REQUEST.response() {
+        Some(resp) => arch::x86_64::smp::bring_up_aps(resp),
+        None => arch::x86_64::smp::bring_up_bsp_only(),
+    }
+
+    // Milestone 6: every additional core's idle loop (under this feature
+    // only, see `arch::x86_64::smp::ap_entry_on_own_stack`) free-spins
+    // incrementing its own counter instead of immediately hlt-parking.
+    // After a fixed delay, logging every core's count that has genuinely
+    // advanced -- and by a comparable order of magnitude across cores --
+    // is real evidence they're executing concurrently, not secretly
+    // serialized, without needing any periodic timer interrupt at all.
+    // Never enabled for a normal build. See `xtask test-smp-boot`.
+    #[cfg(feature = "smp-boot-test")]
+    {
+        use core::sync::atomic::Ordering;
+
+        let start = arch::x86_64::interrupts::ticks();
+        while arch::x86_64::interrupts::ticks() < start + 50 {
+            x86_64::instructions::hlt();
+        }
+
+        for core_index in 0..arch::x86_64::percpu::MAX_CORES {
+            let slot = arch::x86_64::percpu::slot(core_index);
+            if slot.ready.load(Ordering::Acquire) {
+                earlyprintln!(
+                    "[smp-test] core {} spin_count={}",
+                    core_index,
+                    slot.spin_count.load(Ordering::Relaxed)
+                );
+            }
+        }
+        earlyprintln!("[smp-test] boot check complete");
+    }
+
+    // Milestone 6, adversarially: after bring-up, sends a targeted test
+    // IPI to one specific booted core (not a broadcast) and confirms
+    // only that core's IPI counter advanced, then sends the same IPI to
+    // a LAPIC ID with no corresponding booted core and confirms the
+    // kernel doesn't hang or fault. Never enabled for a normal build.
+    // See `xtask test-smp-ipi`.
+    #[cfg(feature = "smp-ipi-test")]
+    {
+        use core::sync::atomic::Ordering;
+
+        const TARGET_INDEX: usize = 1;
+        // Comfortably outside any LAPIC ID QEMU assigns for this
+        // milestone's small `-smp` counts -- a real send to a target
+        // with no corresponding booted core.
+        const BAD_LAPIC_ID: u32 = 0xFE;
+
+        let target_ready = arch::x86_64::percpu::slot(TARGET_INDEX)
+            .ready
+            .load(Ordering::Acquire);
+
+        let result = if target_ready {
+            let target_lapic_id = arch::x86_64::percpu::slot(TARGET_INDEX).lapic_id();
+            arch::x86_64::lapic::send_ipi(target_lapic_id, arch::x86_64::lapic::TEST_IPI_VECTOR);
+
+            let start = arch::x86_64::interrupts::ticks();
+            while arch::x86_64::interrupts::ticks() < start + 10 {
+                x86_64::instructions::hlt();
+            }
+
+            let mut ok = arch::x86_64::percpu::slot(TARGET_INDEX)
+                .ipi_count
+                .load(Ordering::Relaxed)
+                == 1;
+            for other in 0..arch::x86_64::percpu::MAX_CORES {
+                if other != TARGET_INDEX
+                    && arch::x86_64::percpu::slot(other).ipi_count.load(Ordering::Relaxed) != 0
+                {
+                    ok = false;
+                }
+            }
+
+            arch::x86_64::lapic::send_ipi(BAD_LAPIC_ID, arch::x86_64::lapic::TEST_IPI_VECTOR);
+            let start2 = arch::x86_64::interrupts::ticks();
+            while arch::x86_64::interrupts::ticks() < start2 + 10 {
+                x86_64::instructions::hlt();
+            }
+
+            ok
+        } else {
+            false
+        };
+
+        earlyprintln!("[smp-test] {}", if result { "IPI_OK" } else { "IPI_FAIL" });
+    }
 
     // Deliberately faults instead of continuing boot — see
     // `cargo run -p xtask -- test-fault`, which builds with this feature

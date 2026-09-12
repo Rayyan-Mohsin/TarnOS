@@ -15,12 +15,13 @@
 //! unit-testable on the host — this module is a thin adapter that adds
 //! back the hardware types (`PhysFrame`, the Limine `Entry`) a host-side
 //! test has no use for.
-use spin::Mutex;
 use tarnos_kcore::bitmap::usable_frame_range;
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
 
 use limine::memmap::{Entry, MEMMAP_USABLE};
+
+use crate::sync::SpinLock;
 
 const FRAME_SIZE: u64 = 4096;
 /// Upper bound on physical memory this allocator can track. Comfortably
@@ -77,7 +78,15 @@ impl BitmapFrameAllocator {
     }
 }
 
-static ALLOCATOR: Mutex<BitmapFrameAllocator> = Mutex::new(BitmapFrameAllocator::new());
+// `SpinLock`, not a plain `spin::Mutex`: nothing in this kernel calls into
+// the frame allocator from interrupt context today, but leaving that
+// undocumented and relying on it implicitly is exactly the kind of gap
+// this milestone's own hardening sweep exists to close -- unlike every
+// other lock in the codebase, this one had no stated rationale either
+// way. Costs nothing (this lock is never contended from an interrupt
+// handler, so the extra interrupt-disable is unobservable), and makes
+// the safety property explicit and enforced rather than assumed.
+static ALLOCATOR: SpinLock<BitmapFrameAllocator> = SpinLock::new(BitmapFrameAllocator::new());
 
 /// Seeds the global frame allocator from Limine's memory map. Must be
 /// called exactly once, before any other `memory::phys` function.

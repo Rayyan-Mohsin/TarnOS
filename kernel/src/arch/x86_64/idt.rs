@@ -40,9 +40,24 @@ pub fn init() {
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
         super::interrupts::register_handlers(&mut idt);
+        super::lapic::register_handlers(&mut idt);
         idt
     });
     idt.load();
+}
+
+/// Loads the already-built shared IDT (see [`init`]) onto an additional
+/// core. No new IDT content is needed for this — the IDT is a
+/// read-only-after-`init` data structure every core's `IDTR` can point at
+/// identically; only the `lidt` instruction itself is genuinely per-core
+/// (unlike the GDT's TSS descriptor, see `gdt::init_ap`).
+///
+/// # Safety
+/// Must only be called after [`init`] has completed on the BSP.
+pub unsafe fn load_ap() {
+    IDT.get()
+        .expect("idt::init() must run before idt::load_ap()")
+        .load();
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {

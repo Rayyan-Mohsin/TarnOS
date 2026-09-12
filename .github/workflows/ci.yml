@@ -92,3 +92,15 @@ jobs:
 
       - name: xtask test-sbrk-boundary (SYS_SBRK enforces its heap ceiling and grow-only contract)
         run: cargo run -p xtask -- test-sbrk-boundary
+
+      - name: xtask test-smp-boot (every reported CPU core boots and runs concurrently)
+        run: cargo run -p xtask -- test-smp-boot
+
+      - name: xtask test-smp-degraded (SMP bring-up isn't hardcoded to a specific core count)
+        run: cargo run -p xtask -- test-smp-degraded
+
+      - name: xtask test-smp-ipi (a targeted IPI reaches exactly one core, never a wrong one)
+        run: cargo run -p xtask -- test-smp-ipi
+
+      - name: xtask test-smp-regression (fault isolation + blocking IPC unaffected by other cores)
+        run: cargo run -p xtask -- test-smp-regression

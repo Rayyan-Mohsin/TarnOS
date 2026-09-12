@@ -76,6 +76,19 @@ heap-growth-test = []
 # zero-increment query. Exercised by
 # `cargo run -p xtask -- test-sbrk-boundary`.
 sbrk-boundary-test = []
+# Every additional core's idle loop free-spins incrementing its own
+# counter instead of immediately hlt-parking; after a fixed delay the BSP
+# logs every core's count as evidence they're genuinely executing
+# concurrently, not secretly serialized. Exercised by
+# `cargo run -p xtask -- test-smp-boot` (and, at a different `-smp`
+# count, `test-smp-degraded`).
+smp-boot-test = []
+# After bring-up, the BSP sends a targeted test IPI to one specific core
+# and confirms only that core's IPI counter advanced, then sends the same
+# IPI to a LAPIC ID with no corresponding booted core and confirms the
+# kernel doesn't hang or fault. Exercised by
+# `cargo run -p xtask -- test-smp-ipi`.
+smp-ipi-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

@@ -12,9 +12,14 @@ use x86_64::instructions::interrupts;
 ///
 /// Without this, code on this core holding a plain spinlock could be
 /// interrupted, and if the interrupt handler tries to take the same lock,
-/// the core deadlocks against itself (there is no second core to make
-/// progress and release it). Disabling interrupts across the critical
-/// section makes that reentrancy impossible instead of merely unlikely.
+/// this core deadlocks against itself — a second core spinning on the
+/// same lock would eventually make progress once the first core's
+/// interrupt handler returns and releases it, but a same-core interrupt
+/// handler never returns until it acquires the lock it's stuck waiting
+/// on. Disabling interrupts across the critical section makes that
+/// same-core reentrancy impossible instead of merely unlikely; the
+/// underlying `spin::Mutex`'s ordinary cross-core mutual exclusion
+/// already handles any number of cores correctly on its own.
 pub struct SpinLock<T> {
     inner: spin::Mutex<T>,
 }
@@ -67,21 +72,5 @@ impl<T> Drop for SpinLockGuard<'_, T> {
         if self.interrupts_were_enabled {
             interrupts::enable();
         }
-    }
-}
-
-/// Placeholder for per-CPU state. A no-op on today's single-core kernel;
-/// exists so call sites that will need real per-CPU indirection (a GS-base
-/// pointer or an array indexed by APIC ID) once SMP lands are written
-/// against this type now instead of a bare global.
-pub struct PerCpu<T>(T);
-
-impl<T> PerCpu<T> {
-    pub const fn new(value: T) -> Self {
-        Self(value)
-    }
-
-    pub fn get(&self) -> &T {
-        &self.0
     }
 }

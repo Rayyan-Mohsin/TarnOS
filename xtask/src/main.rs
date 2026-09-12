@@ -33,6 +33,10 @@ fn main() {
         "test-kill-boundary" => test_kill_boundary(),
         "test-heap-growth" => test_heap_growth(),
         "test-sbrk-boundary" => test_sbrk_boundary(),
+        "test-smp-boot" => test_smp_boot(),
+        "test-smp-degraded" => test_smp_degraded(),
+        "test-smp-ipi" => test_smp_ipi(),
+        "test-smp-regression" => test_smp_regression(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
@@ -44,7 +48,11 @@ fn main() {
             .and_then(|_| test_wait_exit_code())
             .and_then(|_| test_kill_boundary())
             .and_then(|_| test_heap_growth())
-            .and_then(|_| test_sbrk_boundary()),
+            .and_then(|_| test_sbrk_boundary())
+            .and_then(|_| test_smp_boot())
+            .and_then(|_| test_smp_degraded())
+            .and_then(|_| test_smp_ipi())
+            .and_then(|_| test_smp_regression()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -94,11 +102,20 @@ fn print_usage() {
          \x20 test-sbrk-boundary     Confirm SYS_SBRK rejects an absurd increment and a\n\
          \x20                    negative one, while a valid grow and a zero-increment query\n\
          \x20                    behave correctly\n\
+         \x20 test-smp-boot         Confirm every CPU core Limine reports boots, reaches\n\
+         \x20                    ready, and genuinely executes concurrently (-smp 4)\n\
+         \x20 test-smp-degraded     The same check as test-smp-boot, at -smp 2 instead of 4,\n\
+         \x20                    proving bring-up isn't hardcoded to a specific core count\n\
+         \x20 test-smp-ipi          Confirm a targeted IPI reaches exactly one core and\n\
+         \x20                    nothing else, and a send to a nonexistent target is safe\n\
+         \x20 test-smp-regression   Confirm fault isolation and blocking IPC still behave\n\
+         \x20                    identically with other cores booted and idling (-smp 4)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
          \x20                    test-wait-exit-code, test-kill-boundary, test-heap-growth,\n\
-         \x20                    and test-sbrk-boundary in sequence"
+         \x20                    test-sbrk-boundary, test-smp-boot, test-smp-degraded,\n\
+         \x20                    test-smp-ipi, and test-smp-regression in sequence"
     );
 }
 
@@ -416,11 +433,17 @@ fn run(flags: &[String]) -> Result<(), String> {
 /// log. Shared by every milestone-2 integration test scenario below;
 /// each one builds with its own feature and applies its own assertions
 /// to the returned log.
+/// `smp` is explicit on every call, never a hidden QEMU default (`1`
+/// today): every pre-SMP-milestone scenario passes `1`, which is the
+/// cheapest possible regression check that this milestone's changes
+/// don't perturb single-core behavior at all, and the new `test-smp-*`
+/// scenarios pass a real core count to actually exercise multi-core boot.
 fn run_scenario(
     kernel_features: &[&str],
     log_name: &str,
     timeout_secs: u64,
     uefi: bool,
+    smp: u32,
 ) -> Result<String, String> {
     let root = workspace_root();
     iso(false, kernel_features)?;
@@ -435,6 +458,8 @@ fn run_scenario(
         "q35",
         "-m",
         "512M",
+        "-smp",
+        &smp.to_string(),
         "-serial",
         &format!("file:{}", log_path.display()),
         "-display",
@@ -517,7 +542,7 @@ fn assert_booted_once(log: &str) -> Result<(), String> {
 /// counterpart, even though an intermittent UEFI-only boot hang was one
 /// of the very issues this milestone's hardening work fixed.
 fn test_uefi_boot() -> Result<(), String> {
-    let log = run_scenario(&[], "uefi-boot-test.log", 8, true)?;
+    let log = run_scenario(&[], "uefi-boot-test.log", 8, true, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic on a normal UEFI boot".to_string());
@@ -543,7 +568,7 @@ fn test_uefi_boot() -> Result<(), String> {
 /// panic the whole kernel — see `test_fault_isolation` for the
 /// ring-3 (process-only) case.
 fn test_fault() -> Result<(), String> {
-    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 5, false)?;
+    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 5, false, 1)?;
     assert_booted_once(&log)?;
     if !log.contains("[KERNEL PANIC]") || !log.contains("page fault") {
         return Err(
@@ -565,7 +590,7 @@ fn test_fault() -> Result<(), String> {
 /// from merely not crashing: the machine keeps doing useful work after
 /// a process misbehaves.
 fn test_fault_isolation() -> Result<(), String> {
-    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 5, false)?;
+    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 5, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err(
@@ -604,7 +629,7 @@ fn test_fault_isolation() -> Result<(), String> {
 /// a process can actually suspend and later resume, not merely that the
 /// demo's usual ordering happens to avoid ever needing to.
 fn test_blocking_ipc() -> Result<(), String> {
-    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 8, false)?;
+    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 8, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -629,7 +654,7 @@ fn test_blocking_ipc() -> Result<(), String> {
 /// nobody receiving panicked the kernel. Confirms both sends queue and
 /// are eventually delivered instead.
 fn test_double_send() -> Result<(), String> {
-    let log = run_scenario(&["double-send-test"], "double-send-test.log", 8, false)?;
+    let log = run_scenario(&["double-send-test"], "double-send-test.log", 8, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err(
@@ -663,7 +688,7 @@ fn test_double_send() -> Result<(), String> {
 /// `SYS_PROCESS_START`, and completes a genuine rendezvous with it —
 /// none of it boot-choreographed the way the console-server handoff is.
 fn test_spawn_ipc() -> Result<(), String> {
-    let log = run_scenario(&[], "spawn-ipc-test.log", 8, false)?;
+    let log = run_scenario(&[], "spawn-ipc-test.log", 8, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -698,7 +723,7 @@ fn test_spawn_ipc() -> Result<(), String> {
 /// that one proves the happy path works, this one proves the boundary
 /// is actually enforced, not merely unexercised.
 fn test_spawn_boundary() -> Result<(), String> {
-    let log = run_scenario(&["spawn-boundary-test"], "spawn-boundary-test.log", 5, false)?;
+    let log = run_scenario(&["spawn-boundary-test"], "spawn-boundary-test.log", 5, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -739,6 +764,7 @@ fn test_process_lifecycle() -> Result<(), String> {
         "process-lifecycle-test.log",
         8,
         false,
+        1,
     )?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
@@ -789,7 +815,7 @@ fn test_process_lifecycle() -> Result<(), String> {
 /// Confirms the reported status matches the exact code
 /// `exit-code-child` passes to `sys_exit`.
 fn test_wait_exit_code() -> Result<(), String> {
-    let log = run_scenario(&["wait-exit-code-test"], "wait-exit-code-test.log", 8, false)?;
+    let log = run_scenario(&["wait-exit-code-test"], "wait-exit-code-test.log", 8, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -822,7 +848,7 @@ fn test_wait_exit_code() -> Result<(), String> {
 /// genuinely `Blocked` one. Complements `test_spawn_boundary`'s bar for
 /// adversarial proof, applied to termination instead of grant/start.
 fn test_kill_boundary() -> Result<(), String> {
-    let log = run_scenario(&["kill-boundary-test"], "kill-boundary-test.log", 5, false)?;
+    let log = run_scenario(&["kill-boundary-test"], "kill-boundary-test.log", 5, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -853,7 +879,7 @@ fn test_kill_boundary() -> Result<(), String> {
 /// `alloc`, forcing dozens of separate heap growths, then verifies
 /// every value it wrote is still intact — and confirms it exits `0`.
 fn test_heap_growth() -> Result<(), String> {
-    let log = run_scenario(&["heap-growth-test"], "heap-growth-test.log", 8, false)?;
+    let log = run_scenario(&["heap-growth-test"], "heap-growth-test.log", 8, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -887,7 +913,7 @@ fn test_heap_growth() -> Result<(), String> {
 /// milestone), and a zero-increment query returns the unchanged current
 /// break, proving the rejected calls truly had no side effects.
 fn test_sbrk_boundary() -> Result<(), String> {
-    let log = run_scenario(&["sbrk-boundary-test"], "sbrk-boundary-test.log", 5, false)?;
+    let log = run_scenario(&["sbrk-boundary-test"], "sbrk-boundary-test.log", 5, false, 1)?;
     assert_booted_once(&log)?;
     if log.contains("[KERNEL PANIC]") {
         return Err("expected no kernel panic".to_string());
@@ -909,6 +935,214 @@ fn test_sbrk_boundary() -> Result<(), String> {
     println!(
         "xtask: test-sbrk-boundary PASSED — an absurd increment and a negative increment were \
          both rejected, while a valid grow and a side-effect-free query behaved correctly"
+    );
+    Ok(())
+}
+
+/// Shared implementation for `test_smp_boot`/`test_smp_degraded`: builds
+/// the kernel with the `smp-boot-test` feature (see `kernel/src/main.rs`)
+/// and boots it with `smp` virtual CPUs. Checks that every core Limine
+/// reported reaches its own ready line (not a hardcoded count — read
+/// back from the kernel's own "MP info received" log line) and that
+/// every one of their independent, free-running spin counters has
+/// advanced by a comparable order of magnitude — real evidence the cores
+/// are executing concurrently, not secretly serialized, without needing
+/// any periodic timer interrupt at all. Returns how many CPUs Limine
+/// actually reported, for the caller's own success message.
+fn smp_boot_check(smp: u32, log_name: &str) -> Result<usize, String> {
+    let log = run_scenario(&["smp-boot-test"], log_name, 10, false, smp)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+
+    let reported: usize = log
+        .lines()
+        .find_map(|line| line.split("MP info received (").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| "expected an \"MP info received (N CPU(s)...\" log line".to_string())?;
+
+    // Every core (BSP via `smp::bring_up_aps`, every AP via
+    // `smp::ap_entry_on_own_stack`) logs "[smp] core N ready" -- counted
+    // by the literal " ready" suffix rather than a stricter prefix match,
+    // since the exact core index varies.
+    let ready_count = log.matches(" ready").count();
+    if ready_count != reported {
+        return Err(format!(
+            "expected {reported} core(s) to report ready (Limine reported {reported} CPU(s)), \
+             but saw {ready_count} \"ready\" line(s)"
+        ));
+    }
+    if !log.contains("[smp-test] boot check complete") {
+        return Err("expected the smp-boot-test process to reach its final log line".to_string());
+    }
+
+    // "[smp-test] core {index} spin_count={count}" -- one line per ready
+    // core (BSP included), parsed as (index, count) pairs so the BSP's
+    // own count (always 0 -- it never runs the AP-only free-spin loop,
+    // see `ap_entry_on_own_stack`) can be excluded from the "did this
+    // core actually run concurrently" check below without excluding it
+    // from the "did every core report in at all" line-count check.
+    let spin_lines: Vec<(usize, u64)> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("[smp-test] core "))
+        .filter_map(|rest| rest.split_once(" spin_count="))
+        .filter_map(|(idx, count)| Some((idx.trim().parse().ok()?, count.trim().parse().ok()?)))
+        .collect();
+    if spin_lines.len() != reported {
+        return Err(format!(
+            "expected {reported} \"spin_count=\" log line(s), found {}",
+            spin_lines.len()
+        ));
+    }
+
+    let ap_spin_counts: Vec<u64> = spin_lines
+        .iter()
+        .filter(|(core_index, _)| *core_index != 0)
+        .map(|(_, count)| *count)
+        .collect();
+    if ap_spin_counts.is_empty() {
+        return Err("expected at least one AP to check spin counters for".to_string());
+    }
+    if ap_spin_counts.iter().any(|&c| c == 0) {
+        return Err(
+            "expected every AP's spin counter to have advanced -- a zero count suggests \
+             that core never actually ran concurrently with the others"
+                .to_string(),
+        );
+    }
+    let min = *ap_spin_counts.iter().min().unwrap();
+    let max = *ap_spin_counts.iter().max().unwrap();
+    // A generous ratio -- this only needs to catch "one core never ran
+    // at all" or "cores were secretly time-sliced one at a time instead
+    // of truly concurrently," not assert anything about precise
+    // fairness between them.
+    if max > min.saturating_mul(1000) {
+        return Err(format!(
+            "expected every AP's spin counter to advance by a comparable order of magnitude, \
+             but saw counts ranging from {min} to {max}"
+        ));
+    }
+
+    Ok(reported)
+}
+
+/// Milestone 6: builds the kernel with the `smp-boot-test` feature and
+/// boots it with 4 virtual CPUs, via [`smp_boot_check`].
+fn test_smp_boot() -> Result<(), String> {
+    let reported = smp_boot_check(4, "smp-boot-test.log")?;
+    println!(
+        "xtask: test-smp-boot PASSED — {reported} core(s) all reported ready and advanced \
+         their own independent spin counters"
+    );
+    Ok(())
+}
+
+/// The same `smp-boot-test` kernel image as [`test_smp_boot`], run with
+/// only 2 virtual CPUs instead of 4 — proves the ready-count assertion
+/// and bring-up logic isn't hardcoded to a specific core count and
+/// degrades gracefully (exercising `arch::x86_64::smp::bring_up_aps`'s
+/// bounded-timeout wait) rather than hanging waiting for cores that
+/// don't exist.
+fn test_smp_degraded() -> Result<(), String> {
+    let reported = smp_boot_check(2, "smp-degraded-test.log")?;
+    println!(
+        "xtask: test-smp-degraded PASSED — the same bring-up logic correctly handled \
+         {reported} core(s) instead of the usual 4, with no hang and no hardcoded count"
+    );
+    Ok(())
+}
+
+/// Milestone 6, adversarially: builds the kernel with the `smp-ipi-test`
+/// feature and boots it with 4 virtual CPUs. Confirms a targeted IPI
+/// (`arch::x86_64::lapic::send_ipi`, never a broadcast) reaches exactly
+/// one specific core and no other, and that sending the same vector to a
+/// LAPIC ID with no corresponding booted core doesn't hang or fault the
+/// kernel — confirmed empirically rather than assumed.
+fn test_smp_ipi() -> Result<(), String> {
+    let log = run_scenario(&["smp-ipi-test"], "smp-ipi-test.log", 10, false, 4)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("IPI_FAIL") {
+        return Err(
+            "smp-ipi-test reported IPI_FAIL -- a targeted IPI reached the wrong core(s), or \
+             the bad-target send hung/faulted the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("IPI_OK") {
+        return Err(
+            "expected \"IPI_OK\" -- the smp-ipi-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-smp-ipi PASSED — a targeted IPI reached exactly its target and nothing \
+         else, and a send to a nonexistent target didn't hang or fault"
+    );
+    Ok(())
+}
+
+/// Milestone 6's own regression check: re-runs `test-fault-isolation`
+/// and `test-blocking-ipc`'s exact kernel builds at `-smp 4` instead of
+/// `-smp 1`, asserting the exact same pass criteria as their original
+/// single-core versions — proving that other cores merely booting and
+/// idling nearby doesn't perturb the untouched BSP-only
+/// scheduler/IPC/fault logic this milestone deliberately never changes.
+fn test_smp_regression() -> Result<(), String> {
+    let log = run_scenario(
+        &["fault-isolation-test"],
+        "smp-regression-fault-isolation.log",
+        5,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic under -smp 4 -- a ring-3 fault should still kill only \
+             the offending process, not the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("[fault]") || !log.contains("killed") {
+        return Err(
+            "expected a \"[fault] pid ... killed: ...\" line under -smp 4, same as at -smp 1"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err(
+            "expected the survivor process to still reach a clean exit under -smp 4"
+                .to_string(),
+        );
+    }
+
+    let log = run_scenario(
+        &["blocking-ipc-test"],
+        "smp-regression-blocking-ipc.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to still arrive after genuinely blocking on sys_send, \
+             under -smp 4"
+                .to_string(),
+        );
+    }
+
+    println!(
+        "xtask: test-smp-regression PASSED — fault isolation and blocking IPC behave \
+         identically with other cores booted and idling nearby"
     );
     Ok(())
 }
