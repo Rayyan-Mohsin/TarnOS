@@ -37,6 +37,27 @@ pub struct PerCpuSlot {
     /// concurrently with every other one rather than being secretly
     /// serialized — see `xtask test-smp-boot`.
     pub spin_count: AtomicU64,
+    /// Lock-free mirror of `task::scheduler::Inner.current[this core]` —
+    /// `0` for "no process," else a `Pid`'s raw `u64`. `Pid(0)` can never
+    /// be a real assignment (`allocate_pid` always bumps a slot's
+    /// generation to at least `1` before handing out index `0` — see
+    /// `docs/adr/0007`), so `0` is a safe sentinel. Exists so a core
+    /// requesting a cross-core kill can poll "has the target core
+    /// actually evicted it yet" without contending `SCHEDULER`'s lock —
+    /// see `task::scheduler::terminate_process`.
+    pub current: AtomicU64,
+    /// Set by `terminate_process` (`SYS_KILL`) to the raw `Pid` a core
+    /// must evict if it's still that core's own `current` when its
+    /// `RESCHEDULE_VECTOR` handler observes this — see
+    /// `docs/adr/0010-cross-core-scheduling.md`.
+    pub evict_request: AtomicU64,
+    /// Set by a core itself, under `cli`, while it's parked in `hlt`
+    /// waiting for the shared ready queue to become non-empty — see
+    /// `task::scheduler::park_until_woken`. Anything that pushes new work
+    /// into that queue scans this flag on every slot and sends a
+    /// targeted `RESCHEDULE_VECTOR` IPI to every core it finds set,
+    /// waking it out of `hlt` (see `task::scheduler::notify_idle_cores`).
+    pub idle: AtomicBool,
 }
 
 impl PerCpuSlot {
@@ -46,6 +67,9 @@ impl PerCpuSlot {
             ready: AtomicBool::new(false),
             ipi_count: AtomicU64::new(0),
             spin_count: AtomicU64::new(0),
+            current: AtomicU64::new(0),
+            evict_request: AtomicU64::new(0),
+            idle: AtomicBool::new(false),
         }
     }
 

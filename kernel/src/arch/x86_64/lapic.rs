@@ -28,6 +28,18 @@ const SPURIOUS_VECTOR: u8 = 0xFF;
 /// delivery: the BSP sends this to one specific target LAPIC ID and
 /// checks only that core's [`percpu::PerCpuSlot::ipi_count`] advanced.
 pub const TEST_IPI_VECTOR: u8 = 0x41;
+/// Vector used to wake an idle core with newly-ready work, and to force a
+/// core running a `SYS_KILL` target to evict it — see
+/// `task::scheduler::terminate_process`/`on_reschedule_ipi` and
+/// `arch::x86_64::context_switch::reschedule_entry`. Unlike
+/// [`TEST_IPI_VECTOR`] and [`SPURIOUS_VECTOR`] (both handled by an
+/// `extern "x86-interrupt"` function via [`register_handlers`]), this one
+/// is registered directly in `idt::init`/`idt::load_ap` with a raw entry
+/// address, the same way CPU fault vectors are, since it needs the full
+/// dual ring0/ring3-dispatching save shape `exception_entry_no_code!`
+/// generates -- it may need to force a genuine context switch, not just
+/// bump a counter.
+pub const RESCHEDULE_VECTOR: u8 = 0x42;
 
 const REG_ID: usize = 0x20;
 const REG_EOI: usize = 0xB0;

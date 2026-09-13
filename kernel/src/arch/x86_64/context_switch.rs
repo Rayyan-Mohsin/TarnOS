@@ -329,6 +329,52 @@ macro_rules! exception_entry_with_code {
     };
 }
 
+// `RESCHEDULE_VECTOR`'s entry stub: sent as a targeted IPI either to force
+// a cross-core `SYS_KILL` target to evict (see
+// `task::scheduler::terminate_process`/`on_reschedule_ipi`), reusing the
+// exact same dual ring0/ring3-dispatching shape the CPU fault stubs above
+// use, since it may need to redirect control to a *different* process
+// than whatever this core was running when the IPI landed -- the same
+// reason those stubs can't use the compiler-generated
+// `extern "x86-interrupt"` ABI either. A spurious delivery (the target
+// already moved on by the time the IPI arrived -- e.g. it self-exited
+// concurrently) can legitimately land in either path: ring3 if this core
+// is still running *some* process (just not `evict_request`'s target
+// anymore), or ring0 if it had already gone idle -- both simply resume
+// whatever was interrupted (see `ring3_reschedule`/`ring0_reschedule`).
+exception_entry_no_code!(
+    reschedule_entry,
+    super::context_switch::ring0_reschedule,
+    super::context_switch::ring3_reschedule
+);
+
+unsafe extern "C" {
+    fn reschedule_entry();
+}
+
+/// The address to install in the IDT for `lapic::RESCHEDULE_VECTOR`.
+pub fn reschedule_entry_addr() -> VirtAddr {
+    VirtAddr::new(reschedule_entry as *const () as u64)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ring3_reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let next = crate::task::scheduler::on_reschedule_ipi(frame);
+    super::lapic::eoi();
+    next
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ring0_reschedule(_frame: *mut TrapFrame) {
+    // This core had already left its process (if any) and gone idle by
+    // the time the IPI landed -- e.g. the eviction target self-exited or
+    // blocked on its own first. Nothing to do beyond acknowledging the
+    // interrupt; `terminate_process`'s spin-wait already observes the
+    // eviction via the `PerCpuSlot.current` mirror clearing, which that
+    // self-exit/block path itself already did.
+    super::lapic::eoi();
+}
+
 exception_entry_no_code!(
     divide_error_entry,
     super::idt::divide_error_ring0,

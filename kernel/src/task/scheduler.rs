@@ -13,12 +13,16 @@
 //! same reason — never from interrupt context.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
+use spin::Once;
 use tarnos_abi::ExitStatus;
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::context_switch::TrapFrame;
-use crate::arch::x86_64::gdt;
+use crate::arch::x86_64::percpu::{self, MAX_CORES};
+use crate::arch::x86_64::{gdt, lapic};
+use crate::memory::virt::AddressSpace;
 use crate::sync::SpinLock;
 
 use super::process::{Process, ProcessState};
@@ -60,7 +64,18 @@ struct Inner {
     /// — see `Pid`'s doc comment.
     generations: [u32; MAX_PROCESSES],
     ready: ReadyQueue,
-    current: Option<Pid>,
+    /// The process currently running *on each core* — `current[i]` is
+    /// core `i`'s own, indexed by `percpu::core_index()`. A single
+    /// scalar sufficed before this milestone (there was only ever one
+    /// core); see `docs/adr/0010-cross-core-scheduling.md`. Every
+    /// existing call site that reads/writes "the current process"
+    /// already only ever concerns the calling core's own entry, so
+    /// indexing by `percpu::core_index()` is the whole change — except
+    /// [`take_and_finalize_slot`], which must clear *whichever* core (if
+    /// any) still shows a terminating `pid` as current, since a
+    /// cross-core `SYS_KILL` can terminate a process another core is
+    /// running right now.
+    current: [Option<Pid>; MAX_CORES],
 }
 
 impl Inner {
@@ -70,9 +85,20 @@ impl Inner {
             processes: [EMPTY; MAX_PROCESSES],
             generations: [0; MAX_PROCESSES],
             ready: ReadyQueue::new(),
-            current: None,
+            current: [None; MAX_CORES],
         }
     }
+}
+
+/// Sets `core`'s current process in both `Inner.current` (authoritative,
+/// `SCHEDULER`-locked) and `percpu::PerCpuSlot.current` (a lock-free
+/// mirror another core can poll without contending `SCHEDULER` — see
+/// `terminate_process`'s cross-core eviction wait).
+fn set_current(sched: &mut Inner, core: usize, pid: Option<Pid>) {
+    sched.current[core] = pid;
+    percpu::slot(core)
+        .current
+        .store(pid.map_or(0, |p| p.0), Ordering::Release);
 }
 
 static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
@@ -128,6 +154,8 @@ pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     let mut sched = SCHEDULER.lock();
     sched.processes[index] = Slot::Occupied(Box::new(process));
     sched.ready.push(pid);
+    drop(sched);
+    notify_idle_cores();
     Ok(())
 }
 
@@ -183,6 +211,8 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
     }
     process.state = ProcessState::Ready;
     sched.ready.push(target);
+    drop(sched);
+    notify_idle_cores();
     Ok(())
 }
 
@@ -192,7 +222,7 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// reading them here avoids the caller needing to re-lock `SCHEDULER`
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
-    sched.current = Some(pid);
+    set_current(sched, percpu::core_index(), Some(pid));
     let process = match &mut sched.processes[pid.index()] {
         Slot::Occupied(process) => process,
         _ => panic!("switch_to named a process that does not exist"),
@@ -247,8 +277,9 @@ fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
 /// round-robin queue hands back next.
 pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
+    let core = percpu::core_index();
 
-    if let Some(current_pid) = sched.current {
+    if let Some(current_pid) = sched.current[core] {
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
@@ -295,22 +326,298 @@ pub fn on_syscall_yield(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     on_timer_tick(current_frame)
 }
 
+/// True only when every process-table slot is genuinely `Empty` — no
+/// process exists anywhere, on any core, in any state. Distinct from
+/// "nothing is ready right now": under single-core scheduling those were
+/// the same thing (nothing else could ever make something ready again),
+/// but with multiple cores, a process can be `Blocked`/`Suspended`/
+/// `Running` on some *other* core while this core's own queue check
+/// comes up empty. Gates [`switch_to_next_or_halt`]'s permanent,
+/// unwakeable halt — reserved for "the whole machine is done," not
+/// merely "this core has nothing to do at this exact instant."
+fn all_processes_empty(sched: &Inner) -> bool {
+    sched.processes.iter().all(|slot| matches!(slot, Slot::Empty))
+}
+
+/// The genuine end state: prints `halt_message` (existing `xtask`
+/// scenarios grep for this exact text, so it must only ever fire when
+/// [`all_processes_empty`] is true) and parks this core forever. Never
+/// returns.
+fn permanent_halt(halt_message: &str) -> ! {
+    crate::earlyprintln!("{halt_message}");
+    crate::earlyprintln!(
+        "[memtest] free_frames={}",
+        crate::memory::phys::free_frame_count()
+    );
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// A single, shared, upper-half-only `AddressSpace` (no user mappings at
+/// all — exactly what `AddressSpace::new()` already builds) every core
+/// activates while idling with nothing to run. Without this, an idle
+/// core's CR3 keeps pointing at whatever `AddressSpace` it last ran —
+/// if that gets torn down and its PML4 frame recycled by a *different*
+/// core while this one is still sitting on it, a stray page-table walk
+/// here could read a half-rewritten table. Since nothing in this kernel
+/// uses PCID or global pages, activating this (an ordinary `mov cr3`)
+/// flushes this core's entire TLB, closing the gap with no IPI-based
+/// shootdown protocol needed — see `docs/adr/0010`.
+static IDLE_ADDRESS_SPACE: Once<AddressSpace> = Once::new();
+
+fn build_idle_address_space() -> AddressSpace {
+    AddressSpace::new().expect("out of memory building the shared idle address space")
+}
+
+/// Builds [`IDLE_ADDRESS_SPACE`] eagerly, once, during boot -- called from
+/// `main.rs` right after every other eager, up-front kernel-half mapping
+/// is already in place (kernel stacks, double-fault stacks, LAPIC MMIO,
+/// every core's idle stack), so this address space's one-time PML4
+/// snapshot (see [`AddressSpace::new`]) correctly includes all of them.
+///
+/// Not just an optimization: [`activate_idle_address_space`] would
+/// otherwise build this the *first* time any core actually goes idle,
+/// which can happen well into a test run (or real usage) -- allocating
+/// its one PML4 frame at an unpredictable point looks exactly like a
+/// physical-memory leak to anything that snapshots
+/// `memory::phys::free_frame_count()` before that point and checks it
+/// returns to the same value later (as `xtask test-process-lifecycle`
+/// does; this was a real, reproduced false-positive "AddressSpace
+/// teardown is leaking physical memory" failure). Building it here,
+/// before any such baseline is ever taken, closes that gap -- this
+/// address space is a permanent, always-referenced part of the kernel's
+/// own footprint, like the GDT/IDT/kernel stacks, not something that
+/// should ever appear as a delta.
+pub fn init_idle_address_space() {
+    IDLE_ADDRESS_SPACE.call_once(build_idle_address_space);
+}
+
+fn activate_idle_address_space() {
+    let idle_as = IDLE_ADDRESS_SPACE.call_once(build_idle_address_space);
+    unsafe {
+        idle_as.activate();
+    }
+}
+
+/// Parks this core until the shared ready queue plausibly has something
+/// in it — interrupt-driven, not a busy poll. May return spuriously (a
+/// stray LAPIC spurious interrupt, or another core winning the race for
+/// whatever just appeared) — callers must re-check the queue themselves
+/// after this returns, the same contract as any condvar-style wait.
+///
+/// An earlier version of this milestone used a plain busy poll here
+/// instead (`spin_loop()` in a tight lock-check-unlock loop), reasoned to
+/// be safe because the BSP's own periodic timer tick would eventually
+/// re-check the same shared queue regardless. That reasoning was correct
+/// about *starvation*, but missed the actual cost: every idle core pins
+/// one full host CPU at 100%, and this milestone's own adversarial
+/// testing (`xtask test-smp-kill-cross-core`'s ancestor, `test-smp-ipi`,
+/// caught it first) reproduced genuine hangs and spurious faults under
+/// realistic host contention (as few host cores as guest vCPUs, exactly
+/// what a GitHub Actions runner or this project's own dev sandbox looks
+/// like) — the active core was starved of real CPU time by three
+/// spinning idle ones. Replaced with a real interrupt-driven halt.
+///
+/// # Lost-wakeup correctness
+/// Pushing new work (`spawn`, `start_child`, `wake_blocked_process`)
+/// sends a targeted `RESCHEDULE_VECTOR` IPI to every core it finds marked
+/// idle (see [`notify_idle_cores`]). The classic hazard this must close:
+/// if this core already checked the queue once (found it empty) and a
+/// push on another core checks *this* core's idle flag before this core
+/// has actually set it, that push correctly sees "not idle yet" and
+/// (reasonably) sends no IPI — yet this core is about to park anyway,
+/// missing that work forever. Closed by checking *twice*, with setting
+/// the flag in between rather than before: the first check (before the
+/// flag is visible to anyone) catches anything already queued; setting
+/// `idle` makes this core discoverable to any push from that instant on;
+/// the second check catches anything that landed in the gap between the
+/// two. A push arriving after the second check is guaranteed to observe
+/// `idle == true` and IPI this core — and the final `sti; hlt`, issued as
+/// one instruction pair via a raw `asm!` block (never through
+/// `SpinLockGuard`'s ordinary drop-then-separately-re-enable, which the
+/// compiler is free to place other instructions inside), is the standard
+/// idiom for the one gap that's still unavoidable: `sti`'s one-
+/// instruction interrupt shadow guarantees `hlt` itself executes before
+/// any interrupt raised in that exact instant is serviced, so a wake IPI
+/// landing between "queue checked empty" and "actually halted" still
+/// reaches this `hlt` instead of being silently coalesced into nothing.
+fn park_until_woken(core: usize) {
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+
+    if !SCHEDULER.lock().ready.is_empty() {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        return;
+    }
+
+    percpu::slot(core).idle.store(true, Ordering::SeqCst);
+    if !SCHEDULER.lock().ready.is_empty() {
+        percpu::slot(core).idle.store(false, Ordering::SeqCst);
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        return;
+    }
+
+    unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    percpu::slot(core).idle.store(false, Ordering::SeqCst);
+}
+
+/// Sends a targeted `RESCHEDULE_VECTOR` IPI to every core currently
+/// marked idle (see [`park_until_woken`]). Called after pushing new work
+/// into the shared ready queue — `spawn`, `start_child`,
+/// `wake_blocked_process(_locked)` — so a core parked in `hlt` with
+/// nothing to do notices promptly instead of waiting for some unrelated
+/// interrupt. Deliberately notifies every idle core rather than picking
+/// one: harmless (a core that loses the race for the one new item just
+/// re-parks immediately), and avoids needing to reason about which single
+/// core is "the right one" when several might be idle at once.
+fn notify_idle_cores() {
+    for core in 0..MAX_CORES {
+        if percpu::slot(core).idle.load(Ordering::SeqCst) {
+            lapic::send_ipi(percpu::slot(core).lapic_id(), lapic::RESCHEDULE_VECTOR);
+        }
+    }
+}
+
+/// The shared "wait for and run whatever the scheduler hands this core"
+/// loop body. Assumes it is *already* running on a stack no live process
+/// owns -- either a core's own dedicated idle stack (see
+/// [`abandon_process_stack_and_idle`]), or the boot-time stack
+/// `smp::ap_entry_trampoline`/`arch::x86_64::smp` hands an AP before it
+/// ever runs a process at all. Never returns: each iteration either
+/// resumes a process via [`context_switch::resume`] (which itself never
+/// returns to this stack) or parks via [`park_until_woken`] and loops.
+///
+/// `halt_message` is `None` for the boot-time entry points
+/// ([`ap_enter_scheduler`]/[`start`]), where finding the process table
+/// empty only ever means "nothing has been spawned yet," never "nothing
+/// ever will be" -- only a core that has already run at least one
+/// process to completion can conclude the latter, so those two never
+/// call [`permanent_halt`] at all, just keep parking forever.
+///
+/// [`context_switch::resume`]: crate::arch::x86_64::context_switch::resume
+fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! {
+    loop {
+        // Drained on *every* iteration, not just once before the first
+        // `park_until_woken` -- a kernel task's own wake (its `Waker`
+        // firing, e.g. the console server's endpoint receiving a
+        // message) only ever marks it ready in `task::executor`'s own
+        // queue, never touches `SCHEDULER.ready` directly. An earlier
+        // version of this loop drained only when it had already found a
+        // process to run, so once this core reached `park_until_woken`
+        // with nothing immediately ready, a task becoming ready afterward
+        // (its poll is what would actually complete the rendezvous and
+        // push a process into `SCHEDULER.ready`) was never picked up --
+        // this core would keep waking on unrelated interrupts (the PIT
+        // tick, say) and going straight back to `park_until_woken`
+        // without ever running the task that could have unblocked
+        // things, hanging indefinitely. Cheap to call unconditionally:
+        // draining an executor with nothing ready is a no-op, and this
+        // loop only ever spins again after `park_until_woken`'s own
+        // interrupt-driven wait, never busily.
+        crate::task::executor::run_ready_tasks();
+        let mut sched = SCHEDULER.lock();
+        if let Some(next_pid) = sched.ready.pop() {
+            let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
+            drop(sched);
+            maybe_print_switch(next_pid, rax, rbx);
+            unsafe { crate::arch::x86_64::context_switch::resume(&*frame_ptr) }
+        }
+        if let Some(msg) = halt_message {
+            if all_processes_empty(&sched) {
+                drop(sched);
+                permanent_halt(msg);
+            }
+        }
+        drop(sched);
+        park_until_woken(core);
+    }
+}
+
+/// `extern "C"` landing pad for [`abandon_process_stack_and_idle`]'s raw
+/// stack switch -- reassembles the `&'static str` its two register
+/// arguments were decomposed into (a fat pointer can't cross a raw
+/// `asm!` call directly) and hands off to [`idle_loop_on_own_stack`].
+///
+/// # Safety
+/// `msg_ptr`/`msg_len` must together describe a valid, `'static` UTF-8
+/// string -- true for every real caller, which only ever passes through
+/// a `&'static str` it already had.
+extern "C" fn idle_loop_trampoline(core: u64, msg_ptr: *const u8, msg_len: u64) -> ! {
+    let halt_message: &'static str =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg_ptr, msg_len as usize)) };
+    idle_loop_on_own_stack(core as usize, Some(halt_message))
+}
+
+/// Switches this core onto its own dedicated idle stack (the same one
+/// `arch::x86_64::smp` mapped for it at bring-up -- see
+/// `smp::idle_stack_top_addr`) and enters [`idle_loop_on_own_stack`]
+/// there. Never returns.
+///
+/// # Why a stack switch is required here, not just an address-space one
+/// A blocked/exited/evicted process's kernel stack is fixed *per process
+/// slot*, not per core (`Process::kernel_stack_top`) -- deliberately, so
+/// the same stack is simply reused the next time that slot's occupant
+/// (this one, or the next process to take that table index) runs,
+/// regardless of which core. [`switch_to_next_or_halt`] is called while
+/// still running *on that very stack* (it's whatever the syscall/
+/// interrupt entry stub that led here was using). Naively looping right
+/// there to wait for more work -- which an earlier version of this
+/// milestone did -- leaves this core's entire C call chain (locals,
+/// return addresses, this very stack-switch decision) sitting on that
+/// stack for as long as this core stays idle. If the *same process*
+/// then wakes up and gets picked up by *any* core (including a
+/// completely different one) for its next syscall, that core's entry
+/// stub starts pushing a fresh `TrapFrame` from the *same fixed*
+/// `kernel_stack_top()` address downward -- directly overwriting
+/// whatever this core still had live there. This was a real, reproduced
+/// bug (caught by this milestone's own `xtask test-smp-ipi`, manifesting
+/// as `percpu::slot()` being called with a stack address instead of a
+/// core index -- a corrupted local variable, not a logic error):
+/// swapping onto a stack no process owns *before* waiting closes it, the
+/// same reasoning `smp::ap_entry_trampoline` already applies to a
+/// freshly-booted AP that has no process stack to abandon in the first
+/// place.
+fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! {
+    let idle_top = crate::arch::x86_64::smp::idle_stack_top_addr(core).as_u64();
+    let msg_ptr = halt_message.as_ptr();
+    let msg_len = halt_message.len() as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "call {trampoline}",
+            top = in(reg) idle_top,
+            trampoline = sym idle_loop_trampoline,
+            in("rdi") core as u64,
+            in("rsi") msg_ptr,
+            in("rdx") msg_len,
+            options(noreturn),
+        );
+    }
+}
+
 /// Picks the next ready process and switches to it, given `sched`'s lock
 /// already held. If none is ready yet, gives kernel tasks one drain —
-/// not zero, and not an unbounded retry loop — before finally halting:
-/// a task's poll (e.g. the console server receiving a message) can
-/// itself complete a rendezvous with a process that was `Blocked` on
-/// the other side (see `ipc::endpoint::Endpoint::wake_receiver`), which
-/// pushes that process into `ready` as a direct side effect of the
-/// drain, so a process can genuinely become schedulable only *because*
-/// of that one drain. Nothing en route to this function's callers
-/// (a process terminating or blocking) allocates or holds another lock
-/// across the drain, so one pass is enough to observe everything it
-/// could produce — a second pass would only ever find the same, already
-/// re-checked, empty queue.
+/// not zero, and not an unbounded retry loop — since a task's poll (e.g.
+/// the console server receiving a message) can itself complete a
+/// rendezvous with a process that was `Blocked` on the other side (see
+/// `ipc::endpoint::Endpoint::wake_receiver`), which pushes that process
+/// into `ready` as a direct side effect of the drain.
+///
+/// If the whole process table is genuinely empty afterward, halts this
+/// core permanently (see [`permanent_halt`]) — the same terminal
+/// behavior this milestone's predecessor always had. Otherwise, some
+/// other process still exists elsewhere (`Blocked`/`Suspended`/
+/// `Running` on a different core) that could make this core's queue
+/// non-empty at any moment, so this core switches away from whatever
+/// address space it was about to leave dangling (see
+/// [`activate_idle_address_space`]), abandons the stack it's currently
+/// running on (see [`abandon_process_stack_and_idle`]), and parks via
+/// [`park_until_woken`] until something appears.
 fn switch_to_next_or_halt(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
-    halt_message: &str,
+    halt_message: &'static str,
 ) -> *mut TrapFrame {
     if let Some(next_pid) = sched.ready.pop() {
         return finish_switch(sched, next_pid);
@@ -323,17 +630,27 @@ fn switch_to_next_or_halt(
         return finish_switch(sched, next_pid);
     }
 
-    drop(sched);
-    crate::earlyprintln!("{halt_message}");
-    crate::earlyprintln!(
-        "[memtest] free_frames={}",
-        crate::memory::phys::free_frame_count()
-    );
-    loop {
-        unsafe {
-            core::arch::asm!("cli", "hlt", options(nomem, nostack));
-        }
+    if all_processes_empty(&sched) {
+        drop(sched);
+        permanent_halt(halt_message);
     }
+    drop(sched);
+
+    activate_idle_address_space();
+    abandon_process_stack_and_idle(percpu::core_index(), halt_message);
+}
+
+/// The BSP's own first entry, right after `main.rs` spawns `init`, and
+/// every additional core's entry right after it finishes its own
+/// bring-up (GDT/IDT/LAPIC) -- see [`idle_loop_on_own_stack`], which does
+/// the actual work. Already running on a stack no process owns in both
+/// cases (this core's own dedicated idle stack, set up by
+/// `smp::ap_entry_trampoline`/`smp::bring_up_aps` before either ever
+/// runs anything), so -- unlike [`switch_to_next_or_halt`] -- there is no
+/// stack to abandon here.
+pub fn ap_enter_scheduler() -> ! {
+    activate_idle_address_space();
+    idle_loop_on_own_stack(percpu::core_index(), None)
 }
 
 fn finish_switch(mut sched: crate::sync::SpinLockGuard<'_, Inner>, next_pid: Pid) -> *mut TrapFrame {
@@ -395,8 +712,15 @@ fn take_and_finalize_slot(
     };
 
     remove_from_ready_queue(sched, pid);
-    if sched.current == Some(pid) {
-        sched.current = None;
+    // Normally at most one core's `current` can ever name `pid` (a process
+    // only ever runs on one core at a time), but scanning all of them
+    // rather than assuming "the caller's own core" is what makes this
+    // correct when called from a cross-core `SYS_KILL` path too -- see
+    // `terminate_process`.
+    for core in 0..MAX_CORES {
+        if sched.current[core] == Some(pid) {
+            set_current(sched, core, None);
+        }
     }
 
     if let Some(waiter) = process.wait_waiter {
@@ -423,8 +747,25 @@ fn take_and_finalize_slot(
 ///   it) is reaped straight to `Empty`, since leaving it would make its
 ///   slot a *permanent* leak, worse than the bounded one a still-live
 ///   parent leaves;
-/// - an ordinary running/blocked child is left alone — same as a real
-///   OS not killing a process just because its parent died.
+/// - an ordinary `Ready`/`Running`/`Blocked` child is left running — same
+///   as a real OS not killing a process just because its parent died —
+///   but has its `parent` field cleared to `None`. Without this, a child
+///   that happened to be merely `Ready` (already woken by some rendezvous
+///   but not yet actually resumed) at the exact moment this sweep ran
+///   would keep its stale `parent` pointing at a pid nothing will ever
+///   reuse for its old parent again; when that child *later* exits on
+///   its own, [`take_and_finalize_slot`] would see a non-`None` `parent`
+///   and turn its slot into a `Zombie` nobody can ever `SYS_WAIT` (its
+///   real parent is gone) — a permanent, unreapable slot leak that also
+///   makes [`all_processes_empty`] never true again, hanging the whole
+///   machine's terminal halt forever. A real, reproduced bug: found via
+///   `xtask test-spawn-ipc` intermittently hanging instead of reaching
+///   its expected clean-exit halt, whenever a timer tick happened to
+///   preempt right as the parent/child rendezvous left the child exactly
+///   in this window. Clearing `parent` here makes a later self-exit go
+///   straight to `Empty` instead (the same path a process with no parent
+///   at all already takes), matching a real OS re-parenting an orphan
+///   rather than leaving it un-reapable.
 fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec<Box<Process>>) {
     for index in 0..MAX_PROCESSES {
         let is_orphaned_suspended = matches!(
@@ -436,6 +777,11 @@ fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec
             let child_pid = Pid::new(index, sched.generations[index]);
             take_and_finalize_slot(sched, child_pid, ExitStatus::Killed, pending_drops);
             continue;
+        }
+        if let Slot::Occupied(process) = &mut sched.processes[index] {
+            if process.parent == Some(exiting_pid) {
+                process.parent = None;
+            }
         }
         if let Slot::Zombie { parent, .. } = &sched.processes[index] {
             if *parent == exiting_pid {
@@ -477,7 +823,7 @@ fn terminate_slot(pid: Pid, status: ExitStatus) {
 pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
     let current = {
         let sched = SCHEDULER.lock();
-        sched.current
+        sched.current[percpu::core_index()]
     };
     if let Some(pid) = current {
         terminate_slot(pid, status);
@@ -505,12 +851,26 @@ pub fn on_syscall_exit(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 /// isn't a live child of the caller at all, or one that's already a
 /// `Zombie` — reaping one of those is `SYS_WAIT`'s job, not this one's.
 ///
-/// Since nothing is its own parent, and there's exactly one running
-/// process on this single core, `target` can never be `caller` itself —
-/// this never needs to trigger a scheduler switch, matching
-/// `sys_grant`/`sys_process_start`'s shape.
+/// Nothing is its own parent, so `target` can never be `caller` itself.
+/// On a single core that made this a pure "just finalize it" operation --
+/// with more than one core, `target` might genuinely be `Running` on a
+/// *different* core at this exact instant, so this first checks
+/// `sched.current` for every core: if `target` isn't running anywhere,
+/// this is still the same single-step finalize as before. If it is,
+/// finalizing here immediately (and freeing its `AddressSpace`) while
+/// that other core's CR3 still names it would be a genuine use-after-free
+/// -- so instead this records an eviction request for that core, sends it
+/// a targeted `RESCHEDULE_VECTOR` IPI, and bounded-spins on the
+/// lock-free `PerCpuSlot.current` mirror (never contending `SCHEDULER`
+/// while waiting) until that core's own IPI handler
+/// ([`on_reschedule_ipi`]) confirms the eviction by clearing it. Only
+/// then does this proceed to the same `terminate_slot` every path uses --
+/// by then, provably safe, since no core's CR3 can reference `target`'s
+/// `AddressSpace` anymore. This keeps `SYS_KILL`'s caller-visible
+/// contract identical to the single-core case: the target is
+/// unconditionally gone by the time this returns.
 pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
-    {
+    let owning_core = {
         let mut sched = SCHEDULER.lock();
         let Some(process) = occupied_mut(&mut sched, target) else {
             return Err(tarnos_abi::SyscallError::InvalidTarget);
@@ -518,9 +878,62 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
         if process.parent != Some(caller) {
             return Err(tarnos_abi::SyscallError::InvalidTarget);
         }
+        (0..MAX_CORES).find(|&core| sched.current[core] == Some(target))
+    };
+
+    if let Some(core) = owning_core {
+        percpu::slot(core)
+            .evict_request
+            .store(target.0, Ordering::Release);
+        lapic::send_ipi(percpu::slot(core).lapic_id(), lapic::RESCHEDULE_VECTOR);
+
+        // Mirrors `smp::bring_up_aps`'s own bounded-timeout wait pattern:
+        // logged and finite, never a true infinite spin, even though in
+        // practice the target core's IPI handler runs essentially
+        // immediately.
+        const TIMEOUT_SPINS: u64 = 100_000_000;
+        let mut spins = 0u64;
+        while percpu::slot(core).current.load(Ordering::Acquire) == target.0 {
+            core::hint::spin_loop();
+            spins += 1;
+            if spins > TIMEOUT_SPINS {
+                crate::earlyprintln!(
+                    "[sched] core {core} did not evict pid {} in time -- proceeding anyway",
+                    target.index()
+                );
+                break;
+            }
+        }
     }
+
     terminate_slot(target, ExitStatus::Killed);
     Ok(())
+}
+
+/// The `RESCHEDULE_VECTOR` IPI handler's scheduler-side half (see
+/// `arch::x86_64::context_switch::ring3_reschedule`). Runs on whichever
+/// core the IPI targeted, on that process's own kernel stack, with
+/// `current_frame` pointing at its just-interrupted registers.
+///
+/// If this core has no pending eviction request, or the request no
+/// longer names *this* core's current process (it already moved on by
+/// the time the IPI landed -- e.g. it exited on its own first), this is a
+/// no-op: return `current_frame` unchanged so the entry stub simply
+/// resumes what was running. Otherwise, this process is being killed, not
+/// preempted -- its frame isn't worth preserving -- so this clears
+/// `current` (which is what unblocks `terminate_process`'s spin-wait
+/// above) and falls into the same idle-or-pop-next-ready path every
+/// reschedule IPI shares.
+pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    let core = percpu::core_index();
+    let mut sched = SCHEDULER.lock();
+    let evict = percpu::slot(core).evict_request.swap(0, Ordering::AcqRel);
+    if evict == 0 || sched.current[core].map(|p| p.0) != Some(evict) {
+        drop(sched);
+        return current_frame;
+    }
+    set_current(&mut sched, core, None);
+    switch_to_next_or_halt(sched, "[sched] evicted core found nothing else ready, halting.")
 }
 
 /// `SYS_WAIT`'s implementation. If `target` (a child of `caller`) has
@@ -576,7 +989,7 @@ pub fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process) -> R) -> Option<R>
 pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
     let pid = {
         let sched = SCHEDULER.lock();
-        sched.current?
+        sched.current[percpu::core_index()]?
     };
     with_process(pid, f)
 }
@@ -620,6 +1033,10 @@ fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) 
     }
     process.state = ProcessState::Ready;
     sched.ready.push(pid);
+    // Safe to call while still holding `sched`'s lock: unlike
+    // `SCHEDULER.lock()` itself, this only touches percpu atomics and
+    // sends an IPI, never re-entering `SCHEDULER`.
+    notify_idle_cores();
 }
 
 /// Moves a `Blocked` process back to `Ready` and into the ready queue,
@@ -648,7 +1065,8 @@ pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
 /// to run" halt if every other process is also blocked or gone.
 pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
-    if let Some(current_pid) = sched.current {
+    let core = percpu::core_index();
+    if let Some(current_pid) = sched.current[core] {
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame -- it's the same frame the syscall entry
@@ -656,26 +1074,46 @@ pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
             process.trap_frame = unsafe { *current_frame };
             process.state = ProcessState::Blocked;
         }
+        // Load-bearing, not cleanup: a blocked process is no longer
+        // "current" on this core, and unlike the timer-tick path (which
+        // either immediately overwrites `current` with whatever it
+        // switches to next, or leaves it alone specifically *because*
+        // the same process keeps running), `switch_to_next_or_halt`
+        // below may find nothing ready and simply idle this core --
+        // potentially for a long time. Leaving this core's `current`
+        // stale-pointing at the now-blocked pid was a real bug: if this
+        // process later gets woken and migrated to run on a *different*
+        // core, this core's own `sched.current` entry stayed
+        // `Some(pid)`. On the BSP that meant the very next PIT tick's
+        // `on_timer_tick` (which trusts its own `sched.current[core]`
+        // completely) would see this stale entry, overwrite the
+        // process's real, *actively executing on another core* trapframe
+        // with garbage from this core's own idle context, and push it
+        // into the ready queue a second time -- corrupting its saved
+        // state and setting up a second core to run the very same
+        // process (and kernel stack) concurrently. Clearing it here
+        // closes that window entirely.
+        set_current(&mut sched, core, None);
     }
     switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
 }
 
-/// Starts running processes: picks the first ready one and resumes it.
-/// Called exactly once, from boot code, after at least one process has
-/// been [`spawn`]ed — every later switch happens automatically via
-/// [`on_timer_tick`] instead. Never returns: like any other resume, this
-/// only comes back to ring 0 via a future interrupt, not a normal
-/// function return.
+/// Starts running processes on the BSP: called exactly once, from boot
+/// code, right after `main.rs` [`spawn`]s `init`.
+///
+/// This used to simply pop the ready queue and `expect` `init` to
+/// actually be there — safe under single-core scheduling, where nothing
+/// else could possibly touch the queue between `spawn` and this call.
+/// With more than one core, that assumption no longer holds: every idle
+/// AP is already busy-polling the very same shared queue (see
+/// [`ap_enter_scheduler`]) the instant `main.rs`'s `spawn` call pushes
+/// `init` into it, and can legitimately win the race and start running it
+/// first — exactly the migration this milestone's shared-ready-queue
+/// design accepts. So this is simply [`ap_enter_scheduler`] under a
+/// boot-code-facing name: if `init` is still here, this core runs it; if
+/// an AP already grabbed it, this core instead becomes the BSP's own
+/// entry into the same busy-poll idle path every core shares, ready to
+/// pick up whatever runs next. Never returns.
 pub fn start() -> ! {
-    let (first, frame_ptr, rax, rbx) = {
-        let mut sched = SCHEDULER.lock();
-        let first = sched
-            .ready
-            .pop()
-            .expect("scheduler::start() called with no processes spawned");
-        let (frame_ptr, rax, rbx) = switch_to(&mut sched, first);
-        (first, frame_ptr, rax, rbx)
-    };
-    maybe_print_switch(first, rax, rbx);
-    unsafe { crate::arch::x86_64::context_switch::resume(&*frame_ptr) }
+    ap_enter_scheduler()
 }

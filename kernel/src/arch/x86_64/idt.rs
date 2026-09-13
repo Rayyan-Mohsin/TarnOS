@@ -38,6 +38,13 @@ pub fn init() {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+            // Same dual ring0/ring3-dispatching stub shape as the four
+            // process-facing fault vectors above (`set_handler_addr`, not
+            // `set_handler_fn`) since it may need to redirect control to a
+            // different process than the one running when the IPI landed
+            // -- see `context_switch::reschedule_entry`'s doc comment.
+            idt[super::lapic::RESCHEDULE_VECTOR]
+                .set_handler_addr(super::context_switch::reschedule_entry_addr());
         }
         super::interrupts::register_handlers(&mut idt);
         super::lapic::register_handlers(&mut idt);

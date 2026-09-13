@@ -38,6 +38,17 @@ fn idle_stack_slot_base(core_index: usize) -> u64 {
     IDLE_STACK_BASE + core_index as u64 * IDLE_STACK_SLOT_STRIDE
 }
 
+/// Pure arithmetic, no mapping -- the same computation [`idle_stack_top`]
+/// does, split out so callers that just need the *address* of a core's
+/// already-mapped idle stack (every possible core's idle stack is mapped
+/// eagerly by [`bring_up_aps`] before anything ever runs) don't have to
+/// call the mapping function a second time, which would panic
+/// (`MapError::AlreadyMapped`). See `task::scheduler`'s
+/// `abandon_process_stack_and_idle`, the other caller.
+pub(crate) fn idle_stack_top_addr(core_index: usize) -> VirtAddr {
+    VirtAddr::new(idle_stack_slot_base(core_index) + (1 + IDLE_STACK_PAGES) * 4096)
+}
+
 /// Maps `core_index`'s idle stack and returns its top, leaving a guard
 /// page immediately below it — mirrors `gdt::double_fault_stack_top`
 /// exactly. Called for every possible core index eagerly, by the BSP,
@@ -56,7 +67,7 @@ fn idle_stack_top(core_index: usize) -> VirtAddr {
             .expect("out of memory mapping an idle stack");
         virt::map(page, frame, flags).expect("failed to map idle stack page");
     }
-    VirtAddr::new(slot_base + (1 + IDLE_STACK_PAGES) * 4096)
+    idle_stack_top_addr(core_index)
 }
 
 // The raw AP landing point handed to `MpInfo::bootstrap()`. Limine calls
@@ -128,6 +139,12 @@ extern "C" fn ap_entry_on_own_stack(core_index: u64) -> ! {
         gdt::init_ap(core_index);
         lapic::init_this_core();
     }
+    // Safe here (unlike at the equivalent point in `arch::x86_64::init`
+    // for the BSP): this core's own percpu slot was already assigned by
+    // `bring_up_aps`, *before* it was ever started -- see
+    // `percpu::assign_slot`'s doc comment -- so `syscall::init`'s
+    // internal `percpu::core_index()` call resolves correctly here.
+    super::syscall::init();
 
     percpu::slot(core_index).ready.store(true, Ordering::Release);
     earlyprintln!("[smp] core {} ready", core_index);
@@ -147,10 +164,16 @@ extern "C" fn ap_entry_on_own_stack(core_index: u64) -> ! {
             core::hint::spin_loop();
         }
     }
+    // Every other build (including `smp-ipi-test`, which only needs this
+    // core to still be interrupt-responsive -- true of the real
+    // scheduling loop below exactly as it was of the old `hlt` loop):
+    // this core is done with its own bring-up and joins the real
+    // scheduler, ready to run whatever the shared ready queue eventually
+    // hands it. See `task::scheduler::ap_enter_scheduler`'s doc comment
+    // for why this never permanently halts just because nothing has been
+    // spawned onto it yet.
     #[cfg(not(feature = "smp-boot-test"))]
-    loop {
-        x86_64::instructions::hlt();
-    }
+    crate::task::scheduler::ap_enter_scheduler();
 }
 
 /// Enumerates every CPU Limine reported (via `resp`, from `main.rs`'s
@@ -170,6 +193,12 @@ extern "C" fn ap_entry_on_own_stack(core_index: u64) -> ! {
 pub fn bring_up_bsp_only() {
     percpu::assign_slot(0, percpu::read_own_apic_id());
     percpu::slot(0).ready.store(true, Ordering::Release);
+    // Normally `bring_up_aps` maps every possible core's idle stack
+    // eagerly; with no APs to bring up at all, this is the only place
+    // that ever would for the BSP's own -- and it still must, since
+    // `task::scheduler::abandon_process_stack_and_idle` unconditionally
+    // assumes it exists once a process ever blocks or exits.
+    idle_stack_top(0);
     earlyprintln!("[smp] MP_REQUEST not honored -- running BSP-only");
 }
 

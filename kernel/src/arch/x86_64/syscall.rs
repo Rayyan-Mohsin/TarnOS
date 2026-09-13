@@ -7,10 +7,20 @@
 //! table (see `docs/adr/0004-posix-abi-seam.md`).
 //!
 //! Unlike an interrupt, `SYSCALL` never switches stacks automatically —
-//! there is no TSS mechanism for it — so the entry stub below does it by
-//! hand, reading [`SYSCALL_KERNEL_RSP`] directly rather than through
-//! per-CPU/GS-relative addressing: with a single core there is exactly
-//! one "current kernel stack," so a plain global suffices.
+//! there is no TSS mechanism for it — so the entry stub does it by hand,
+//! reading a scratch cell directly rather than through the TSS. With more
+//! than one core, "the current kernel stack" is genuinely per-core state,
+//! and the entry stub's first two instructions touch `rsp` *before saving
+//! a single register* — at that point `rax`/`rdx`/etc. still hold live
+//! syscall arguments, so a `percpu::core_index()` call (which clobbers
+//! exactly those registers via `CPUID`) cannot run there. Rather than
+//! introduce a new per-core CPU register (`GS_BASE`/`swapgs`) just to
+//! make that lookup safe at that one spot, this instead generates
+//! [`percpu::MAX_CORES`] near-identical copies of the whole entry stub
+//! (see [`syscall_entry_stub`]), each closed over its own dedicated pair
+//! of scratch cells — safe because `LSTAR` (the MSR naming which stub a
+//! given core's `SYSCALL` jumps to) is itself already a per-core MSR, the
+//! same way each core already gets its own TSS (`gdt::TSS_TABLE`).
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tarnos_abi::{
@@ -23,6 +33,7 @@ use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, Size4KiB}
 use x86_64::VirtAddr;
 
 use super::context_switch::TrapFrame;
+use super::percpu;
 use super::gdt;
 use crate::ipc::endpoint::{RecvResult, SendResult};
 use crate::ipc::{CapabilitySlot, Endpoint, KernelObjectRef, Rights};
@@ -44,29 +55,156 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-/// The kernel stack top for whichever process is about to run — updated
-/// by the scheduler on every switch, alongside `gdt::set_kernel_stack`.
-pub static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-/// Scratch cell for the user `RSP` at syscall entry, before this stub
-/// switches onto the kernel stack — plain (not `SpinLock`) because
-/// nothing else ever touches it: `SFMask` clears `IF` on entry, so this
-/// single core cannot re-enter this trampoline before it finishes with
-/// this value.
-static SCRATCH_USER_RSP: AtomicU64 = AtomicU64::new(0);
-
 static USER_CS_SELECTOR: AtomicU64 = AtomicU64::new(0);
 static USER_SS_SELECTOR: AtomicU64 = AtomicU64::new(0);
 
+/// Generates one core's copy of the `SYSCALL` entry stub, plus its own
+/// dedicated pair of scratch cells (the kernel-stack-top the scheduler
+/// last set for this core, and a landing spot for the user `RSP` while
+/// the stub isn't on any real stack yet). Mirrors `context_switch`'s
+/// timer entry stub, with two differences forced by `SYSCALL` itself:
+/// there is no hardware-pushed frame to branch on (userspace is the only
+/// caller, always ring 3, so `cs`/`ss` are always the same known
+/// selectors, shared across cores since the GDT's own selector numbers
+/// are) and no automatic stack switch (so this does it manually before
+/// touching anything else). Once on the kernel stack, it builds exactly
+/// the same `TrapFrame` shape the timer stub does, so `syscall_dispatch`
+/// and `resume` both work unmodified regardless of which trampoline
+/// (which core) produced the frame.
+///
+/// Plain `AtomicU64`s, not `SpinLock`s: `SFMask` clears `IF` on entry, so
+/// the *owning* core cannot re-enter its own copy of this trampoline
+/// before it finishes with these values — and no other core ever touches
+/// a copy that isn't its own.
+macro_rules! syscall_entry_stub {
+    ($entry_name:ident, $kernel_rsp:ident, $scratch_rsp:ident) => {
+        pub static $kernel_rsp: AtomicU64 = AtomicU64::new(0);
+        static $scratch_rsp: AtomicU64 = AtomicU64::new(0);
+
+        core::arch::global_asm!(
+            concat!(".global ", stringify!($entry_name)),
+            concat!(stringify!($entry_name), ":"),
+            "mov [rip + {scratch_rsp}], rsp",
+            "mov rsp, [rip + {kernel_rsp}]",
+            "push qword ptr [rip + {user_ss}]",
+            "push qword ptr [rip + {scratch_rsp}]",
+            "push r11", // rflags, saved here by SYSCALL
+            "push qword ptr [rip + {user_cs}]",
+            "push rcx", // rip, saved here by SYSCALL
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "mov rdi, rsp",
+            "call {dispatch}",
+            "mov rsp, rax",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+            "iretq",
+            scratch_rsp = sym $scratch_rsp,
+            kernel_rsp = sym $kernel_rsp,
+            user_cs = sym USER_CS_SELECTOR,
+            user_ss = sym USER_SS_SELECTOR,
+            dispatch = sym syscall_dispatch,
+        );
+
+        unsafe extern "C" {
+            fn $entry_name();
+        }
+    };
+}
+
+syscall_entry_stub!(syscall_entry_0, SYSCALL_KERNEL_RSP_0, SCRATCH_USER_RSP_0);
+syscall_entry_stub!(syscall_entry_1, SYSCALL_KERNEL_RSP_1, SCRATCH_USER_RSP_1);
+syscall_entry_stub!(syscall_entry_2, SYSCALL_KERNEL_RSP_2, SCRATCH_USER_RSP_2);
+syscall_entry_stub!(syscall_entry_3, SYSCALL_KERNEL_RSP_3, SCRATCH_USER_RSP_3);
+syscall_entry_stub!(syscall_entry_4, SYSCALL_KERNEL_RSP_4, SCRATCH_USER_RSP_4);
+syscall_entry_stub!(syscall_entry_5, SYSCALL_KERNEL_RSP_5, SCRATCH_USER_RSP_5);
+syscall_entry_stub!(syscall_entry_6, SYSCALL_KERNEL_RSP_6, SCRATCH_USER_RSP_6);
+syscall_entry_stub!(syscall_entry_7, SYSCALL_KERNEL_RSP_7, SCRATCH_USER_RSP_7);
+
+// One literal copy per possible core -- kept in sync with
+// `percpu::MAX_CORES` by hand (`global_asm!` can't be generated in a
+// loop), asserted at compile time just below rather than only at the
+// array-length-mismatch error site.
+const _: () = assert!(percpu::MAX_CORES == 8, "update syscall.rs's 8 entry-stub copies to match");
+
+const ENTRY_ADDRS: [unsafe extern "C" fn(); percpu::MAX_CORES] = [
+    syscall_entry_0,
+    syscall_entry_1,
+    syscall_entry_2,
+    syscall_entry_3,
+    syscall_entry_4,
+    syscall_entry_5,
+    syscall_entry_6,
+    syscall_entry_7,
+];
+
+static KERNEL_RSP_SLOTS: [&AtomicU64; percpu::MAX_CORES] = [
+    &SYSCALL_KERNEL_RSP_0,
+    &SYSCALL_KERNEL_RSP_1,
+    &SYSCALL_KERNEL_RSP_2,
+    &SYSCALL_KERNEL_RSP_3,
+    &SYSCALL_KERNEL_RSP_4,
+    &SYSCALL_KERNEL_RSP_5,
+    &SYSCALL_KERNEL_RSP_6,
+    &SYSCALL_KERNEL_RSP_7,
+];
+
+fn syscall_entry_addr_for_core(core: usize) -> VirtAddr {
+    VirtAddr::new(ENTRY_ADDRS[core] as usize as u64)
+}
+
+/// The kernel stack top for whichever process is about to run *on the
+/// calling core* — updated by the scheduler on every switch, alongside
+/// `gdt::set_kernel_stack`. Resolves its own core index internally
+/// (mirroring `gdt::set_kernel_stack`'s own established pattern), so
+/// every call site written back when there was only ever one core needed
+/// no change at all.
 pub fn set_syscall_kernel_stack(top: VirtAddr) {
-    SYSCALL_KERNEL_RSP.store(top.as_u64(), Ordering::Relaxed);
+    KERNEL_RSP_SLOTS[percpu::core_index()].store(top.as_u64(), Ordering::Relaxed);
 }
 
 /// Programs the MSRs `SYSCALL` needs: `STAR` (segment selectors, laid out
 /// so this matches the GDT ordering fixed back when the GDT itself was
-/// built — see `gdt`'s module doc comment), `LSTAR` (entry point), and
-/// `SFMASK` (RFLAGS bits to clear on entry — just `IF`, so this stub runs
-/// with interrupts off exactly like the timer entry stub does).
+/// built — see `gdt`'s module doc comment), `LSTAR` (this core's own
+/// entry-stub copy — see [`syscall_entry_stub`]), and `SFMASK` (RFLAGS
+/// bits to clear on entry — just `IF`, so this stub runs with interrupts
+/// off exactly like the timer entry stub does).
+///
+/// Must be called once by every core, BSP and every AP alike (`LSTAR` is
+/// genuinely per-core hardware state) — `STAR`/`EFER`/`SFMASK` end up
+/// holding numerically identical values on every core (the GDT selector
+/// layout is shared), but they're still per-core MSRs with no
+/// "set once for every core" mechanism, so this just reruns the whole
+/// idempotent sequence on each caller rather than trying to special-case
+/// which parts only need doing once.
 pub fn init() {
+    let core = percpu::core_index();
     let selectors = gdt::selectors();
     USER_CS_SELECTOR.store(selectors.user_code.0 as u64, Ordering::Relaxed);
     USER_SS_SELECTOR.store(selectors.user_data.0 as u64, Ordering::Relaxed);
@@ -80,76 +218,9 @@ pub fn init() {
             selectors.kernel_data,
         )
         .expect("GDT selector layout does not satisfy SYSCALL/SYSRET's fixed-offset requirement");
-        LStar::write(syscall_entry_addr());
+        LStar::write(syscall_entry_addr_for_core(core));
         SFMask::write(RFlags::INTERRUPT_FLAG);
     }
-}
-
-// Mirrors `context_switch`'s timer entry stub, with two differences
-// forced by `SYSCALL` itself: there is no hardware-pushed frame to
-// branch on (userspace is the only caller, always ring 3, so `cs`/`ss`
-// are always the same known selectors) and no automatic stack switch (so
-// this does it manually before touching anything else). Once on the
-// kernel stack, it builds exactly the same `TrapFrame` shape the timer
-// stub does, so `syscall_dispatch` and `resume` both work unmodified
-// regardless of which trampoline produced the frame.
-core::arch::global_asm!(
-    ".global syscall_entry",
-    "syscall_entry:",
-    "mov [rip + {scratch_rsp}], rsp",
-    "mov rsp, [rip + {kernel_rsp}]",
-    "push qword ptr [rip + {user_ss}]",
-    "push qword ptr [rip + {scratch_rsp}]",
-    "push r11", // rflags, saved here by SYSCALL
-    "push qword ptr [rip + {user_cs}]",
-    "push rcx", // rip, saved here by SYSCALL
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push rbp",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov rdi, rsp",
-    "call {dispatch}",
-    "mov rsp, rax",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    "iretq",
-    scratch_rsp = sym SCRATCH_USER_RSP,
-    kernel_rsp = sym SYSCALL_KERNEL_RSP,
-    user_cs = sym USER_CS_SELECTOR,
-    user_ss = sym USER_SS_SELECTOR,
-    dispatch = sym syscall_dispatch,
-);
-
-unsafe extern "C" {
-    fn syscall_entry();
-}
-
-fn syscall_entry_addr() -> VirtAddr {
-    VirtAddr::new(syscall_entry as *const () as u64)
 }
 
 #[unsafe(no_mangle)]
@@ -180,8 +251,12 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// specifically so the actual send/recv below — which may call back into
 /// `task::scheduler` to wake a *different* blocked process — never runs
 /// while still holding the scheduler's lock `with_current_process`
-/// itself takes; doing both under one lock would be a single-core
-/// self-deadlock the moment a wake-up needs that same lock.
+/// itself takes; doing both under one lock would be a same-core
+/// self-deadlock (this core re-entering a lock it already holds) the
+/// moment a wake-up needs that same lock — a hazard tied to holding the
+/// lock across a reentrant call, not to how many cores exist; a second
+/// core spinning on the same lock would only make it worse (real
+/// contention on top of the same-core reentrancy), never better.
 fn resolve_endpoint(
     cap_index: CapIndex,
     required: Rights,

@@ -190,6 +190,25 @@ extern "C" fn _start() -> ! {
         None => arch::x86_64::smp::bring_up_bsp_only(),
     }
 
+    // Must run only after the call above assigns the BSP's own percpu
+    // slot (`percpu::assign_slot(0, ..)`): programming `LSTAR` needs to
+    // know which of `syscall`'s per-core entry-stub copies belongs to
+    // this core, via `percpu::core_index()`. Every AP programs its own
+    // copy of these same MSRs as part of its own bring-up instead (see
+    // `arch::x86_64::smp::ap_entry_on_own_stack`), for the same reason.
+    arch::x86_64::syscall::init();
+    earlyprintln!("[boot] SYSCALL/SYSRET initialized");
+
+    // Eagerly, here, before anything spawns a process (and, critically,
+    // before any test scenario ever snapshots
+    // `memory::phys::free_frame_count()` as a baseline) -- see
+    // `task::scheduler::init_idle_address_space`'s doc comment for why
+    // building this lazily instead (the first time any core actually
+    // went idle) looked exactly like a physical-memory leak. Must run
+    // after the bring-up above so this address space's one-time PML4
+    // snapshot already includes every core's idle stack.
+    task::scheduler::init_idle_address_space();
+
     // Milestone 6: every additional core's idle loop (under this feature
     // only, see `arch::x86_64::smp::ap_entry_on_own_stack`) free-spins
     // incrementing its own counter instead of immediately hlt-parking.
