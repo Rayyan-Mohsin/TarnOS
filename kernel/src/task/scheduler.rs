@@ -247,10 +247,13 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
 }
 
 /// Diagnostic only, gated to roughly twice a second: shows which process
-/// the round-robin queue picked and its register state at that point, so
-/// alternation (and each process's counter actually changing between
-/// picks, not just staying at its initial value) is directly observable
-/// rather than merely "didn't crash." Prints `pid.index()`, not the raw
+/// the round-robin queue picked, which core is now running it, and its
+/// register state at that point, so alternation (and each process's
+/// counter actually changing between picks, not just staying at its
+/// initial value) is directly observable rather than merely "didn't
+/// crash." The core index is what `xtask`'s cross-core scenarios grep
+/// for to confirm a process genuinely ran somewhere other than the BSP,
+/// not just "eventually finished." Prints `pid.index()`, not the raw
 /// packed value, since the generation half is an internal safety detail
 /// no diagnostic reader needs to see.
 fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
@@ -264,8 +267,9 @@ fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
     if now >= LAST_PRINT_TICK.load(Ordering::Relaxed) + 51 {
         LAST_PRINT_TICK.store(now, Ordering::Relaxed);
         crate::earlyprintln!(
-            "[sched] switched to pid {} (rax={rax}, rbx={rbx})",
-            pid.index()
+            "[sched] switched to pid {} on core {} (rax={rax}, rbx={rbx})",
+            pid.index(),
+            percpu::core_index()
         );
     }
 }
@@ -538,15 +542,23 @@ fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! 
 /// `extern "C"` landing pad for [`abandon_process_stack_and_idle`]'s raw
 /// stack switch -- reassembles the `&'static str` its two register
 /// arguments were decomposed into (a fat pointer can't cross a raw
-/// `asm!` call directly) and hands off to [`idle_loop_on_own_stack`].
+/// `asm!` call directly), releases the `SCHEDULER` lock
+/// [`switch_to_next_or_halt`] deliberately left held across the switch
+/// (see that function's doc comment), and hands off to
+/// [`idle_loop_on_own_stack`].
 ///
 /// # Safety
 /// `msg_ptr`/`msg_len` must together describe a valid, `'static` UTF-8
 /// string -- true for every real caller, which only ever passes through
-/// a `&'static str` it already had.
+/// a `&'static str` it already had. `SCHEDULER` must actually still be
+/// locked by the caller that jumped here -- true for
+/// [`abandon_process_stack_and_idle`]'s one call site.
 extern "C" fn idle_loop_trampoline(core: u64, msg_ptr: *const u8, msg_len: u64) -> ! {
     let halt_message: &'static str =
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg_ptr, msg_len as usize)) };
+    // SAFETY: see this function's own doc comment.
+    unsafe { SCHEDULER.force_unlock() };
+    activate_idle_address_space();
     idle_loop_on_own_stack(core as usize, Some(halt_message))
 }
 
@@ -579,6 +591,30 @@ extern "C" fn idle_loop_trampoline(core: u64, msg_ptr: *const u8, msg_len: u64) 
 /// same reasoning `smp::ap_entry_trampoline` already applies to a
 /// freshly-booted AP that has no process stack to abandon in the first
 /// place.
+///
+/// # `SCHEDULER` stays locked across the switch
+/// The caller ([`switch_to_next_or_halt`]) must still hold `SCHEDULER`'s
+/// lock and must not have dropped it -- simply never dropping the guard
+/// it took is what keeps the lock held here, since a guard whose `Drop`
+/// sits behind a diverging call like this one never runs at all, not
+/// merely later. That's deliberate, not an oversight: the stack-sharing
+/// bug above was only *mostly* fixed by swapping stacks before parking.
+/// Everything this function's caller did first -- one more ready-queue
+/// check, a kernel-task drain, building the idle address space -- used to
+/// run first, still on the outgoing process's own stack, and a real,
+/// reproduced adversarial test (`xtask test-smp-wait-cross-core`) showed
+/// that window is plenty wide enough for the *same* process to be woken
+/// and dispatched onto a different core in the meantime, whose next
+/// syscall entry starts overwriting this exact stack while this core is
+/// still using it -- the identical hazard, just with a smaller window
+/// instead of none. Holding `SCHEDULER` continuously from the moment this
+/// process stopped being current until this core has actually finished
+/// switching away closes it completely: waking or re-dispatching that
+/// process is impossible without the same lock (`wake_blocked_process`,
+/// `allocate_pid`, `start_child` all take it), so nothing else can touch
+/// this stack's fixed address until [`idle_loop_trampoline`] releases the
+/// lock from the safe side of the switch. See
+/// `docs/adr/0010-cross-core-scheduling.md`.
 fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! {
     let idle_top = crate::arch::x86_64::smp::idle_stack_top_addr(core).as_u64();
     let msg_ptr = halt_message.as_ptr();
@@ -598,23 +634,55 @@ fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! 
 }
 
 /// Picks the next ready process and switches to it, given `sched`'s lock
-/// already held. If none is ready yet, gives kernel tasks one drain —
-/// not zero, and not an unbounded retry loop — since a task's poll (e.g.
-/// the console server receiving a message) can itself complete a
-/// rendezvous with a process that was `Blocked` on the other side (see
-/// `ipc::endpoint::Endpoint::wake_receiver`), which pushes that process
-/// into `ready` as a direct side effect of the drain.
+/// already held. If one is immediately ready, this is the *only* branch
+/// that's still safe to run on the stack this core is already on — see
+/// below — so this stays a plain, non-diverging function call
+/// ([`finish_switch`]) that returns normally, exactly like every syscall
+/// handler's ordinary return path.
 ///
-/// If the whole process table is genuinely empty afterward, halts this
-/// core permanently (see [`permanent_halt`]) — the same terminal
-/// behavior this milestone's predecessor always had. Otherwise, some
-/// other process still exists elsewhere (`Blocked`/`Suspended`/
-/// `Running` on a different core) that could make this core's queue
-/// non-empty at any moment, so this core switches away from whatever
-/// address space it was about to leave dangling (see
-/// [`activate_idle_address_space`]), abandons the stack it's currently
-/// running on (see [`abandon_process_stack_and_idle`]), and parks via
-/// [`park_until_woken`] until something appears.
+/// If nothing is ready yet, this deliberately does **not** drop `sched`
+/// before abandoning the stack (see [`abandon_process_stack_and_idle`]) —
+/// simply never dropping a `SpinLockGuard` is what keeps a lock held
+/// across a diverging call, since the guard's `Drop` then sits behind
+/// code that never runs, not merely behind code that runs later. Two
+/// earlier versions of this function got this wrong in smaller and
+/// smaller ways, both caught by the same real, reproduced adversarial
+/// test (`xtask test-smp-wait-cross-core`, manifesting as a
+/// general-protection fault at an unpredictable kernel address that
+/// changed between runs, or an outright wrong exit status delivered to
+/// the waiting parent — the signature of two cores racing on the same
+/// memory, not a deterministic logic error):
+///
+/// - The first version dropped the lock, ran a kernel-task drain, took a
+///   *second* lock acquisition to recheck the ready queue, and only
+///   *then* abandoned the stack if still nothing was ready. All of that
+///   ran on the stack of a process that — unlike one
+///   [`terminate_current_process`] already finalized before ever calling
+///   this — [`block_current_process`] leaves merely `Blocked`, still
+///   fully alive and able to be woken and dispatched onto a *different*
+///   core at any instant by a completely unrelated event (e.g. the
+///   target it's `SYS_WAIT`ing for exiting on that other core right
+///   now). From that instant on, nothing stops that other core's next
+///   syscall entry for it from pushing a fresh `TrapFrame` from the top
+///   of this exact same fixed per-PID kernel stack, while this core is
+///   still using deeper addresses on the very same stack for its own
+///   locals and call frames.
+/// - The second version shrank that window (dropping straight to
+///   [`abandon_process_stack_and_idle`] with no drain/recheck first) but
+///   didn't close it: dropping the lock at all, even briefly, is exactly
+///   the signal every other core's `wake_blocked_process`/`start_child`/
+///   `allocate_pid` is waiting on before it can touch this process again.
+///   Under real QEMU/TCG scheduling noise that smaller window still lost
+///   the race often enough to fail about a third of the time under
+///   repeated stress.
+///
+/// Holding `SCHEDULER` continuously from here through the actual stack
+/// switch closes this completely rather than just shrinking it: every
+/// operation that could make this process visible to another core again
+/// (waking it, migrating it, reusing its table slot) needs this same
+/// lock, so none of them can run until [`idle_loop_trampoline`] releases
+/// it from the safe side of the switch, once this core is no longer
+/// using the stack at all. See `docs/adr/0010-cross-core-scheduling.md`.
 fn switch_to_next_or_halt(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     halt_message: &'static str,
@@ -623,20 +691,12 @@ fn switch_to_next_or_halt(
         return finish_switch(sched, next_pid);
     }
 
-    drop(sched);
-    crate::task::executor::run_ready_tasks();
-    sched = SCHEDULER.lock();
-    if let Some(next_pid) = sched.ready.pop() {
-        return finish_switch(sched, next_pid);
-    }
-
-    if all_processes_empty(&sched) {
-        drop(sched);
-        permanent_halt(halt_message);
-    }
-    drop(sched);
-
-    activate_idle_address_space();
+    // No `drop(sched)` here -- see this function's doc comment.
+    // SAFETY: `sched` is simply never dropped from this point on (this
+    // function diverges into `abandon_process_stack_and_idle`, whose own
+    // doc comment documents and relies on exactly this), so `SCHEDULER`
+    // stays locked until `idle_loop_trampoline` releases it.
+    core::mem::forget(sched);
     abandon_process_stack_and_idle(percpu::core_index(), halt_message);
 }
 
@@ -937,36 +997,77 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 }
 
 /// `SYS_WAIT`'s implementation. If `target` (a child of `caller`) has
-/// already exited (`Slot::Zombie`), reaps it immediately and returns its
-/// status (`Ok(Some(status))`). If `target` is still alive, records
-/// `caller` as its `wait_waiter` — so [`take_and_finalize_slot`] can
+/// already exited (`Slot::Zombie`), reaps it immediately and writes its
+/// status into `current_frame`'s registers, returning it unchanged (the
+/// non-blocking case). Otherwise, if `target` is still alive, records
+/// `caller` as its `wait_waiter` -- so [`take_and_finalize_slot`] can
 /// resolve it directly once `target` actually terminates, whatever the
-/// cause — and returns `Ok(None)`, telling the caller (`sys_wait`'s
-/// syscall handler) to block via [`block_current_process`], exactly
-/// like a blocking `sys_send`/`sys_recv`. Since only `target.parent` is
-/// ever permitted to become its `wait_waiter`, at most one process can
-/// ever legitimately be waiting on a given target — no wait *queue* is
-/// needed, just this one field.
-pub fn wait_for_child(
-    target: Pid,
-    caller: Pid,
-) -> Result<Option<ExitStatus>, tarnos_abi::SyscallError> {
+/// cause -- and *immediately* blocks the caller itself
+/// ([`block_current_process_locked`]), all under the one `SCHEDULER`
+/// lock acquisition this function takes at the top.
+///
+/// That atomicity is load-bearing, not a style choice: an earlier version
+/// of this function only recorded `wait_waiter` and returned a sentinel
+/// telling `sys_wait` to separately call [`block_current_process`]
+/// afterward -- two distinct lock acquisitions with a gap in between.
+/// With more than one core, `target` terminating *in that exact gap* (on
+/// a different core, entirely independently) would see `wait_waiter`
+/// already set and immediately try to wake and resume `caller` -- mutating
+/// its `trap_frame` and pushing it into the ready queue -- while `caller`
+/// was still genuinely running right here, hadn't actually stopped, and
+/// hadn't yet persisted *this* syscall's real trap frame anywhere. A real,
+/// reproduced bug (`xtask test-smp-wait-cross-core`, the same one
+/// `switch_to_next_or_halt`'s doc comment describes: a general-protection
+/// fault at an unpredictable kernel address, or a flatly wrong exit status
+/// delivered) that no amount of fixing what happens *after* blocking could
+/// ever close, since the unsafe window was entirely *before* it. Since
+/// only `target.parent` is ever permitted to become its `wait_waiter`, at
+/// most one process can ever legitimately be waiting on a given target --
+/// no wait *queue* is needed, just this one field. See
+/// `docs/adr/0010-cross-core-scheduling.md`.
+pub fn wait_for_child(current_frame: *mut TrapFrame, target: Pid, caller: Pid) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
     let index = target.index();
     if index >= MAX_PROCESSES || sched.generations[index] != target.generation() {
-        return Err(tarnos_abi::SyscallError::InvalidTarget);
+        drop(sched);
+        unsafe { (*current_frame).rax = tarnos_abi::SyscallError::InvalidTarget.as_retval() as u64 };
+        return current_frame;
     }
-    match &mut sched.processes[index] {
-        Slot::Zombie { parent, status } if *parent == caller => {
-            let status = *status;
+
+    enum Outcome {
+        AlreadyDone(ExitStatus),
+        MustBlock,
+        Invalid,
+    }
+    let outcome = match &sched.processes[index] {
+        Slot::Zombie { parent, status } if *parent == caller => Outcome::AlreadyDone(*status),
+        Slot::Occupied(process) if process.parent == Some(caller) => Outcome::MustBlock,
+        _ => Outcome::Invalid,
+    };
+
+    match outcome {
+        Outcome::AlreadyDone(status) => {
             sched.processes[index] = Slot::Empty;
-            Ok(Some(status))
+            drop(sched);
+            let (kind, code) = status.to_regs();
+            let regs = unsafe { &mut *current_frame };
+            regs.rax = 0;
+            regs.rdi = kind;
+            regs.rsi = code;
+            current_frame
         }
-        Slot::Occupied(process) if process.parent == Some(caller) => {
-            process.wait_waiter = Some(caller);
-            Ok(None)
+        Outcome::MustBlock => {
+            if let Slot::Occupied(process) = &mut sched.processes[index] {
+                process.wait_waiter = Some(caller);
+            }
+            block_current_process_locked(&mut sched, current_frame);
+            switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
         }
-        _ => Err(tarnos_abi::SyscallError::InvalidTarget),
+        Outcome::Invalid => {
+            drop(sched);
+            unsafe { (*current_frame).rax = tarnos_abi::SyscallError::InvalidTarget.as_retval() as u64 };
+            current_frame
+        }
     }
 }
 
@@ -1053,18 +1154,22 @@ pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
     wake_blocked_process_locked(&mut sched, pid, result);
 }
 
-/// Suspends the calling process inside a blocking `SYS_SEND`/`SYS_RECV`/
-/// `SYS_WAIT` that found no partner ready: persists `current_frame` into
-/// the process's own `trap_frame` (so `wake_blocked_process` can resume
-/// it later, exactly like a preempted process's frame is persisted in
-/// `on_timer_tick`), marks it `Blocked`, and — the one thing that
-/// actually distinguishes this from an ordinary preemption — does *not*
-/// push it back into the ready queue, so it can never be scheduled again
-/// until something wakes it. Switches to whatever's next ready exactly
-/// like `terminate_current_process`, including the same "nothing left
-/// to run" halt if every other process is also blocked or gone.
-pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
-    let mut sched = SCHEDULER.lock();
+/// The mutation half of blocking the calling process, given `sched`'s
+/// lock already held: persists `current_frame` into the process's own
+/// `trap_frame` (so `wake_blocked_process` can resume it later, exactly
+/// like a preempted process's frame is persisted in `on_timer_tick`),
+/// marks it `Blocked`, and clears this core's `current` entry. Does
+/// *not* push it back into the ready queue -- the one thing that
+/// actually distinguishes this from an ordinary preemption -- so it can
+/// never be scheduled again until something wakes it.
+///
+/// Factored out so [`wait_for_child`] can perform this as part of the
+/// *same* lock acquisition that already found `target` still alive and
+/// recorded `caller` as its `wait_waiter`, rather than that check and
+/// this transition happening under two separate locks with a gap a
+/// different core's wake could land in -- see that function's doc
+/// comment.
+fn block_current_process_locked(sched: &mut Inner, current_frame: *mut TrapFrame) {
     let core = percpu::core_index();
     if let Some(current_pid) = sched.current[core] {
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
@@ -1093,8 +1198,24 @@ pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         // state and setting up a second core to run the very same
         // process (and kernel stack) concurrently. Clearing it here
         // closes that window entirely.
-        set_current(&mut sched, core, None);
+        set_current(sched, core, None);
     }
+}
+
+/// Suspends the calling process inside a blocking `SYS_SEND`/`SYS_RECV`
+/// that found no partner ready (see [`block_current_process_locked`] for
+/// the actual transition), then switches to whatever's next ready --
+/// exactly like `terminate_current_process`, including the same "nothing
+/// left to run" halt if every other process is also blocked or gone.
+///
+/// `SYS_WAIT`'s equivalent is [`wait_for_child`], which performs the same
+/// transition itself rather than calling this, so it can do so under the
+/// *same* lock acquisition that decided blocking was necessary in the
+/// first place -- see its doc comment for why that matters with more
+/// than one core.
+pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    let mut sched = SCHEDULER.lock();
+    block_current_process_locked(&mut sched, current_frame);
     switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
 }
 

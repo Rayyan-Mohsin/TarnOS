@@ -89,6 +89,25 @@ smp-boot-test = []
 # kernel doesn't hang or fault. Exercised by
 # `cargo run -p xtask -- test-smp-ipi`.
 smp-ipi-test = []
+# Spawns two dummy ring-3 processes that each free-spin on SYS_YIELD for
+# a large fixed iteration count, then polls every core's current-process
+# atomic looking for direct evidence both are resident on two different
+# cores at the same instant -- proof of genuine concurrent, cross-core
+# execution for real *processes* (not just the idle-loop free-spin
+# counters `smp-boot-test` already proved for cores with nothing to
+# run). Exercised by `cargo run -p xtask -- test-smp-sched-concurrency`.
+smp-sched-concurrency-test = []
+# Spawns a dummy ring-3 process that free-spins on SYS_YIELD forever
+# (never exiting on its own) as the child of a second dummy process that
+# yields a few times -- letting the first one actually start running,
+# most likely on a different core -- then SYS_KILLs it. Directly
+# exercises `task::scheduler::terminate_process`'s cross-core eviction
+# protocol (a targeted IPI plus a bounded wait for the owning core to
+# confirm), then spawns, starts, and waits on one more ordinary child to
+# confirm the machine is still fully healthy right after the eviction --
+# the direct adversarial check for the idle-core stale-CR3 fix. Exercised
+# by `cargo run -p xtask -- test-smp-kill-cross-core`.
+kill-cross-core-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

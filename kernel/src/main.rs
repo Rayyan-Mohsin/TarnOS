@@ -20,6 +20,7 @@ mod milestone2_tests;
 mod milestone3_tests;
 mod milestone4_tests;
 mod milestone5_tests;
+mod milestone7_tests;
 mod sync;
 mod task;
 
@@ -695,6 +696,140 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(test_process).expect("spawn failed");
 
         earlyprintln!("[boot] sbrk-boundary-test: spawned sbrk-boundary-test process");
+        task::scheduler::start();
+    }
+
+    // Milestone 7: spawns two dummy processes that each free-spin on
+    // SYS_YIELD, then polls every core's current-process atomic looking
+    // for direct evidence both are resident on two *different* cores at
+    // the same instant -- real proof of concurrent, cross-core process
+    // execution, not just "eventually scheduled somewhere" (see
+    // `xtask test-smp-sched-concurrency`). Never enabled for a normal
+    // build.
+    #[cfg(feature = "smp-sched-concurrency-test")]
+    {
+        let pid_a = task::scheduler::allocate_pid();
+        let process_a =
+            task::process::Process::new_dummy(pid_a, milestone7_tests::concurrency_process_a, None)
+                .expect("failed to create concurrency test process A");
+        task::scheduler::spawn(process_a).expect("spawn failed");
+
+        let pid_b = task::scheduler::allocate_pid();
+        let process_b =
+            task::process::Process::new_dummy(pid_b, milestone7_tests::concurrency_process_b, None)
+                .expect("failed to create concurrency test process B");
+        task::scheduler::spawn(process_b).expect("spawn failed");
+
+        earlyprintln!("[boot] smp-sched-concurrency-test: spawned processes A and B");
+
+        let mut saw_concurrent = false;
+        for _ in 0..200 {
+            let start = arch::x86_64::interrupts::ticks();
+            while arch::x86_64::interrupts::ticks() < start + 2 {
+                x86_64::instructions::hlt();
+            }
+
+            let mut core_of_a = None;
+            let mut core_of_b = None;
+            for core in 0..arch::x86_64::percpu::MAX_CORES {
+                let current = arch::x86_64::percpu::slot(core)
+                    .current
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if current == pid_a.0 {
+                    core_of_a = Some(core);
+                }
+                if current == pid_b.0 {
+                    core_of_b = Some(core);
+                }
+            }
+            if let (Some(core_a), Some(core_b)) = (core_of_a, core_of_b) {
+                if core_a != core_b {
+                    earlyprintln!(
+                        "[smp-test] pid_a on core {core_a}, pid_b on core {core_b} -- concurrent"
+                    );
+                    saw_concurrent = true;
+                    break;
+                }
+            }
+        }
+        earlyprintln!(
+            "[smp-test] {}",
+            if saw_concurrent { "CONCURRENCY_OK" } else { "CONCURRENCY_FAIL" }
+        );
+
+        task::scheduler::start();
+    }
+
+    // Milestone 7: spawns a dummy process that free-spins forever as the
+    // child of a second dummy process that yields a few times (letting
+    // the first one actually start running, most likely on a different
+    // core) and then SYS_KILLs it -- the direct adversarial test for
+    // `task::scheduler::terminate_process`'s cross-core eviction
+    // protocol. Immediately afterward the killer spawns, starts, and
+    // waits on one more ordinary child to confirm the machine is still
+    // fully healthy right after the eviction (see
+    // `xtask test-smp-kill-cross-core`). Never enabled for a normal
+    // build.
+    #[cfg(feature = "kill-cross-core-test")]
+    {
+        // Allocated first, so it gets the fixed Pid (index 0, generation
+        // 1) `milestone7_tests::kill_cc_killer_process` hardcodes as its
+        // target -- see that function's doc comment.
+        //
+        // Spawned immediately, with a placeholder `parent: None`, rather
+        // than allocating `killer_pid` first and passing it in here
+        // directly: `allocate_pid` only reserves a `Pid` value (bumping
+        // that slot's generation) -- it does *not* mark the table slot
+        // non-`Empty`, which only `spawn`/`spawn_suspended` do. Calling
+        // it a second time (for `killer_pid`) before this process was
+        // ever actually spawned would find the *same* slot still
+        // reporting `Empty` and hand out that same index again, just
+        // one generation higher -- exactly the hazard `allocate_pid`'s
+        // own doc comment warns callers must avoid. A real, reproduced
+        // bug: both pids ended up naming table index 0, so target's own
+        // `spawn` and killer's `spawn` right after it landed in the
+        // *same* slot, and the ready queue ended up with two different
+        // `Pid`s (different generations) both resolving to one shared
+        // `Process` -- silent double-scheduling that surfaced as
+        // wild jumps to near-null addresses under real cross-core
+        // timing (`xtask test-smp-kill-cross-core`). Spawning target
+        // first (so its slot is genuinely `Occupied` before `killer_pid`
+        // is ever allocated) closes the gap; its `parent` is fixed up
+        // below once `killer_pid` is actually known.
+        let target_pid = task::scheduler::allocate_pid();
+        let target_process = task::process::Process::new_dummy(
+            target_pid,
+            milestone7_tests::kill_cc_target_process,
+            None,
+        )
+        .expect("failed to create the kill-cross-core-test target process");
+        task::scheduler::spawn(target_process).expect("spawn failed");
+
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let killer_pid = task::scheduler::allocate_pid();
+        task::scheduler::with_process(target_pid, |p| p.parent = Some(killer_pid))
+            .expect("target process vanished before its parent could be set");
+
+        let mut killer_process = task::process::Process::new_dummy(
+            killer_pid,
+            milestone7_tests::kill_cc_killer_process,
+            None,
+        )
+        .expect("failed to create the kill-cross-core-test killer process");
+        killer_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(killer_process).expect("spawn failed");
+
+        earlyprintln!("[boot] kill-cross-core-test: spawned target + killer processes");
         task::scheduler::start();
     }
 

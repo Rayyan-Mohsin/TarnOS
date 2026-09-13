@@ -51,6 +51,32 @@ impl<T> SpinLock<T> {
             interrupts_were_enabled,
         }
     }
+
+    /// Releases this lock without going through the `SpinLockGuard` that
+    /// took it — for the one case where that guard can't be carried to
+    /// where it would normally be dropped: a caller that takes this lock,
+    /// then performs a raw stack switch (`task::scheduler`'s
+    /// `abandon_process_stack_and_idle`) into code that never returns
+    /// through the original call chain the guard lives in. Simply never
+    /// dropping the guard there is exactly what keeps this lock held
+    /// across that switch (its `Drop` becomes unreachable code, not
+    /// merely delayed) — deliberately, so nothing else can act on
+    /// whatever this lock protects until the new stack is safely in use.
+    /// This is how that same code releases it again, once there.
+    ///
+    /// # Safety
+    /// The caller must actually still hold this lock (i.e. every
+    /// `SpinLockGuard` this lock ever produced has either already been
+    /// dropped or, for exactly one still-live one, will never be dropped
+    /// at all — never call this while a guard that *will* still run its
+    /// `Drop` remains outstanding, or the lock is released twice). Every
+    /// real caller also took the lock with interrupts already disabled
+    /// (a `SYSCALL`/interrupt entry, which every IDT gate here uses —
+    /// see `idt::init`) and never re-enables them before calling this, so
+    /// unlike `SpinLockGuard::drop`, this never needs to restore them.
+    pub unsafe fn force_unlock(&self) {
+        unsafe { self.inner.force_unlock() };
+    }
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {

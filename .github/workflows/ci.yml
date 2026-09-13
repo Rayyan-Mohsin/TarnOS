@@ -104,3 +104,15 @@ jobs:
 
       - name: xtask test-smp-regression (fault isolation + blocking IPC unaffected by other cores)
         run: cargo run -p xtask -- test-smp-regression
+
+      - name: xtask test-smp-sched-concurrency (two real processes genuinely run on two cores)
+        run: cargo run -p xtask -- test-smp-sched-concurrency
+
+      - name: xtask test-smp-wait-cross-core (SYS_WAIT's block/wake/report works across cores)
+        run: cargo run -p xtask -- test-smp-wait-cross-core
+
+      - name: xtask test-smp-kill-cross-core (SYS_KILL evicts a process running on another core)
+        run: cargo run -p xtask -- test-smp-kill-cross-core
+
+      - name: xtask test-smp-sched-stress (rapid cross-core spawn+kill cycles, no lost wakeups)
+        run: cargo run -p xtask -- test-smp-sched-stress

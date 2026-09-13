@@ -37,6 +37,10 @@ fn main() {
         "test-smp-degraded" => test_smp_degraded(),
         "test-smp-ipi" => test_smp_ipi(),
         "test-smp-regression" => test_smp_regression(),
+        "test-smp-sched-concurrency" => test_smp_sched_concurrency(),
+        "test-smp-wait-cross-core" => test_smp_wait_cross_core(),
+        "test-smp-kill-cross-core" => test_smp_kill_cross_core(),
+        "test-smp-sched-stress" => test_smp_sched_stress(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
@@ -52,7 +56,11 @@ fn main() {
             .and_then(|_| test_smp_boot())
             .and_then(|_| test_smp_degraded())
             .and_then(|_| test_smp_ipi())
-            .and_then(|_| test_smp_regression()),
+            .and_then(|_| test_smp_regression())
+            .and_then(|_| test_smp_sched_concurrency())
+            .and_then(|_| test_smp_wait_cross_core())
+            .and_then(|_| test_smp_kill_cross_core())
+            .and_then(|_| test_smp_sched_stress()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -110,12 +118,22 @@ fn print_usage() {
          \x20                    nothing else, and a send to a nonexistent target is safe\n\
          \x20 test-smp-regression   Confirm fault isolation and blocking IPC still behave\n\
          \x20                    identically with other cores booted and idling (-smp 4)\n\
+         \x20 test-smp-sched-concurrency  Confirm two real processes genuinely run\n\
+         \x20                    concurrently on two different cores (-smp 4)\n\
+         \x20 test-smp-wait-cross-core    Confirm SYS_WAIT's block-wake-and-report path\n\
+         \x20                    still works when the child runs on a different core (-smp 4)\n\
+         \x20 test-smp-kill-cross-core    Confirm SYS_KILL can evict a process genuinely\n\
+         \x20                    running on another core, and the machine stays healthy after\n\
+         \x20 test-smp-sched-stress       Stress-test rapid spawn+kill+wait cycles across\n\
+         \x20                    cores for the idle-park lost-wakeup hazard (-smp 4)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
          \x20                    test-wait-exit-code, test-kill-boundary, test-heap-growth,\n\
          \x20                    test-sbrk-boundary, test-smp-boot, test-smp-degraded,\n\
-         \x20                    test-smp-ipi, and test-smp-regression in sequence"
+         \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
+         \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core, and\n\
+         \x20                    test-smp-sched-stress in sequence"
     );
 }
 
@@ -1143,6 +1161,219 @@ fn test_smp_regression() -> Result<(), String> {
     println!(
         "xtask: test-smp-regression PASSED — fault isolation and blocking IPC behave \
          identically with other cores booted and idling nearby"
+    );
+    Ok(())
+}
+
+/// Milestone 7: builds the kernel with the `smp-sched-concurrency-test`
+/// feature and boots it with 4 virtual CPUs. Two dummy processes each
+/// free-spin on `SYS_YIELD`; the kernel itself polls every core's
+/// current-process atomic and logs the moment it finds both processes
+/// resident on two *different* cores at once — direct proof of genuine
+/// concurrent, cross-core execution for real processes (not merely
+/// "eventually scheduled somewhere," and not just the idle-loop
+/// free-spin counters `test-smp-boot` already proved for cores with
+/// nothing to run).
+fn test_smp_sched_concurrency() -> Result<(), String> {
+    let log = run_scenario(
+        &["smp-sched-concurrency-test"],
+        "smp-sched-concurrency-test.log",
+        15,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("CONCURRENCY_FAIL") {
+        return Err(
+            "smp-sched-concurrency-test reported CONCURRENCY_FAIL -- never observed both test \
+             processes resident on two different cores at the same instant"
+                .to_string(),
+        );
+    }
+    if !log.contains("CONCURRENCY_OK") {
+        return Err(
+            "expected \"CONCURRENCY_OK\" -- the concurrency check never reported a result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("concurrent") {
+        return Err(
+            "expected a \"pid_a on core ..., pid_b on core ... -- concurrent\" line naming the \
+             two distinct cores"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both spinning processes to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-sched-concurrency PASSED — two real processes ran concurrently on two \
+         different cores, confirmed directly rather than assumed"
+    );
+    Ok(())
+}
+
+/// Milestone 7: re-runs `test-wait-exit-code`'s exact kernel build
+/// (`wait-exit-code-test`) at `-smp 4` instead of `-smp 1` — the parent
+/// `SYS_WAIT`s on `exit-code-child` before it has ever run, forcing a
+/// genuine block; with more than one core, the child is very likely to
+/// get picked up by a different, idle core than the one the parent
+/// blocked on, proving the block-wake-and-report path works correctly
+/// across cores, not just within one. Same pass criteria as the
+/// single-core version, plus a check that the switch log actually shows
+/// a process running on a non-BSP core at some point.
+fn test_smp_wait_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["wait-exit-code-test"],
+        "smp-wait-cross-core-test.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("WAIT_FAIL") {
+        return Err(
+            "wait-exit-code-test reported WAIT_FAIL under -smp 4 -- the cross-core wake-and-\
+             report path did not deliver the correct exit status"
+                .to_string(),
+        );
+    }
+    if !log.contains("WAIT_OK") {
+        return Err(
+            "expected \"WAIT_OK\" -- the wait-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the wait-test process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-wait-cross-core PASSED — SYS_WAIT correctly blocked, and the child's \
+         exit correctly woke and reported to its parent, under -smp 4"
+    );
+    Ok(())
+}
+
+/// Milestone 7, the direct adversarial test for cross-core `SYS_KILL`:
+/// builds the kernel with the `kill-cross-core-test` feature and boots
+/// it with 4 virtual CPUs. A dummy process free-spins on `SYS_YIELD`
+/// forever as the child of a second dummy process that yields a few
+/// times (letting the first one actually start running, most likely on
+/// a different, idle core) and then `SYS_KILL`s it — exercising
+/// `task::scheduler::terminate_process`'s cross-core eviction protocol
+/// (a targeted IPI plus a bounded wait for the owning core to confirm)
+/// rather than the same-core immediate-finalize path every earlier
+/// milestone's kill tests already covered. Immediately afterward the
+/// killer spawns, starts, and waits on one more completely ordinary
+/// child — the direct adversarial check for the idle-core stale-CR3
+/// fix (see `docs/adr/0010-cross-core-scheduling.md`): a missing or
+/// broken fix would surface as a spurious kernel-mode page fault right
+/// here, quite possibly on the very core that was just evicted.
+fn test_smp_kill_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["kill-cross-core-test"],
+        "smp-kill-cross-core-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a missing idle-core stale-CR3 fix would surface as a \
+             spurious page fault right after the cross-core kill"
+                .to_string(),
+        );
+    }
+    if log.contains("KILL_CC_FAIL") {
+        return Err(
+            "kill-cross-core-test reported KILL_CC_FAIL -- either the cross-core kill itself \
+             failed, or the machine was not fully healthy afterward"
+                .to_string(),
+        );
+    }
+    if !log.contains("KILL_CC_OK") {
+        return Err(
+            "expected \"KILL_CC_OK\" -- the kill-cross-core-test process never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the killer process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-kill-cross-core PASSED — SYS_KILL correctly evicted a process \
+         genuinely running on another core, and the machine stayed fully healthy afterward"
+    );
+    Ok(())
+}
+
+/// Milestone 7's own stress test for the lost-wakeup hazard named in
+/// `task::scheduler::park_until_woken`'s doc comment: re-runs
+/// `test-process-lifecycle`'s exact kernel build (48 rapid spawn+kill+
+/// wait cycles) at `-smp 4` instead of `-smp 1`. With more than one
+/// core, every one of those cycles is a chance for a core to park via
+/// the interrupt-driven idle wait and need a wake-up IPI to notice new
+/// work — a bug in that path would show up here as a hang (caught by
+/// `run_scenario`'s own bounded timeout) long before it would in the
+/// single-core version, which never actually exercises the idle-park
+/// path at all. Same pass criteria as the single-core version.
+fn test_smp_sched_stress() -> Result<(), String> {
+    let log = run_scenario(
+        &["process-lifecycle-test"],
+        "smp-sched-stress-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("LIFECYCLE_FAIL") {
+        return Err(
+            "process-lifecycle-test reported LIFECYCLE_FAIL under -smp 4 -- a rapid spawn+kill \
+             cycle failed under real cross-core scheduling pressure"
+                .to_string(),
+        );
+    }
+    if !log.contains("LIFECYCLE_OK") {
+        return Err(
+            "expected \"LIFECYCLE_OK\" -- the lifecycle-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    match extract_free_frame_counts(&log).as_slice() {
+        [before, after] if before == after => {}
+        [before, after] => {
+            return Err(format!(
+                "expected the free physical frame count to return to its starting value after \
+                 48 rapid spawn+kill cycles under -smp 4, but it went from {before} to {after} \
+                 -- AddressSpace teardown is leaking physical memory"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "expected exactly two \"free_frames=\" log lines (before and after) under \
+                 -smp 4, found {}",
+                other.len()
+            ));
+        }
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the lifecycle-test process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-sched-stress PASSED — 48 rapid spawn+kill+wait cycles completed under \
+         -smp 4 with no hang and no leaked physical memory"
     );
     Ok(())
 }

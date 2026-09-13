@@ -433,26 +433,20 @@ fn sys_process_start(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// state) terminates, then returns its exit status —
 /// `rdi`=kind (`0`=`Exited`, `1`=`Faulted`, `2`=`Killed`), `rsi`=code
 /// (`Exited` only). Non-blocking if `target_pid` already terminated
-/// before this call. See [`scheduler::wait_for_child`].
+/// before this call. See [`scheduler::wait_for_child`], which performs
+/// the "already done, or must block" decision and the blocking
+/// transition itself as a single atomic step -- unlike every other
+/// blocking syscall here, this can't be split into a separate check and
+/// a separate `scheduler::block_current_process` call (see that
+/// function's doc comment for why).
 fn sys_wait(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
     let target_pid = Pid(regs.rdi);
 
-    let outcome = scheduler::with_current_process(|p| p.pid)
-        .ok_or(SyscallError::InvalidTarget)
-        .and_then(|caller_pid| scheduler::wait_for_child(target_pid, caller_pid));
-
-    match outcome {
-        Ok(Some(status)) => {
-            let (kind, code) = status.to_regs();
-            regs.rax = 0;
-            regs.rdi = kind;
-            regs.rsi = code;
-            frame
-        }
-        Ok(None) => scheduler::block_current_process(frame),
-        Err(e) => {
-            regs.rax = e.as_retval() as u64;
+    match scheduler::with_current_process(|p| p.pid) {
+        Some(caller_pid) => scheduler::wait_for_child(frame, target_pid, caller_pid),
+        None => {
+            regs.rax = SyscallError::InvalidTarget.as_retval() as u64;
             frame
         }
     }
