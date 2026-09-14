@@ -21,6 +21,7 @@ mod milestone3_tests;
 mod milestone4_tests;
 mod milestone5_tests;
 mod milestone7_tests;
+mod milestone8_tests;
 mod sync;
 mod task;
 
@@ -830,6 +831,190 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(killer_process).expect("spawn failed");
 
         earlyprintln!("[boot] kill-cross-core-test: spawned target + killer processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 8: spawns a receiver process that immediately `SYS_RECV`s
+    // on a fresh endpoint (blocking, since nothing has been sent yet)
+    // and a sender process that immediately `SYS_SEND`s the same
+    // message -- spawned in that order specifically so the receiver is
+    // very likely already blocked on a *different*, previously-idle
+    // core by the time the sender delivers, forcing the exact
+    // `Process::pending_wake` race window (see `docs/adr/0011`). Never
+    // enabled for a normal build.
+    #[cfg(feature = "smp-send-cross-core-test")]
+    {
+        let test_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let receiver_pid = task::scheduler::allocate_pid();
+        let mut receiver_process = task::process::Process::new_dummy(
+            receiver_pid,
+            milestone8_tests::send_cc_receiver_process,
+            None,
+        )
+        .expect("failed to create the send-cross-core-test receiver process");
+        receiver_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        receiver_process.cap_table.insert(
+            tarnos_abi::CapIndex(1),
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(test_endpoint.clone()),
+                rights: ipc::Rights::RECV,
+            },
+        );
+        task::scheduler::spawn(receiver_process).expect("spawn failed");
+
+        let sender_pid = task::scheduler::allocate_pid();
+        let mut sender_process = task::process::Process::new_dummy(
+            sender_pid,
+            milestone8_tests::send_cc_sender_process,
+            None,
+        )
+        .expect("failed to create the send-cross-core-test sender process");
+        sender_process.cap_table.insert(
+            tarnos_abi::CapIndex(1),
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(test_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(sender_process).expect("spawn failed");
+
+        earlyprintln!("[boot] smp-send-cross-core-test: spawned receiver + sender processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 8: spawns a dummy process that busy-loops forever
+    // *without ever making a single syscall* -- the only thing that can
+    // ever preempt it is the new per-core LAPIC timer. Polls every
+    // core's current-process atomic to find out empirically which core
+    // it landed on, then keeps watching that exact core for direct
+    // evidence it gets preempted there -- the same "confirm, don't
+    // assume" methodology `smp-sched-concurrency-test` above already
+    // uses. Afterward spawns an ordinary process (confirming it still
+    // gets to run and exit cleanly) and a killer process that `SYS_KILL`s
+    // the busy one -- the direct adversarial test that cross-core
+    // eviction still works when the target was forcibly, not
+    // cooperatively, scheduled the whole time. Never enabled for a
+    // normal build.
+    #[cfg(feature = "forced-preempt-test")]
+    {
+        // Spawned first, so it's very likely picked up by an idle AP
+        // before this boot code (still running on the BSP) ever reaches
+        // `task::scheduler::start()` itself -- see
+        // `milestone7_tests::kill_cc_killer_process`'s doc comment for
+        // the same reasoning.
+        let busy_pid = task::scheduler::allocate_pid();
+        let busy_process = task::process::Process::new_dummy(
+            busy_pid,
+            milestone8_tests::forced_preempt_busy_process,
+            None,
+        )
+        .expect("failed to create the forced-preempt-test busy process");
+        task::scheduler::spawn(busy_process).expect("spawn failed");
+
+        let mut busy_core = None;
+        for _ in 0..200 {
+            let start = arch::x86_64::interrupts::ticks();
+            while arch::x86_64::interrupts::ticks() < start + 1 {
+                x86_64::instructions::hlt();
+            }
+            for core in 0..arch::x86_64::percpu::MAX_CORES {
+                if arch::x86_64::percpu::slot(core)
+                    .current
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    == busy_pid.0
+                {
+                    busy_core = Some(core);
+                    break;
+                }
+            }
+            if busy_core.is_some() {
+                break;
+            }
+        }
+        let busy_core = busy_core.expect("forced-preempt-test busy process never started running");
+
+        // Not "does `current` ever change" -- with nothing else ever
+        // ready on this core, a preempted busy process is immediately
+        // redispatched right back to itself, so `current` never actually
+        // changes value even though real preemption keeps happening.
+        // `preempt_count` is bumped unconditionally on every preemption
+        // regardless of what gets dispatched next, so it's the one
+        // signal that can't hide that case.
+        let mut saw_preemption = false;
+        for _ in 0..400 {
+            let start = arch::x86_64::interrupts::ticks();
+            while arch::x86_64::interrupts::ticks() < start + 1 {
+                x86_64::instructions::hlt();
+            }
+            let preempt_count = arch::x86_64::percpu::slot(busy_core)
+                .preempt_count
+                .load(core::sync::atomic::Ordering::Acquire);
+            if preempt_count > 0 {
+                saw_preemption = true;
+                break;
+            }
+        }
+        earlyprintln!(
+            "[forced-preempt-test] busy process ran on core {busy_core}, {}",
+            if saw_preemption { "PREEMPTION_OK" } else { "PREEMPTION_FAIL" }
+        );
+
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let ordinary_pid = task::scheduler::allocate_pid();
+        let mut ordinary_process = task::process::Process::new_dummy(
+            ordinary_pid,
+            milestone8_tests::forced_preempt_ordinary_process,
+            None,
+        )
+        .expect("failed to create the forced-preempt-test ordinary process");
+        ordinary_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint.clone()),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(ordinary_process).expect("spawn failed");
+
+        // Allocated (and its parent fixed up) only after `busy_process`
+        // was actually spawned -- see `kill_cc_killer_process`'s doc
+        // comment on why `allocate_pid` must never be called a second
+        // time before the first allocation's own `spawn` lands.
+        let killer_pid = task::scheduler::allocate_pid();
+        task::scheduler::with_process(busy_pid, |p| p.parent = Some(killer_pid))
+            .expect("forced-preempt-test busy process vanished before its parent could be set");
+
+        let mut killer_process = task::process::Process::new_dummy(
+            killer_pid,
+            milestone8_tests::forced_preempt_killer_process,
+            None,
+        )
+        .expect("failed to create the forced-preempt-test killer process");
+        killer_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(killer_process).expect("spawn failed");
+
+        earlyprintln!("[boot] forced-preempt-test: spawned busy + ordinary + killer processes");
         task::scheduler::start();
     }
 

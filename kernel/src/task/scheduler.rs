@@ -284,6 +284,7 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
 
     if let Some(current_pid) = sched.current[core] {
+        percpu::slot(core).preempt_count.fetch_add(1, Ordering::Relaxed);
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.

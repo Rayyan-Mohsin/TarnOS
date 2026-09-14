@@ -108,6 +108,26 @@ smp-sched-concurrency-test = []
 # the direct adversarial check for the idle-core stale-CR3 fix. Exercised
 # by `cargo run -p xtask -- test-smp-kill-cross-core`.
 kill-cross-core-test = []
+# Spawns a receiver process that immediately blocks in SYS_RECV on a
+# fresh endpoint (nothing has been sent yet) and a sender process that
+# immediately SYS_SENDs the same message -- spawned in that order so the
+# receiver is very likely already blocked on a different, previously-
+# idle core by the time the sender delivers, forcing the exact
+# Process::pending_wake race window the SYS_SEND/SYS_RECV cross-core fix
+# closes (see docs/adr/0011). Exercised by
+# `cargo run -p xtask -- test-smp-send-cross-core`.
+smp-send-cross-core-test = []
+# Spawns a dummy ring-3 process that busy-loops forever making *zero*
+# syscalls -- unlike kill-cross-core-test's target, nothing here ever
+# traps into the kernel on its own, so only the new per-core LAPIC timer
+# can ever preempt it. Confirms (by directly polling which core it
+# landed on, then watching that core) it actually gets preempted there,
+# that an ordinary process still gets to run and exit cleanly alongside
+# it, and that SYS_KILL's cross-core eviction protocol still works
+# against a target that was forcibly, not cooperatively, scheduled the
+# whole time. Exercised by
+# `cargo run -p xtask -- test-smp-forced-preempt`.
+forced-preempt-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

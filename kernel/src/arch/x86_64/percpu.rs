@@ -58,6 +58,16 @@ pub struct PerCpuSlot {
     /// targeted `RESCHEDULE_VECTOR` IPI to every core it finds set,
     /// waking it out of `hlt` (see `task::scheduler::notify_idle_cores`).
     pub idle: AtomicBool,
+    /// Bumped by `task::scheduler::on_timer_tick` every time this core's
+    /// own periodic LAPIC timer preempts whatever process was running —
+    /// unconditionally, even when the very same process immediately gets
+    /// redispatched right back to itself (the only other process ready
+    /// to run being none), which is otherwise invisible from the
+    /// outside: `current` never changes value in that case, so it can't
+    /// serve as evidence preemption actually happened. Direct, empirical
+    /// proof for `xtask test-smp-forced-preempt`, the same "confirm,
+    /// don't assume" discipline `spin_count` already exists for.
+    pub preempt_count: AtomicU64,
 }
 
 impl PerCpuSlot {
@@ -70,6 +80,7 @@ impl PerCpuSlot {
             current: AtomicU64::new(0),
             evict_request: AtomicU64::new(0),
             idle: AtomicBool::new(false),
+            preempt_count: AtomicU64::new(0),
         }
     }
 

@@ -41,6 +41,8 @@ fn main() {
         "test-smp-wait-cross-core" => test_smp_wait_cross_core(),
         "test-smp-kill-cross-core" => test_smp_kill_cross_core(),
         "test-smp-sched-stress" => test_smp_sched_stress(),
+        "test-smp-send-cross-core" => test_smp_send_cross_core(),
+        "test-smp-forced-preempt" => test_smp_forced_preempt(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
@@ -60,7 +62,9 @@ fn main() {
             .and_then(|_| test_smp_sched_concurrency())
             .and_then(|_| test_smp_wait_cross_core())
             .and_then(|_| test_smp_kill_cross_core())
-            .and_then(|_| test_smp_sched_stress()),
+            .and_then(|_| test_smp_sched_stress())
+            .and_then(|_| test_smp_send_cross_core())
+            .and_then(|_| test_smp_forced_preempt()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -126,14 +130,20 @@ fn print_usage() {
          \x20                    running on another core, and the machine stays healthy after\n\
          \x20 test-smp-sched-stress       Stress-test rapid spawn+kill+wait cycles across\n\
          \x20                    cores for the idle-park lost-wakeup hazard (-smp 4)\n\
+         \x20 test-smp-send-cross-core    Confirm a cross-core SYS_SEND correctly wakes a\n\
+         \x20                    receiver blocked in SYS_RECV on a different core (-smp 4)\n\
+         \x20 test-smp-forced-preempt     Confirm a process making zero syscalls is still\n\
+         \x20                    preempted by its own core's LAPIC timer, an ordinary process\n\
+         \x20                    still runs alongside it, and SYS_KILL still evicts it (-smp 4)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
          \x20                    test-wait-exit-code, test-kill-boundary, test-heap-growth,\n\
          \x20                    test-sbrk-boundary, test-smp-boot, test-smp-degraded,\n\
          \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
-         \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core, and\n\
-         \x20                    test-smp-sched-stress in sequence"
+         \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
+         \x20                    test-smp-sched-stress, test-smp-send-cross-core, and\n\
+         \x20                    test-smp-forced-preempt in sequence"
     );
 }
 
@@ -1311,6 +1321,120 @@ fn test_smp_kill_cross_core() -> Result<(), String> {
     println!(
         "xtask: test-smp-kill-cross-core PASSED — SYS_KILL correctly evicted a process \
          genuinely running on another core, and the machine stayed fully healthy afterward"
+    );
+    Ok(())
+}
+
+/// Milestone 8's direct adversarial test for the cross-core SYS_SEND/
+/// SYS_RECV race `Process::pending_wake` closes (see docs/adr/0011):
+/// builds the kernel with the `smp-send-cross-core-test` feature and
+/// boots it with 4 virtual CPUs. A receiver process blocks in SYS_RECV
+/// before anything has been sent; a sender process, spawned right after
+/// it and very likely landing on a different, previously-idle core,
+/// immediately SYS_SENDs the same message -- forcing the exact race
+/// window between registering as a waiter and actually reaching
+/// `block_current_process` that a single-core version of this test
+/// could never reach at all.
+fn test_smp_send_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["smp-send-cross-core-test"],
+        "smp-send-cross-core-test.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("SEND_CC_FAIL") {
+        return Err(
+            "smp-send-cross-core-test reported SEND_CC_FAIL -- the delivered message did not \
+             match what the sender actually sent"
+                .to_string(),
+        );
+    }
+    if !log.contains("SEND_CC_OK") {
+        return Err(
+            "expected \"SEND_CC_OK\" -- the send-cross-core-test receiver never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-smp-send-cross-core PASSED — a cross-core SYS_SEND correctly woke a \
+         receiver blocked in SYS_RECV on a different core, with the correct message delivered"
+    );
+    Ok(())
+}
+
+/// Milestone 8's direct adversarial test for per-core forced preemption:
+/// builds the kernel with the `forced-preempt-test` feature and boots it
+/// with 4 virtual CPUs. A dummy process busy-loops forever making *zero*
+/// syscalls -- only the new per-core LAPIC timer can ever preempt it.
+/// Boot code polls to find out empirically which core it landed on, then
+/// confirms it actually gets preempted there (`PREEMPTION_OK`), that an
+/// ordinary process still gets to run and exit cleanly alongside it
+/// (`PREEMPT_ORD_OK`), and that SYS_KILL's cross-core eviction protocol
+/// still works against a target that was forcibly, not cooperatively,
+/// scheduled the whole time (`FRC_PRE_OK`).
+fn test_smp_forced_preempt() -> Result<(), String> {
+    let log = run_scenario(
+        &["forced-preempt-test"],
+        "forced-preempt-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("PREEMPTION_FAIL") {
+        return Err(
+            "forced-preempt-test reported PREEMPTION_FAIL -- the never-syscalling busy process \
+             never got preempted on its own core"
+                .to_string(),
+        );
+    }
+    if !log.contains("PREEMPTION_OK") {
+        return Err(
+            "expected \"PREEMPTION_OK\" -- the forced-preempt-test busy process never started \
+             running at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("PREEMPT_ORD_OK") {
+        return Err(
+            "expected \"PREEMPT_ORD_OK\" -- the ordinary process never got to run and exit \
+             alongside the never-yielding busy process"
+                .to_string(),
+        );
+    }
+    if log.contains("FRC_PRE_FAIL") {
+        return Err(
+            "forced-preempt-test reported FRC_PRE_FAIL -- either SYS_KILL failed against the \
+             forcibly-scheduled busy process, or the machine was not fully healthy afterward"
+                .to_string(),
+        );
+    }
+    if !log.contains("FRC_PRE_OK") {
+        return Err(
+            "expected \"FRC_PRE_OK\" -- the forced-preempt-test killer process never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-smp-forced-preempt PASSED — a never-syscalling process was genuinely \
+         preempted by its own core's LAPIC timer, an ordinary process still ran alongside it, \
+         and SYS_KILL still evicted it despite it never cooperating"
     );
     Ok(())
 }
