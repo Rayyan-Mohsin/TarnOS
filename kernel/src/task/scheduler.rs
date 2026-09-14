@@ -1057,23 +1057,50 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
         // Mirrors `smp::bring_up_aps`'s own bounded-timeout wait pattern:
         // logged and finite, never a true infinite spin, even though in
         // practice the target core's IPI handler runs essentially
-        // immediately.
-        const TIMEOUT_SPINS: u64 = 100_000_000;
+        // immediately. Deliberately much smaller than the AP bring-up
+        // wait's own bound: with per-core forced preemption now in the
+        // picture, `target` migrating away mid-wait is an expected,
+        // ordinary occurrence (see this function's own doc comment), not
+        // a rare failure -- this loop is meant to give up on a *stale*
+        // wait quickly and let the outer loop re-scan and re-target,
+        // not to burn a large fraction of a whole test scenario's wall
+        //-clock budget spinning under slow TCG emulation on one attempt
+        // that's already stale.
+        const TIMEOUT_SPINS: u64 = 2_000_000;
         let mut spins = 0u64;
+        let mut timed_out = false;
         while percpu::slot(core).current.load(Ordering::Acquire) == target.0 {
             core::hint::spin_loop();
             spins += 1;
             if spins > TIMEOUT_SPINS {
-                crate::earlyprintln!(
-                    "[sched] core {core} did not evict pid {} in time -- proceeding anyway",
-                    target.index()
-                );
+                timed_out = true;
                 break;
             }
         }
-        // Loop back around and re-scan rather than assume this means
-        // `target` is now safe to finalize -- see this function's doc
-        // comment for why it might instead have simply migrated.
+        if timed_out {
+            // Clear this core's own eviction request before moving on --
+            // otherwise a *late* reschedule IPI for this exact request,
+            // arriving after this function has already moved on to a
+            // different core (or a different target migrated here since,
+            // if this same core is later asked to evict someone else),
+            // could be misread by `on_reschedule_ipi` as still relevant.
+            // `evict_request` only ever names *one* outstanding request
+            // per core, so clearing it here is always safe: either it
+            // still names `target` (nothing consumed it -- the IPI truly
+            // never arrived in time) or it was already zeroed by a
+            // legitimate `on_reschedule_ipi` run that arrived just after
+            // this loop gave up, in which case this store is a harmless
+            // no-op racing a value that's already 0.
+            percpu::slot(core).evict_request.store(0, Ordering::Release);
+            crate::earlyprintln!(
+                "[sched] core {core} did not evict pid {} in time -- re-scanning",
+                target.index()
+            );
+        }
+        // Loop back around and re-scan rather than assume a completed
+        // wait means `target` is now safe to finalize -- see this
+        // function's doc comment for why it might instead have simply
+        // migrated.
     }
 }
 
