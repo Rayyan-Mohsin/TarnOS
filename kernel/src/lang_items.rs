@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// A per-core panic reentrancy guard. Without this, a *second* fault
 /// landing on the same core while this handler is still mid-print
-/// (still holding `earlycon::EARLYCON_LOCK` on its own call stack)
+/// (still holding `earlycon::COM1_TX_LOCK` on its own call stack)
 /// re-enters this same function, whose own first `earlyprintln!()` then
 /// deadlocks trying to re-lock a `spin::Mutex`-backed lock this exact
 /// core already holds -- turning what should be a diagnosable panic

@@ -13,12 +13,26 @@
 //! message and its trailing `"\r\n"` (one lock/unlock, not two separate
 //! ones), so a full line from one core is never split by another core's
 //! output landing in the middle of it.
+//!
+//! [`COM1_TX_LOCK`] is `pub(crate)`, not private to this module: this bare
+//! poke and `driver::uart::Uart16550`'s real, LSR-checked writes both
+//! target the exact same physical transmit register (0x3F8) but started
+//! out under two entirely separate locks, each correctly serializing
+//! writers *within* its own path while doing nothing to stop the two
+//! paths from interleaving with *each other*. A real, reproduced bug
+//! (`xtask test-smp-forced-preempt`, intermittently: a boot-time
+//! `earlyprintln!` call on the BSP racing a process's own IPC message
+//! being relayed through `console_server` -> `driver::uart::write_bytes`
+//! on a different core, producing a visibly garbled log line) — see
+//! `docs/adr/0011`. `driver::uart` locks this same shared lock around its
+//! own transmit calls now, so every writer to the physical wire is
+//! mutually exclusive regardless of which logical driver initiated it.
 use core::arch::asm;
 use core::fmt::{self, Write};
 
 use crate::sync::SpinLock;
 
-static EARLYCON_LOCK: SpinLock<()> = SpinLock::new(());
+pub(crate) static COM1_TX_LOCK: SpinLock<()> = SpinLock::new(());
 
 pub struct EarlyCon;
 
@@ -40,7 +54,7 @@ impl Write for EarlyCon {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let _guard = EARLYCON_LOCK.lock();
+    let _guard = COM1_TX_LOCK.lock();
     let _ = EarlyCon.write_fmt(args);
 }
 
@@ -48,7 +62,7 @@ pub fn _print(args: fmt::Arguments) {
 /// guard as the message itself — see this module's doc comment.
 #[doc(hidden)]
 pub fn _println(args: fmt::Arguments) {
-    let _guard = EARLYCON_LOCK.lock();
+    let _guard = COM1_TX_LOCK.lock();
     let _ = EarlyCon.write_fmt(args);
     let _ = EarlyCon.write_str("\r\n");
 }

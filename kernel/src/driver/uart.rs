@@ -7,13 +7,13 @@
 //! though QEMU's emulation tolerates skipping it.
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use x86_64::instructions::port::Port;
 
 use super::{CharDevice, Driver, InterruptHandler};
 use crate::arch::x86_64::interrupts;
-use crate::earlyprintln;
 use crate::sync::SpinLock;
 
 const COM1_BASE: u16 = 0x3F8;
@@ -34,6 +34,11 @@ const LSR_THR_EMPTY: u8 = 0x20;
 /// for a debug console; QEMU ignores it entirely but real hardware and
 /// serial-over-USB adapters do not.
 const BAUD_DIVISOR: u16 = 3;
+
+/// Counts bytes discarded by `Uart16550::try_read_byte` due to a set LSR
+/// overrun/parity/framing bit — see that function's doc comment for why
+/// this is a lock-free counter rather than an `earlyprintln!` call.
+static UART_LSR_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub struct Uart16550 {
     data: Port<u8>,
@@ -111,7 +116,17 @@ impl CharDevice for Uart16550 {
             // were valid.
             let byte = unsafe { self.data.read() };
             if status & LSR_ERROR_BITS != 0 {
-                earlyprintln!("[uart] LSR error bits {:#04x}, discarding byte", status & LSR_ERROR_BITS);
+                // A lock-free counter, not `earlyprintln!`, deliberately:
+                // this runs with `COM1`'s own lock already held (every
+                // caller reaches here via `COM1.lock().try_read_byte()`),
+                // and `earlyprintln!` would need to acquire
+                // `earlycon::COM1_TX_LOCK` — the opposite order from
+                // `write_bytes`/`write_line` below, which take
+                // `COM1_TX_LOCK` first and `COM1` second. Logging here
+                // would be a same-core self-deadlock risk (this exact
+                // core re-entering a non-reentrant lock) at best and a
+                // cross-core AB-BA lock-ordering inversion at worst.
+                UART_LSR_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             return Some(byte);
@@ -152,12 +167,35 @@ pub fn init() {
     interrupts::unmask_irq4();
 }
 
+/// Holds the shared `earlycon::COM1_TX_LOCK` for the whole call, not just
+/// `COM1`'s own lock — see that lock's doc comment for why: without it,
+/// this write can interleave byte-by-byte with a concurrent
+/// `earlyprintln!` call on another core, since the two used to be
+/// protected by entirely separate locks despite targeting the exact same
+/// physical transmit register.
 pub fn write_bytes(bytes: &[u8]) {
+    let _tx_guard = crate::earlycon::COM1_TX_LOCK.lock();
     COM1.lock().write_bytes(bytes);
 }
 
+/// See [`write_bytes`]'s doc comment.
 pub fn write_byte(byte: u8) {
+    let _tx_guard = crate::earlycon::COM1_TX_LOCK.lock();
     COM1.lock().write_byte(byte);
+}
+
+/// Like [`write_bytes`], but holds the shared transmit lock across both
+/// `text` and the trailing `"\r\n"` — one lock acquisition, not two —
+/// mirroring `earlycon::_println`'s own "one line is never split by
+/// another writer landing in the middle of it" discipline. Used by
+/// [`console_server`], whose two separate `write_bytes` calls (one for
+/// the message, one for the newline) previously left exactly that gap
+/// open for a differently-timed concurrent write to land inside.
+fn write_line(text: &[u8]) {
+    let _tx_guard = crate::earlycon::COM1_TX_LOCK.lock();
+    let mut com1 = COM1.lock();
+    com1.write_bytes(text);
+    com1.write_bytes(b"\r\n");
 }
 
 /// Resolves to the next received byte, exercising the full
@@ -207,7 +245,6 @@ pub async fn console_server(endpoint: alloc::sync::Arc<crate::ipc::Endpoint>) {
         let message = endpoint.recv().await;
         let mut buf = [0u8; tarnos_abi::MESSAGE_INLINE_WORDS * 8];
         let text = message.as_str_lossy(&mut buf);
-        write_bytes(text.as_bytes());
-        write_bytes(b"\r\n");
+        write_line(text.as_bytes());
     }
 }
