@@ -116,3 +116,9 @@ jobs:
 
       - name: xtask test-smp-sched-stress (rapid cross-core spawn+kill cycles, no lost wakeups)
         run: cargo run -p xtask -- test-smp-sched-stress
+
+      - name: xtask test-smp-send-cross-core (SYS_SEND wakes a cross-core blocked SYS_RECV)
+        run: cargo run -p xtask -- test-smp-send-cross-core
+
+      - name: xtask test-smp-forced-preempt (a zero-syscall process is still preempted per-core)
+        run: cargo run -p xtask -- test-smp-forced-preempt
