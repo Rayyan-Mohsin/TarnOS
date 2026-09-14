@@ -28,45 +28,6 @@ use crate::sync::SpinLock;
 use super::process::{Process, ProcessState};
 use super::Pid;
 
-// TEMPORARY debugging aid for the intermittent `test-smp-kill-cross-core`
-// corruption under the new per-core LAPIC timer -- records a small,
-// lock-free trail of scheduler events so a panic can dump what actually
-// happened leading up to it, the same technique milestone 7 used to find
-// its own two cross-core races. To be removed once this is fixed.
-mod flight_recorder {
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    const CAP: usize = 96;
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    static LOG: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
-
-    pub fn record(tag: u8, core: u8, a: u32, b: u32) {
-        let idx = SEQ.fetch_add(1, Ordering::Relaxed);
-        let packed = ((tag as u64) << 56)
-            | ((core as u64) << 48)
-            | (((a & 0xFF_FFFF) as u64) << 24)
-            | ((b & 0xFF_FFFF) as u64);
-        LOG[idx % CAP].store(packed, Ordering::Relaxed);
-    }
-
-    pub fn dump() {
-        let end = SEQ.load(Ordering::Relaxed);
-        let start = end.saturating_sub(CAP);
-        crate::earlyprintln!("[flight] dumping entries {}..{}", start, end);
-        for i in start..end {
-            let packed = LOG[i % CAP].load(Ordering::Relaxed);
-            let tag = (packed >> 56) as u8;
-            let core = ((packed >> 48) & 0xFF) as u8;
-            let a = ((packed >> 24) & 0xFF_FFFF) as u32;
-            let b = (packed & 0xFF_FFFF) as u32;
-            crate::earlyprintln!("[flight] #{} tag={} core={} a={} b={}", i, tag, core, a, b);
-        }
-    }
-}
-
-pub fn dump_flight_recorder() {
-    flight_recorder::dump();
-}
-
 /// Also the bound on how many processes can simultaneously be queued as
 /// waiters on a single `ipc::Endpoint` (see `ipc::endpoint`'s `Slot`) —
 /// there can never be more blocked senders or receivers on one endpoint
@@ -261,7 +222,6 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// reading them here avoids the caller needing to re-lock `SCHEDULER`
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
-    flight_recorder::record(10, percpu::core_index() as u8, pid.index() as u32, pid.generation());
     set_current(sched, percpu::core_index(), Some(pid));
     let process = match &mut sched.processes[pid.index()] {
         Slot::Occupied(process) => process,
@@ -324,7 +284,6 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
 
     if let Some(current_pid) = sched.current[core] {
-        flight_recorder::record(7, core as u8, current_pid.index() as u32, current_pid.generation());
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
@@ -336,7 +295,6 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 
     let result_frame = match sched.ready.pop() {
         Some(next_pid) => {
-            flight_recorder::record(8, core as u8, next_pid.index() as u32, next_pid.generation());
             let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
             drop(sched);
             maybe_print_switch(next_pid, rax, rbx);
@@ -808,12 +766,10 @@ fn take_and_finalize_slot(
     let process = match core::mem::replace(&mut sched.processes[index], Slot::Empty) {
         Slot::Occupied(process) => process,
         other => {
-            flight_recorder::record(11, 0xFF, pid.index() as u32, pid.generation());
             sched.processes[index] = other;
             return;
         }
     };
-    flight_recorder::record(9, 0xFF, pid.index() as u32, pid.generation());
 
     remove_from_ready_queue(sched, pid);
     // Normally at most one core's `current` can ever name `pid` (a process
@@ -1032,12 +988,6 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
                 }
             }
         };
-        flight_recorder::record(
-            1,
-            owning_core.map_or(0xFF, |c| c as u8),
-            target.index() as u32,
-            target.generation(),
-        );
         // Outside the lock, exactly like `terminate_slot`: frees every
         // finalized `AddressSpace`'s physical frames, a variable-length
         // operation this codebase's convention keeps off the lock's
@@ -1051,7 +1001,6 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
         percpu::slot(core)
             .evict_request
             .store(target.0, Ordering::Release);
-        flight_recorder::record(3, core as u8, target.index() as u32, target.generation());
         lapic::send_ipi(percpu::slot(core).lapic_id(), lapic::RESCHEDULE_VECTOR);
 
         // Mirrors `smp::bring_up_aps`'s own bounded-timeout wait pattern:
@@ -1122,13 +1071,10 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
     let mut sched = SCHEDULER.lock();
     let evict = percpu::slot(core).evict_request.swap(0, Ordering::AcqRel);
-    let current_index = sched.current[core].map_or(0xFF_FFFF, |p| p.index() as u32);
     if evict == 0 || sched.current[core].map(|p| p.0) != Some(evict) {
-        flight_recorder::record(5, core as u8, evict as u32, current_index);
         drop(sched);
         return current_frame;
     }
-    flight_recorder::record(6, core as u8, evict as u32, current_index);
     set_current(&mut sched, core, None);
     switch_to_next_or_halt(sched, "[sched] evicted core found nothing else ready, halting.")
 }
