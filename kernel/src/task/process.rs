@@ -13,7 +13,7 @@ use crate::ipc::CapTable;
 use crate::memory::phys::GlobalFrameAllocator;
 use crate::memory::virt::{self, AddressSpace};
 
-use super::scheduler::MAX_PROCESSES;
+use super::scheduler::{WakeResult, MAX_PROCESSES};
 use super::Pid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +125,24 @@ pub struct Process {
     /// is a single field, not a queue; see
     /// `task::scheduler::wait_for_child`/`take_and_finalize_slot`.
     pub wait_waiter: Option<Pid>,
+    /// A wake this process earned before it actually reached `Blocked`.
+    ///
+    /// `ipc::Endpoint::try_send`/`try_recv` register a waiting process
+    /// under their own `slot` lock and return, fully unlocked, before the
+    /// caller (`sys_send`/`sys_recv`) separately acquires `SCHEDULER` to
+    /// call `task::scheduler::block_current_process`. On more than one
+    /// core, a different core can complete the rendezvous and call
+    /// `task::scheduler::wake_blocked_process` inside that gap — while
+    /// this process is still `Running`, not yet `Blocked`. Applying the
+    /// wake immediately in that case would resume a process that hasn't
+    /// actually stopped executing. Instead `wake_blocked_process_locked`
+    /// stashes it here, and `block_current_process_locked` consumes and
+    /// applies it, under the very same `SCHEDULER` acquisition, the
+    /// instant it finishes transitioning this process to `Blocked` — the
+    /// same "at most one legitimate claimant" shape as `wait_waiter`
+    /// above, since a process can only ever be registered as a waiter on
+    /// one rendezvous at a time.
+    pub pending_wake: Option<WakeResult>,
     /// The current end of this process's heap — its `sys_sbrk` break.
     /// Starts at [`USER_HEAP_START`] (an empty heap) and only ever grows
     /// (see `arch::x86_64::syscall::sys_sbrk` — shrinking is not
@@ -180,6 +198,7 @@ impl Process {
             state: ProcessState::Ready,
             parent,
             wait_waiter: None,
+            pending_wake: None,
             heap_end: USER_HEAP_START,
         })
     }

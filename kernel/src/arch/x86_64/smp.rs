@@ -138,6 +138,12 @@ extern "C" fn ap_entry_on_own_stack(core_index: u64) -> ! {
         idt::load_ap();
         gdt::init_ap(core_index);
         lapic::init_this_core();
+        // The BSP already calibrated (see `arch::x86_64::init`) before
+        // any AP was ever started -- this just arms this core's own
+        // copy of the timer with that shared, already-computed reload
+        // value. Real preemption on this core (and every other AP) only
+        // exists from this point on.
+        lapic::arm_timer_this_core();
     }
     // Safe here (unlike at the equivalent point in `arch::x86_64::init`
     // for the BSP): this core's own percpu slot was already assigned by

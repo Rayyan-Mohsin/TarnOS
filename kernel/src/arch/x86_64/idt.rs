@@ -45,6 +45,12 @@ pub fn init() {
             // -- see `context_switch::reschedule_entry`'s doc comment.
             idt[super::lapic::RESCHEDULE_VECTOR]
                 .set_handler_addr(super::context_switch::reschedule_entry_addr());
+            // Same dual ring0/ring3-dispatching stub shape, for the same
+            // reason -- this core's own periodic preemption timer may
+            // need to redirect control to a different process than
+            // whatever was running when it fired.
+            idt[super::lapic::LAPIC_TIMER_VECTOR]
+                .set_handler_addr(super::context_switch::lapic_timer_entry_addr());
         }
         super::interrupts::register_handlers(&mut idt);
         super::lapic::register_handlers(&mut idt);

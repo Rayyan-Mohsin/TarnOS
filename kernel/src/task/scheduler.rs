@@ -28,6 +28,45 @@ use crate::sync::SpinLock;
 use super::process::{Process, ProcessState};
 use super::Pid;
 
+// TEMPORARY debugging aid for the intermittent `test-smp-kill-cross-core`
+// corruption under the new per-core LAPIC timer -- records a small,
+// lock-free trail of scheduler events so a panic can dump what actually
+// happened leading up to it, the same technique milestone 7 used to find
+// its own two cross-core races. To be removed once this is fixed.
+mod flight_recorder {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const CAP: usize = 96;
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    static LOG: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
+
+    pub fn record(tag: u8, core: u8, a: u32, b: u32) {
+        let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+        let packed = ((tag as u64) << 56)
+            | ((core as u64) << 48)
+            | (((a & 0xFF_FFFF) as u64) << 24)
+            | ((b & 0xFF_FFFF) as u64);
+        LOG[idx % CAP].store(packed, Ordering::Relaxed);
+    }
+
+    pub fn dump() {
+        let end = SEQ.load(Ordering::Relaxed);
+        let start = end.saturating_sub(CAP);
+        crate::earlyprintln!("[flight] dumping entries {}..{}", start, end);
+        for i in start..end {
+            let packed = LOG[i % CAP].load(Ordering::Relaxed);
+            let tag = (packed >> 56) as u8;
+            let core = ((packed >> 48) & 0xFF) as u8;
+            let a = ((packed >> 24) & 0xFF_FFFF) as u32;
+            let b = (packed & 0xFF_FFFF) as u32;
+            crate::earlyprintln!("[flight] #{} tag={} core={} a={} b={}", i, tag, core, a, b);
+        }
+    }
+}
+
+pub fn dump_flight_recorder() {
+    flight_recorder::dump();
+}
+
 /// Also the bound on how many processes can simultaneously be queued as
 /// waiters on a single `ipc::Endpoint` (see `ipc::endpoint`'s `Slot`) —
 /// there can never be more blocked senders or receivers on one endpoint
@@ -222,6 +261,7 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// reading them here avoids the caller needing to re-lock `SCHEDULER`
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
+    flight_recorder::record(10, percpu::core_index() as u8, pid.index() as u32, pid.generation());
     set_current(sched, percpu::core_index(), Some(pid));
     let process = match &mut sched.processes[pid.index()] {
         Slot::Occupied(process) => process,
@@ -284,6 +324,7 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
 
     if let Some(current_pid) = sched.current[core] {
+        flight_recorder::record(7, core as u8, current_pid.index() as u32, current_pid.generation());
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
@@ -295,6 +336,7 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 
     let result_frame = match sched.ready.pop() {
         Some(next_pid) => {
+            flight_recorder::record(8, core as u8, next_pid.index() as u32, next_pid.generation());
             let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
             drop(sched);
             maybe_print_switch(next_pid, rax, rbx);
@@ -766,10 +808,12 @@ fn take_and_finalize_slot(
     let process = match core::mem::replace(&mut sched.processes[index], Slot::Empty) {
         Slot::Occupied(process) => process,
         other => {
+            flight_recorder::record(11, 0xFF, pid.index() as u32, pid.generation());
             sched.processes[index] = other;
             return;
         }
     };
+    flight_recorder::record(9, 0xFF, pid.index() as u32, pid.generation());
 
     remove_from_ready_queue(sched, pid);
     // Normally at most one core's `current` can ever name `pid` (a process
@@ -923,14 +967,45 @@ pub fn on_syscall_exit(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 /// a targeted `RESCHEDULE_VECTOR` IPI, and bounded-spins on the
 /// lock-free `PerCpuSlot.current` mirror (never contending `SCHEDULER`
 /// while waiting) until that core's own IPI handler
-/// ([`on_reschedule_ipi`]) confirms the eviction by clearing it. Only
-/// then does this proceed to the same `terminate_slot` every path uses --
-/// by then, provably safe, since no core's CR3 can reference `target`'s
-/// `AddressSpace` anymore. This keeps `SYS_KILL`'s caller-visible
-/// contract identical to the single-core case: the target is
-/// unconditionally gone by the time this returns.
+/// ([`on_reschedule_ipi`]) confirms the eviction by clearing it.
+///
+/// That whole check-IPI-spin sequence runs in a loop, re-scanning from
+/// scratch every time, rather than once: since every core now runs a
+/// periodic preemption timer (see `arch::x86_64::lapic`'s
+/// `arm_timer_this_core`), `target` can be preempted by its *own* core's
+/// timer tick at any instant, pushed into the shared ready queue exactly
+/// like any other preempted process, and picked up by a completely
+/// different, third core before the IPI this function already sent even
+/// arrives. When that happens, the spin-wait above still observes
+/// `current` on the *original* core stop naming `target` (correctly --
+/// it did leave that core) and returns, but `target` is now genuinely
+/// running elsewhere, not evicted at all. A one-shot version of this
+/// function would then finalize (and free the `AddressSpace` of) a
+/// process another core's CR3 still actively names — a real,
+/// reproduced bug (`xtask test-smp-kill-cross-core`, intermittently
+/// after this milestone added per-core forced preemption, manifesting
+/// as a page fault or an outright hang): the exact "stale CR3" hazard
+/// this function's single-snapshot version already guarded against for
+/// an *idle* core, just reachable now via a *live* one instead. Looping
+/// closes it completely: this only ever proceeds to finalize once a scan
+/// finds `target` not `current` on any core at all, however many times
+/// it had to chase it across migrations to get there.
+///
+/// Crucially, that final "not running anywhere, safe to finalize" check
+/// and the actual finalize ([`take_and_finalize_slot`]) happen under the
+/// *same* `SCHEDULER` acquisition, not two separate ones -- an earlier
+/// version of this loop scanned, released the lock, and only then called
+/// [`terminate_slot`] (which re-locks separately), leaving a gap in
+/// which a *different* core's own scheduling (another `on_timer_tick`,
+/// or an idle core polling the ready queue) could pop `target` off the
+/// ready queue and dispatch it as `current` before this function's own
+/// second lock acquisition ran -- the exact same two-phase
+/// check-then-act shape `wait_for_child`'s doc comment and
+/// `docs/adr/0010`/`0011` already describe for other paths, just
+/// reappearing here. Folding the check and the finalize into one locked
+/// step closes it the same way those fixes do.
 pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
-    let owning_core = {
+    {
         let mut sched = SCHEDULER.lock();
         let Some(process) = occupied_mut(&mut sched, target) else {
             return Err(tarnos_abi::SyscallError::InvalidTarget);
@@ -938,13 +1013,45 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
         if process.parent != Some(caller) {
             return Err(tarnos_abi::SyscallError::InvalidTarget);
         }
-        (0..MAX_CORES).find(|&core| sched.current[core] == Some(target))
-    };
+    }
 
-    if let Some(core) = owning_core {
+    loop {
+        let mut pending_drops = Vec::new();
+        let owning_core = {
+            let mut sched = SCHEDULER.lock();
+            match (0..MAX_CORES).find(|&core| sched.current[core] == Some(target)) {
+                Some(core) => Some(core),
+                None => {
+                    // Not `current` anywhere at this exact locked instant
+                    // -- finalize right here, before releasing the lock,
+                    // so nothing can dispatch it onto a core in the gap a
+                    // second, separate acquisition would otherwise leave
+                    // open (see this function's doc comment).
+                    take_and_finalize_slot(&mut sched, target, ExitStatus::Killed, &mut pending_drops);
+                    None
+                }
+            }
+        };
+        flight_recorder::record(
+            1,
+            owning_core.map_or(0xFF, |c| c as u8),
+            target.index() as u32,
+            target.generation(),
+        );
+        // Outside the lock, exactly like `terminate_slot`: frees every
+        // finalized `AddressSpace`'s physical frames, a variable-length
+        // operation this codebase's convention keeps off the lock's
+        // critical path.
+        drop(pending_drops);
+
+        let Some(core) = owning_core else {
+            return Ok(());
+        };
+
         percpu::slot(core)
             .evict_request
             .store(target.0, Ordering::Release);
+        flight_recorder::record(3, core as u8, target.index() as u32, target.generation());
         lapic::send_ipi(percpu::slot(core).lapic_id(), lapic::RESCHEDULE_VECTOR);
 
         // Mirrors `smp::bring_up_aps`'s own bounded-timeout wait pattern:
@@ -964,10 +1071,10 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
                 break;
             }
         }
+        // Loop back around and re-scan rather than assume this means
+        // `target` is now safe to finalize -- see this function's doc
+        // comment for why it might instead have simply migrated.
     }
-
-    terminate_slot(target, ExitStatus::Killed);
-    Ok(())
 }
 
 /// The `RESCHEDULE_VECTOR` IPI handler's scheduler-side half (see
@@ -988,10 +1095,13 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
     let mut sched = SCHEDULER.lock();
     let evict = percpu::slot(core).evict_request.swap(0, Ordering::AcqRel);
+    let current_index = sched.current[core].map_or(0xFF_FFFF, |p| p.index() as u32);
     if evict == 0 || sched.current[core].map(|p| p.0) != Some(evict) {
+        flight_recorder::record(5, core as u8, evict as u32, current_index);
         drop(sched);
         return current_frame;
     }
+    flight_recorder::record(6, core as u8, evict as u32, current_index);
     set_current(&mut sched, core, None);
     switch_to_next_or_halt(sched, "[sched] evicted core found nothing else ready, halting.")
 }
@@ -1110,10 +1220,12 @@ pub enum WakeResult {
     WaitCompleted(ExitStatus),
 }
 
-fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) {
-    let Some(process) = occupied_mut(sched, pid) else {
-        return;
-    };
+/// Writes a blocked process's saved registers for whatever just
+/// completed its wait, and marks it `Ready`. Does not touch the ready
+/// queue or idle cores — callers do that themselves once this returns
+/// (both current callers need the process's own borrow to end first;
+/// see NLL).
+fn apply_wake_result(process: &mut Process, result: WakeResult) {
     match result {
         WakeResult::SendCompleted => {
             process.trap_frame.rax = 0;
@@ -1133,6 +1245,29 @@ fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) 
         }
     }
     process.state = ProcessState::Ready;
+}
+
+fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) {
+    let Some(process) = occupied_mut(sched, pid) else {
+        return;
+    };
+    // A `Waiter::Process(pid)` registered under `Endpoint::slot`'s lock
+    // (or a `wait_waiter` about to call `wait_for_child`) is not
+    // necessarily `Blocked` yet on more than one core: it may still be
+    // between registering as a waiter and reaching its own
+    // `block_current_process`/`wait_for_child` call, possibly on another
+    // core entirely. A legitimate wake can only ever find this process
+    // `Blocked` (the normal case) or still `Running` (this race window)
+    // — never anything else, since only one rendezvous can be pending at
+    // a time. Applying the wake now in the `Running` case would resume a
+    // process that hasn't actually stopped executing; stash it instead,
+    // for `block_current_process_locked` to apply the instant it
+    // finishes the transition to `Blocked` — see `Process::pending_wake`.
+    if process.state != ProcessState::Blocked {
+        process.pending_wake = Some(result);
+        return;
+    }
+    apply_wake_result(process, result);
     sched.ready.push(pid);
     // Safe to call while still holding `sched`'s lock: unlike
     // `SCHEDULER.lock()` itself, this only touches percpu atomics and
@@ -1169,15 +1304,33 @@ pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
 /// this transition happening under two separate locks with a gap a
 /// different core's wake could land in -- see that function's doc
 /// comment.
+///
+/// Also resolves a [`Process::pending_wake`] the instant it appears:
+/// if some other core already completed this process's rendezvous
+/// before this point was reached (see that field's doc comment for the
+/// exact race), the process is immediately handed back to `Ready`
+/// instead of being left `Blocked` forever with nothing left to wake
+/// it -- still entirely under this same lock acquisition, so there is
+/// no window in which a fresh `wake_blocked_process` call could also
+/// see it as `Blocked` and double-apply the wake.
 fn block_current_process_locked(sched: &mut Inner, current_frame: *mut TrapFrame) {
     let core = percpu::core_index();
     if let Some(current_pid) = sched.current[core] {
+        let mut woken = false;
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame -- it's the same frame the syscall entry
             // trampoline built for this process's own trap.
             process.trap_frame = unsafe { *current_frame };
             process.state = ProcessState::Blocked;
+            if let Some(pending) = process.pending_wake.take() {
+                apply_wake_result(process, pending);
+                woken = true;
+            }
+        }
+        if woken {
+            sched.ready.push(current_pid);
+            notify_idle_cores();
         }
         // Load-bearing, not cleanup: a blocked process is no longer
         // "current" on this core, and unlike the timer-tick path (which

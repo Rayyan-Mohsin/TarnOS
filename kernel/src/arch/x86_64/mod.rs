@@ -42,6 +42,15 @@ pub fn init() {
     lapic::init_mmio_mapping();
     unsafe {
         lapic::init_this_core();
+        // Calibrate against the PIT (already running, still the only
+        // timer in the system) before any AP exists to start racing
+        // this core's reads of it, then arm this core's own timer with
+        // the result -- see `lapic::calibrate_against_pit`'s doc
+        // comment. Every AP arms its own copy later, in
+        // `smp::ap_entry_on_own_stack`, reading the same calibrated
+        // value lock-free.
+        lapic::calibrate_against_pit();
+        lapic::arm_timer_this_core();
     }
     x86_64::instructions::interrupts::enable();
 }

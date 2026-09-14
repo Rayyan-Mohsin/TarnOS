@@ -375,6 +375,54 @@ extern "C" fn ring0_reschedule(_frame: *mut TrapFrame) {
     super::lapic::eoi();
 }
 
+// `LAPIC_TIMER_VECTOR`'s entry stub: this core's own periodic LAPIC
+// timer -- the only thing that can ever preempt a process which never
+// makes a single syscall (no `SYS_YIELD`, nothing cooperative). Same
+// dual ring0/ring3-dispatching shape as the PIT-driven
+// `timer_interrupt_entry` above, and reuses
+// `task::scheduler::on_timer_tick` completely unmodified -- already
+// generic over "whichever core calls it" (it resolves
+// `percpu::core_index()` itself), confirmed needing zero changes to be
+// driven by a second, per-core interrupt source. EOI'd via the LAPIC
+// (`lapic::eoi()`), never `interrupts::send_timer_eoi()` -- this
+// interrupt is never routed through the legacy PIC. Deliberately does
+// *not* call `interrupts::on_timer_tick_bookkeeping()`: that function's
+// `TICKS` counter is the BSP's own PIT-tick count (the `[timer] N
+// ticks` heartbeat and `maybe_print_switch`'s throttle both trust it as
+// such) -- every core's LAPIC timer also bumping it would silently
+// redefine it as a cross-core sum, corrupting both.
+exception_entry_no_code!(
+    lapic_timer_entry,
+    super::context_switch::ring0_lapic_timer_tick,
+    super::context_switch::ring3_lapic_timer_tick
+);
+
+unsafe extern "C" {
+    fn lapic_timer_entry();
+}
+
+/// The address to install in the IDT for `lapic::LAPIC_TIMER_VECTOR`.
+pub fn lapic_timer_entry_addr() -> VirtAddr {
+    VirtAddr::new(lapic_timer_entry as *const () as u64)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ring3_lapic_timer_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let next = crate::task::scheduler::on_timer_tick(frame);
+    super::lapic::eoi();
+    next
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ring0_lapic_timer_tick(_frame: *mut TrapFrame) {
+    // Interrupted the kernel itself (idle loop, a kernel task, boot
+    // code) -- there is no process to preempt away from, so this is
+    // just tick acknowledgment. Mirrors `ring0_timer_tick`'s equivalent
+    // case, minus the PIT-only bookkeeping (see this stub's own doc
+    // comment above).
+    super::lapic::eoi();
+}
+
 exception_entry_no_code!(
     divide_error_entry,
     super::idt::divide_error_ring0,

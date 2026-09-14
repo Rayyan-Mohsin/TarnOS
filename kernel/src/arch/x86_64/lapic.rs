@@ -1,17 +1,18 @@
-//! Minimal Local APIC (LAPIC) driver: just enough to bring up additional
-//! cores and prove they're independently addressable — enable + a
-//! spurious vector, end-of-interrupt, and a targeted send-IPI primitive.
+//! Local APIC (LAPIC) driver: enable + a spurious vector, end-of-interrupt,
+//! a targeted send-IPI primitive, and a calibrated per-core periodic
+//! timer for forced preemption.
 //!
-//! No periodic timer. Each core parks in a low-power, interrupt-driven
-//! idle loop once it's brought up, waking only when explicitly signaled
-//! (an IPI) — a calibrated per-core timer isn't needed until a future
-//! milestone actually schedules work across cores, and adds real
-//! calibration risk this milestone's scope doesn't need to take on. The
-//! legacy PIC/PIT (`arch::x86_64::interrupts`) is untouched and keeps
-//! driving the BSP's real scheduler timer exactly as before — this
-//! module is a second, independent, parallel interrupt path used only
-//! for AP bring-up and the IPI proof.
-use core::sync::atomic::Ordering;
+//! Every core also gets its own periodic timer (see
+//! [`calibrate_against_pit`]/[`arm_timer_this_core`]), the only thing
+//! that can ever preempt a process that never makes a single syscall —
+//! the legacy 8259 PIC/PIT can only ever route an interrupt to one core,
+//! so before this, only the BSP had any preemption at all. The legacy
+//! PIC/PIT (`arch::x86_64::interrupts`) is untouched and keeps driving
+//! the BSP's own scheduler-tick bookkeeping (`TICKS`, the `[timer] N
+//! ticks` heartbeat) exactly as before — this timer is a second,
+//! independent, parallel interrupt path, calibrated against the PIT
+//! once but never touching its counter.
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use x86_64::registers::model_specific::ApicBase;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
@@ -19,6 +20,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::percpu;
+use crate::earlyprintln;
 use crate::memory::virt;
 
 /// Spurious-interrupt vector — clear of both the legacy PIC's 32-47
@@ -40,18 +42,55 @@ pub const TEST_IPI_VECTOR: u8 = 0x41;
 /// generates -- it may need to force a genuine context switch, not just
 /// bump a counter.
 pub const RESCHEDULE_VECTOR: u8 = 0x42;
+/// This core's own periodic preemption timer — see
+/// [`calibrate_against_pit`]/[`arm_timer_this_core`]. Unlike
+/// [`RESCHEDULE_VECTOR`] (an IPI another core sends), this one only ever
+/// fires locally, but needs the exact same dual ring0/ring3-dispatching
+/// stub shape (`context_switch::lapic_timer_entry`) for the same reason:
+/// it may need to redirect control to a different process than whatever
+/// this core was running when it fired.
+pub const LAPIC_TIMER_VECTOR: u8 = 0x43;
 
 const REG_ID: usize = 0x20;
 const REG_EOI: usize = 0xB0;
 const REG_SVR: usize = 0xF0;
 const REG_ICR_LOW: usize = 0x300;
 const REG_ICR_HIGH: usize = 0x310;
+const REG_LVT_TIMER: usize = 0x320;
+const REG_INITIAL_COUNT: usize = 0x380;
+const REG_CURRENT_COUNT: usize = 0x390;
+const REG_DIVIDE_CONFIG: usize = 0x3E0;
 
 /// Spurious-Interrupt Vector Register bit 8: "APIC software enable."
 const SVR_APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
 /// Interrupt Command Register bit 14: "Assert" (vs. "De-assert") — the
 /// standard shape for a normal fixed-vector IPI send, not an INIT/SIPI.
 const ICR_ASSERT: u32 = 1 << 14;
+/// LVT Timer Register bit 16: "Mask" — set while calibrating/idle,
+/// cleared by [`arm_timer_this_core`] once a real reload value is ready.
+const LVT_TIMER_MASKED: u32 = 1 << 16;
+/// LVT Timer Register bit 17: "Timer Mode" (1 = periodic, 0 = one-shot).
+const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+/// Divide Configuration Register value for "divide by 16" (Intel SDM Vol.
+/// 3A §11.5.4's 3-bit encoding, split across bits 0-1 and 3): arbitrary
+/// but fixed — the same divisor is used for both calibration and the
+/// real per-core arm, so it cancels out of the calibrated reload value
+/// entirely.
+const DIVIDE_BY_16: u32 = 0b0011;
+/// Started once at the beginning of the calibration window and read back
+/// afterward via `REG_CURRENT_COUNT` — deliberately the largest possible
+/// value so the window (bounded by a real PIT tick, not by this counter
+/// running out) can never exhaust it first.
+const CALIBRATION_SENTINEL: u32 = u32::MAX;
+
+/// The per-core LAPIC-timer reload value [`calibrate_against_pit`]
+/// derives once, on the BSP, and every core (BSP included) reads
+/// lock-free via [`arm_timer_this_core`]. Zero until calibration has
+/// actually run — every real boot path calibrates before any core is
+/// ever started (see `arch::x86_64::init`/`smp::bring_up_aps`'s
+/// ordering), so an `arm_timer_this_core` call always sees the real
+/// value in practice.
+static CALIBRATED_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Fixed virtual address the LAPIC's MMIO page is explicitly mapped at
 /// by [`init_mmio_mapping`] — deliberately *not* reached via
@@ -115,6 +154,96 @@ unsafe fn write_reg(offset: usize, value: u32) {
 pub unsafe fn init_this_core() {
     unsafe {
         write_reg(REG_SVR, SVR_APIC_SOFTWARE_ENABLE | SPURIOUS_VECTOR as u32);
+    }
+}
+
+/// One-time LAPIC-timer calibration against the legacy PIT, run by the
+/// BSP only, right after its own [`init_this_core`] — while the PIT
+/// (already programmed by `interrupts::init`) is the only timer running
+/// anywhere, and before any AP exists to also be racing this core's own
+/// reads of it. Stores the result in [`CALIBRATED_INITIAL_COUNT`] for
+/// every later [`arm_timer_this_core`] call (BSP and every AP) to read.
+///
+/// Synchronizes to the start of a fresh PIT tick before starting the
+/// measurement window, rather than starting immediately: this function
+/// could be called at any point within whatever tick happens to be
+/// running when it's called, and measuring from a partial tick would
+/// under-count. Starts a one-shot countdown from [`CALIBRATION_SENTINEL`]
+/// (deliberately the largest possible value, so the *PIT's* tick is what
+/// bounds the window, never this counter running out first), waits for
+/// exactly one full PIT tick, then reads back how much of the sentinel
+/// was consumed — that count *is* the reload value for a periodic timer
+/// at the PIT's own tick rate, no further scaling needed.
+///
+/// # Safety
+/// Must run after this core's own `init_this_core` and `interrupts::init`
+/// (needs the PIT already programmed and only its own IRQ0 line
+/// unmasked at the PIC — see that function), before any AP is started,
+/// and before this core's own caller (`arch::x86_64::init`) has done
+/// anything that would break if a ring0 timer tick fired in the middle
+/// of this function (true at the point it's actually called from —
+/// nothing there depends on this core's own percpu slot, which is only
+/// assigned afterward). This function enables interrupts for its own
+/// measurement window (see below) and disables them again before
+/// returning, so it does *not* require interrupts to already be
+/// disabled, but does leave them disabled again on return either way.
+pub unsafe fn calibrate_against_pit() {
+    unsafe {
+        write_reg(REG_DIVIDE_CONFIG, DIVIDE_BY_16);
+        write_reg(REG_LVT_TIMER, LVT_TIMER_MASKED);
+    }
+
+    // `interrupts::ticks()` only ever advances from the PIT's own
+    // interrupt handler — it cannot tick with interrupts disabled, which
+    // is otherwise the state for this entire function's caller
+    // (`arch::x86_64::init` only calls its own `sti` at the very end).
+    // Enable interrupts for exactly this measurement window — only IRQ0
+    // is unmasked at the PIC this early (see `interrupts::init`), so the
+    // one interrupt that can land here is a harmless ring0 (kernel, not
+    // process) timer tick — then restore the disabled state this
+    // function's caller still expects on return.
+    x86_64::instructions::interrupts::enable();
+
+    let start = super::interrupts::ticks();
+    while super::interrupts::ticks() == start {
+        core::hint::spin_loop();
+    }
+
+    unsafe { write_reg(REG_INITIAL_COUNT, CALIBRATION_SENTINEL) };
+    let window_start = super::interrupts::ticks();
+    while super::interrupts::ticks() == window_start {
+        core::hint::spin_loop();
+    }
+    let remaining = unsafe { read_reg(REG_CURRENT_COUNT) };
+    unsafe { write_reg(REG_INITIAL_COUNT, 0) };
+
+    x86_64::instructions::interrupts::disable();
+
+    let elapsed = CALIBRATION_SENTINEL - remaining;
+    CALIBRATED_INITIAL_COUNT.store(elapsed, Ordering::Release);
+    earlyprintln!("[lapic] timer calibrated: {} counts per PIT tick", elapsed);
+}
+
+/// Arms this core's own periodic LAPIC timer at [`LAPIC_TIMER_VECTOR`],
+/// using the reload value [`calibrate_against_pit`] computed once on the
+/// BSP. Must be called by *every* core, including the BSP itself — the
+/// LAPIC timer, like every other LAPIC register, is genuinely per-core
+/// hardware with no "arm once for every core" shortcut.
+///
+/// # Safety
+/// Must run after this core's own `init_this_core` (needs the LAPIC
+/// already enabled) and IDT already loaded (needs `LAPIC_TIMER_VECTOR`
+/// registered — see `idt::init`/`idt::load_ap`), and before this core
+/// enables interrupts. Must also run after [`calibrate_against_pit`] has
+/// completed on the BSP — true of every real boot path (the BSP
+/// calibrates before any AP is started; see `arch::x86_64::init`'s and
+/// `smp::bring_up_aps`'s ordering).
+pub unsafe fn arm_timer_this_core() {
+    let reload = CALIBRATED_INITIAL_COUNT.load(Ordering::Acquire);
+    unsafe {
+        write_reg(REG_DIVIDE_CONFIG, DIVIDE_BY_16);
+        write_reg(REG_LVT_TIMER, LVT_TIMER_PERIODIC | LAPIC_TIMER_VECTOR as u32);
+        write_reg(REG_INITIAL_COUNT, reload);
     }
 }
 

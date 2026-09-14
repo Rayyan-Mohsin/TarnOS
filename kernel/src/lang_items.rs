@@ -18,6 +18,7 @@ fn panic(info: &PanicInfo) -> ! {
     } else {
         earlyprintln!("[KERNEL PANIC] {}", info.message());
     }
+    crate::task::scheduler::dump_flight_recorder();
     earlyprintln!("halting.");
 
     loop {

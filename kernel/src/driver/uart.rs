@@ -13,6 +13,7 @@ use x86_64::instructions::port::Port;
 
 use super::{CharDevice, Driver, InterruptHandler};
 use crate::arch::x86_64::interrupts;
+use crate::earlyprintln;
 use crate::sync::SpinLock;
 
 const COM1_BASE: u16 = 0x3F8;
@@ -23,6 +24,10 @@ const LCR_8N1: u8 = 0x03;
 const LCR_DLAB: u8 = 0x80;
 const MCR_INIT: u8 = 0x0B; // DTR | RTS | OUT2 (OUT2 gates the IRQ line to the PIC)
 const LSR_DATA_READY: u8 = 0x01;
+const LSR_OVERRUN_ERROR: u8 = 0x02;
+const LSR_PARITY_ERROR: u8 = 0x04;
+const LSR_FRAMING_ERROR: u8 = 0x08;
+const LSR_ERROR_BITS: u8 = LSR_OVERRUN_ERROR | LSR_PARITY_ERROR | LSR_FRAMING_ERROR;
 const LSR_THR_EMPTY: u8 = 0x20;
 
 /// Divisor for 38400 baud from the UART's 115200 Hz base clock. Plenty
@@ -90,10 +95,26 @@ impl CharDevice for Uart16550 {
     }
 
     fn try_read_byte(&mut self) -> Option<u8> {
-        if self.line_status() & LSR_DATA_READY != 0 {
-            Some(unsafe { self.data.read() })
-        } else {
-            None
+        loop {
+            let status = self.line_status();
+            if status & LSR_DATA_READY == 0 {
+                return None;
+            }
+            // The byte must be read regardless of the error bits — on real
+            // hardware that's what clears the latched error condition, and
+            // skipping it would leave the UART reporting the same error
+            // forever. A byte that arrived with a framing/parity/overrun
+            // error is data QEMU never actually produces but real hardware
+            // (line noise, a dropped IRQ letting the single-byte FIFO
+            // overrun) can: discard it and keep polling rather than handing
+            // corrupt data up to `echo_task`/the console server as if it
+            // were valid.
+            let byte = unsafe { self.data.read() };
+            if status & LSR_ERROR_BITS != 0 {
+                earlyprintln!("[uart] LSR error bits {:#04x}, discarding byte", status & LSR_ERROR_BITS);
+                continue;
+            }
+            return Some(byte);
         }
     }
 }
