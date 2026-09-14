@@ -214,3 +214,77 @@ mod tests {
         assert_eq!(r.count(), 0);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::Bitmap;
+    use proptest::prelude::*;
+
+    const WORDS: usize = 2; // CAPACITY = 128
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        SetFree(usize),
+        SetUsed(usize),
+        Allocate,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        // Deliberately ranges a bit past `CAPACITY` too, to also exercise
+        // the out-of-range-index-is-ignored path amid otherwise-valid
+        // operations, not just in isolation.
+        let cap = Bitmap::<WORDS>::CAPACITY;
+        prop_oneof![
+            (0..cap + 8).prop_map(Op::SetFree),
+            (0..cap + 8).prop_map(Op::SetUsed),
+            Just(Op::Allocate),
+        ]
+    }
+
+    fn brute_force_free_count(b: &Bitmap<WORDS>) -> usize {
+        (0..Bitmap::<WORDS>::CAPACITY)
+            .filter(|&i| b.is_free(i))
+            .count()
+    }
+
+    proptest! {
+        /// After any sequence of `set_free`/`set_used`/`allocate` calls
+        /// (including out-of-range indices, which must be silently
+        /// ignored rather than panicking or aliasing another index —
+        /// see `boundary_index_at_top_of_capacity_works` above for the
+        /// one hand-picked case this generalizes): every `allocate()`
+        /// that returns `Some(index)` names an index that was free
+        /// *immediately before* the call, and `free_count()` always
+        /// agrees with a brute-force recount over every index.
+        #[test]
+        fn allocate_only_returns_previously_free_and_free_count_matches_recount(
+            ops in prop::collection::vec(op_strategy(), 0..300)
+        ) {
+            let mut b: Bitmap<WORDS> = Bitmap::new();
+            for op in ops {
+                match op {
+                    Op::SetFree(i) => b.set_free(i),
+                    Op::SetUsed(i) => b.set_used(i),
+                    Op::Allocate => {
+                        let free_before: std::collections::HashSet<usize> = (0..Bitmap::<WORDS>::CAPACITY)
+                            .filter(|&i| b.is_free(i))
+                            .collect();
+                        match b.allocate() {
+                            Some(idx) => {
+                                prop_assert!(
+                                    free_before.contains(&idx),
+                                    "allocate() returned {idx}, which was not free beforehand"
+                                );
+                                prop_assert!(!b.is_free(idx), "allocate() must mark its result used");
+                            }
+                            None => {
+                                prop_assert!(free_before.is_empty(), "allocate() returned None despite free indices existing");
+                            }
+                        }
+                    }
+                }
+                prop_assert_eq!(b.free_count(), brute_force_free_count(&b));
+            }
+        }
+    }
+}

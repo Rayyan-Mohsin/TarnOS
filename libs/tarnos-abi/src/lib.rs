@@ -5,7 +5,14 @@
 //! indices, and error codes. Both `tarnos-kernel` and userland binaries (via
 //! `tarnos-rt`) depend on it, so the two sides of the syscall trampoline
 //! cannot drift out of sync with each other.
-#![no_std]
+//!
+//! `#![cfg_attr(not(test), no_std)]`, not a bare `#![no_std]` — mirrors
+//! `tarnos-kcore`'s own pattern (see that crate's `lib.rs` doc comment):
+//! this crate is genuinely `no_std` in every real build (the kernel and
+//! every userland binary that links it), but compiles as an ordinary
+//! `std` crate under `cargo test`, which is what lets the standard
+//! `#[test]`/`proptest!` harness run at all.
+#![cfg_attr(not(test), no_std)]
 
 /// `sys_yield()` — voluntarily give up the remaining timeslice.
 pub const SYS_YIELD: u64 = 0;
@@ -257,8 +264,16 @@ impl SyscallError {
     /// [`SyscallError::NoSuchSyscall`] rather than panicking, since a
     /// future kernel might return codes this build of `tarnos-abi`
     /// doesn't know about yet.
+    ///
+    /// Uses `unsigned_abs`, not a bare `(-retval) as u64`: negating
+    /// `i64::MIN` directly overflows (there is no positive `i64`
+    /// representation of `-i64::MIN`) and panics under debug overflow
+    /// checks — a real, if never-triggered-by-a-real-kernel, gap a
+    /// property test surfaced by exercising this function's full
+    /// documented input domain ("any negative value"), not just the
+    /// small set of codes `as_retval` actually produces.
     pub fn from_retval(retval: i64) -> Self {
-        match (-retval) as u64 {
+        match retval.unsigned_abs() {
             2 => SyscallError::BadCapability,
             3 => SyscallError::PermissionDenied,
             4 => SyscallError::ResourceExhausted,
@@ -282,4 +297,143 @@ impl SyscallError {
 pub enum AbiKind {
     TarnosNative,
     LinuxCompat,
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// ASCII-only, at or under the inline capacity: the packed
+        /// register triple round-trips to *exactly* the original string —
+        /// no truncation, no lossy replacement, since every byte is both
+        /// present and a valid UTF-8 boundary on its own.
+        #[test]
+        fn pack_program_name_round_trips_short_ascii(name in "[ -~]{0,16}") {
+            let (lo, hi, len) = pack_program_name(&name);
+            let mut buf = [0u8; PROGRAM_NAME_MAX];
+            let out = unpack_program_name(lo, hi, len, &mut buf);
+            prop_assert_eq!(out, name);
+        }
+
+        /// Longer than the inline capacity: truncated to exactly the
+        /// first `PROGRAM_NAME_MAX` bytes — still exact (not lossy) since
+        /// the input is pure ASCII, so any byte offset is a valid UTF-8
+        /// boundary.
+        #[test]
+        fn pack_program_name_truncates_long_ascii(name in "[ -~]{17,64}") {
+            let (lo, hi, len) = pack_program_name(&name);
+            let mut buf = [0u8; PROGRAM_NAME_MAX];
+            let out = unpack_program_name(lo, hi, len, &mut buf);
+            prop_assert_eq!(out, &name[..PROGRAM_NAME_MAX]);
+        }
+
+        /// Arbitrary Unicode input (which can straddle a multi-byte
+        /// codepoint right at the truncation boundary) must never panic —
+        /// `unpack_program_name`'s own lossy fallback is exactly the
+        /// mechanism that's supposed to handle that, not a `unwrap()`
+        /// this could still panic through.
+        #[test]
+        fn pack_program_name_never_panics_on_arbitrary_unicode(name in ".{0,64}") {
+            let (lo, hi, len) = pack_program_name(&name);
+            let mut buf = [0u8; PROGRAM_NAME_MAX];
+            let _ = unpack_program_name(lo, hi, len, &mut buf);
+        }
+
+        #[test]
+        fn message_round_trips_short_ascii(s in "[ -~]{0,32}") {
+            let msg = Message::from_str_lossy(&s);
+            let mut buf = [0u8; MESSAGE_INLINE_WORDS * 8];
+            prop_assert_eq!(msg.as_str_lossy(&mut buf), s);
+        }
+
+        #[test]
+        fn message_truncates_long_ascii(s in "[ -~]{33,128}") {
+            let msg = Message::from_str_lossy(&s);
+            let mut buf = [0u8; MESSAGE_INLINE_WORDS * 8];
+            prop_assert_eq!(msg.as_str_lossy(&mut buf), &s[..MESSAGE_INLINE_WORDS * 8]);
+        }
+
+        #[test]
+        fn message_never_panics_on_arbitrary_unicode(s in ".{0,128}") {
+            let msg = Message::from_str_lossy(&s);
+            let mut buf = [0u8; MESSAGE_INLINE_WORDS * 8];
+            let _ = msg.as_str_lossy(&mut buf);
+        }
+
+        /// `SyscallError::from_retval` must never panic on *any* negative
+        /// value, including ones no current variant maps to — an
+        /// unrecognized code is documented to fall back to
+        /// `NoSuchSyscall`, forward-compatibility with a newer kernel
+        /// this build of the ABI crate doesn't fully know about yet.
+        #[test]
+        fn syscall_error_from_retval_never_panics(retval in i64::MIN..0) {
+            let _ = SyscallError::from_retval(retval);
+        }
+
+        #[test]
+        fn exit_status_exited_round_trips_through_regs(code in any::<i32>()) {
+            let status = ExitStatus::Exited(code);
+            let (kind, regs_code) = status.to_regs();
+            prop_assert_eq!(ExitStatus::from_regs(kind, regs_code), status);
+        }
+
+        /// `from_regs` must never panic on an arbitrary `(kind, code)`
+        /// pair — an unrecognized `kind` is documented to map to
+        /// `Killed` rather than panicking, the same forward-compatibility
+        /// reasoning as `SyscallError::from_retval`.
+        #[test]
+        fn exit_status_from_regs_never_panics(kind in any::<u64>(), code in any::<u64>()) {
+            let _ = ExitStatus::from_regs(kind, code);
+        }
+    }
+
+    /// Every defined `SyscallError` variant round-trips through its own
+    /// wire encoding — enumerated rather than randomly generated, since
+    /// there are only a handful of fieldless variants and every one of
+    /// them matters (a gap here would mean a future variant was added to
+    /// the enum without updating `from_retval`'s match, silently aliasing
+    /// it to `NoSuchSyscall`).
+    #[test]
+    fn syscall_error_round_trips_every_variant() {
+        let variants = [
+            SyscallError::NoSuchSyscall,
+            SyscallError::BadCapability,
+            SyscallError::PermissionDenied,
+            SyscallError::ResourceExhausted,
+            SyscallError::NoSuchProgram,
+            SyscallError::InvalidTarget,
+            SyscallError::SpawnFailed,
+            SyscallError::InvalidArgument,
+        ];
+        for err in variants {
+            assert_eq!(SyscallError::from_retval(err.as_retval()), err);
+        }
+    }
+
+    #[test]
+    fn exit_status_faulted_and_killed_round_trip() {
+        assert_eq!(
+            ExitStatus::from_regs(1, 0),
+            ExitStatus::Faulted
+        );
+        let (kind, code) = ExitStatus::Faulted.to_regs();
+        assert_eq!(ExitStatus::from_regs(kind, code), ExitStatus::Faulted);
+
+        let (kind, code) = ExitStatus::Killed.to_regs();
+        assert_eq!(ExitStatus::from_regs(kind, code), ExitStatus::Killed);
+    }
+
+    /// Deterministic regression pin for the `i64::MIN` overflow the
+    /// `syscall_error_from_retval_never_panics` property test above is
+    /// meant to catch, but only ever does probabilistically (random
+    /// sampling isn't guaranteed to land on this one exact boundary
+    /// value every run) — a fixed test names it explicitly so a future
+    /// regression back to `(-retval) as u64` fails every run, not just
+    /// the lucky ones.
+    #[test]
+    fn syscall_error_from_retval_handles_i64_min() {
+        assert_eq!(SyscallError::from_retval(i64::MIN), SyscallError::NoSuchSyscall);
+    }
 }

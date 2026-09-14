@@ -371,3 +371,137 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::{RecvOutcome, SendOutcome, Slot, Waiter};
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+
+    const CAP: usize = 3;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Send(u32, u32),
+        Recv(u32),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (any::<u32>(), any::<u32>()).prop_map(|(m, s)| Op::Send(m, s)),
+            any::<u32>().prop_map(Op::Recv),
+        ]
+    }
+
+    /// A queued sender's identity, mirroring `Waiter<P>`'s two relevant
+    /// shapes for this model (`Waiter::Task` never appears here — every
+    /// op uses `Waiter::Process`): `Some(pid)` for an ordinary queued
+    /// sender, `None` for the `Waiter::None` a displaced receiver's
+    /// message gets re-queued with (see [`super::Waiter::None`]'s doc
+    /// comment) — never the *original* sender, which already got its
+    /// answer synchronously.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ModelSender {
+        Some(u32),
+        None,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ModelState {
+        Empty,
+        SendersWaiting(VecDeque<(u32, ModelSender)>),
+        ReceiverWaiting(u32),
+    }
+
+    proptest! {
+        /// A small model-based fuzz test of the whole rendezvous state
+        /// machine: mirrors `Slot`'s own three-state shape (`Empty` /
+        /// `SendersWaiting` / `ReceiverWaiting`) directly, with a
+        /// reference `VecDeque` standing in for the sender queue.
+        /// Verifies, for arbitrary interleavings of `send`/`recv`: every
+        /// enqueued message is eventually delivered exactly once, in
+        /// FIFO order; the sender queue's capacity bound is enforced
+        /// identically; at most one receiver can ever be queued; and a
+        /// receiver displaced by an immediately-delivered send is
+        /// correctly re-queued with `Waiter::None`, never the original
+        /// sender (the exact historical bug
+        /// `immediate_delivery_to_a_task_does_not_replay_a_stale_wake_on_the_original_sender`
+        /// above pins one hand-picked case of).
+        #[test]
+        fn matches_reference_state_machine(ops in prop::collection::vec(op_strategy(), 0..200)) {
+            let mut slot: Slot<u32, u32, CAP> = Slot::new();
+            let mut model = ModelState::Empty;
+
+            for op in ops {
+                match op {
+                    Op::Send(msg, sender) => {
+                        let outcome = slot.try_send(msg, Waiter::Process(sender));
+                        model = match model {
+                            ModelState::ReceiverWaiting(receiver) => {
+                                match outcome {
+                                    SendOutcome::Delivered(Waiter::Process(delivered_to)) => {
+                                        prop_assert_eq!(delivered_to, receiver);
+                                    }
+                                    _ => prop_assert!(false, "expected Delivered(Process(receiver))"),
+                                }
+                                let mut q = VecDeque::new();
+                                q.push_back((msg, ModelSender::None));
+                                ModelState::SendersWaiting(q)
+                            }
+                            ModelState::Empty => {
+                                prop_assert!(matches!(outcome, SendOutcome::Enqueued));
+                                let mut q = VecDeque::new();
+                                q.push_back((msg, ModelSender::Some(sender)));
+                                ModelState::SendersWaiting(q)
+                            }
+                            ModelState::SendersWaiting(mut q) => {
+                                if q.len() < CAP {
+                                    prop_assert!(matches!(outcome, SendOutcome::Enqueued));
+                                    q.push_back((msg, ModelSender::Some(sender)));
+                                } else {
+                                    prop_assert!(matches!(outcome, SendOutcome::QueueFull));
+                                }
+                                ModelState::SendersWaiting(q)
+                            }
+                        };
+                    }
+                    Op::Recv(receiver) => {
+                        let outcome = slot.try_recv(Waiter::Process(receiver));
+                        model = match model {
+                            ModelState::SendersWaiting(mut q) => {
+                                let (expected_msg, expected_sender) =
+                                    q.pop_front().expect("SendersWaiting is never left empty");
+                                match outcome {
+                                    RecvOutcome::Delivered { message, sender } => {
+                                        prop_assert_eq!(message, expected_msg);
+                                        match (expected_sender, sender) {
+                                            (ModelSender::None, Waiter::None) => {}
+                                            (ModelSender::Some(expected), Waiter::Process(actual)) => {
+                                                prop_assert_eq!(actual, expected);
+                                            }
+                                            _ => prop_assert!(false, "delivered sender kind did not match the model"),
+                                        }
+                                    }
+                                    _ => prop_assert!(false, "expected Delivered"),
+                                }
+                                if q.is_empty() {
+                                    ModelState::Empty
+                                } else {
+                                    ModelState::SendersWaiting(q)
+                                }
+                            }
+                            ModelState::Empty => {
+                                prop_assert!(matches!(outcome, RecvOutcome::Enqueued));
+                                ModelState::ReceiverWaiting(receiver)
+                            }
+                            ModelState::ReceiverWaiting(existing) => {
+                                prop_assert!(matches!(outcome, RecvOutcome::QueueFull));
+                                ModelState::ReceiverWaiting(existing)
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+}

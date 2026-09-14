@@ -10,3 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 tarnos-abi = { path = "../tarnos-abi" }
+
+[dev-dependencies]
+proptest = "1"

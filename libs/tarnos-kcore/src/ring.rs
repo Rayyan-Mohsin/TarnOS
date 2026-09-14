@@ -148,3 +148,57 @@ mod tests {
         assert_eq!(q.pop().as_deref(), Some("b"));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::RingBuffer;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+
+    const CAP: usize = 4;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Push(u32),
+        Pop,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![any::<u32>().prop_map(Op::Push), Just(Op::Pop),]
+    }
+
+    proptest! {
+        /// For any sequence of push/pop operations, `RingBuffer<u32, CAP>`
+        /// behaves exactly like a capacity-bounded `VecDeque` reference
+        /// model: same FIFO delivery order, same accept/reject decision
+        /// on `push` once full, and `len`/`is_empty`/`is_full` always
+        /// agree with the model's own state after every step —
+        /// generalizes the hand-picked wraparound test above to
+        /// arbitrary interleavings, not just one fixed push/pop pattern.
+        #[test]
+        fn matches_vecdeque_model(ops in prop::collection::vec(op_strategy(), 0..200)) {
+            let mut ring: RingBuffer<u32, CAP> = RingBuffer::new();
+            let mut model: VecDeque<u32> = VecDeque::new();
+
+            for op in ops {
+                match op {
+                    Op::Push(value) => {
+                        let accepted = ring.push(value);
+                        if model.len() < CAP {
+                            prop_assert!(accepted);
+                            model.push_back(value);
+                        } else {
+                            prop_assert!(!accepted, "push into a full buffer must fail");
+                        }
+                    }
+                    Op::Pop => {
+                        prop_assert_eq!(ring.pop(), model.pop_front());
+                    }
+                }
+                prop_assert_eq!(ring.len(), model.len());
+                prop_assert_eq!(ring.is_empty(), model.is_empty());
+                prop_assert_eq!(ring.is_full(), model.len() == CAP);
+            }
+        }
+    }
+}

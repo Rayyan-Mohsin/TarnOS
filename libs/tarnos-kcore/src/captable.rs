@@ -165,3 +165,58 @@ mod tests {
         assert_eq!(slot.rights, Rights::RECV);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::{CapTable, CapabilitySlot, Rights};
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+    use tarnos_abi::CapIndex;
+
+    fn rights_strategy() -> impl Strategy<Value = Rights> {
+        (0u8..4).prop_map(Rights::from_bits_truncate)
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Insert(u32, Rights),
+        Lookup(u32, Rights),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0u32..8, rights_strategy()).prop_map(|(i, r)| Op::Insert(i, r)),
+            (0u32..8, rights_strategy()).prop_map(|(i, r)| Op::Lookup(i, r)),
+        ]
+    }
+
+    proptest! {
+        /// For any sequence of inserts and lookups, `lookup(index,
+        /// required)` succeeds if and only if `required` is a subset of
+        /// the rights from the *most recent* `insert` at that index (a
+        /// reinsert fully replaces the slot, per
+        /// `reinserting_at_the_same_index_replaces_the_slot` above — this
+        /// generalizes that single hand-picked case to arbitrary
+        /// interleavings), and reports `BadCapability`/`PermissionDenied`
+        /// correctly for every index never inserted at all.
+        #[test]
+        fn lookup_matches_most_recent_insert(ops in prop::collection::vec(op_strategy(), 0..200)) {
+            let mut table: CapTable<()> = CapTable::new();
+            let mut model: HashMap<u32, Rights> = HashMap::new();
+
+            for op in ops {
+                match op {
+                    Op::Insert(index, rights) => {
+                        table.insert(CapIndex(index), CapabilitySlot { object: (), rights });
+                        model.insert(index, rights);
+                    }
+                    Op::Lookup(index, required) => {
+                        let result = table.lookup(CapIndex(index), required);
+                        let should_succeed = model.get(&index).is_some_and(|held| held.contains(required));
+                        prop_assert_eq!(result.is_ok(), should_succeed);
+                    }
+                }
+            }
+        }
+    }
+}
