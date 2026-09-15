@@ -50,6 +50,31 @@ pub const RESCHEDULE_VECTOR: u8 = 0x42;
 /// it may need to redirect control to a different process than whatever
 /// this core was running when it fired.
 pub const LAPIC_TIMER_VECTOR: u8 = 0x43;
+/// Broadcast by [`broadcast_panic_halt`] the instant any core recognizes
+/// a fatal (ring-0) kernel panic, to every *other* booted core, before
+/// that core does anything else -- including its own diagnostic print.
+///
+/// Found via live GDB inspection of a `kitchen-sink-test` hang that
+/// looked, from the serial log alone, like a total system freeze with
+/// zero further output: one core (via `idt::page_fault_ring0`) had
+/// genuinely panicked and was sitting cleanly in
+/// `lang_items::panic`'s own terminal halt loop, but two *other* cores
+/// were spinning forever inside `task::executor::EXECUTOR`'s `SpinLock`
+/// (reached via `task::scheduler::on_timer_tick` ->
+/// `task::executor::run_ready_tasks`), and a *third* was spinning
+/// forever on `earlycon::COM1_TX_LOCK` -- both orphaned forever, because
+/// the panicking core had been holding one or the other at the exact
+/// instant its fault struck, and a hardware fault jumps to a new
+/// handler without ever running the interrupted frame's `Drop`. Once a
+/// core reaches `idt::page_fault_ring0`/`general_protection_fault_ring0`
+/// (or any other unconditional `panic!()` for a ring-0 fault), the whole
+/// machine is already fatally broken -- there is no way to know in
+/// general which locks that core might have been holding, so the only
+/// way to guarantee no *other* core is left spinning on one forever is
+/// to stop every other core immediately, before the panicking core does
+/// anything else that could itself get stuck (its own diagnostic print
+/// included -- see [`broadcast_panic_halt`]'s doc comment).
+pub const PANIC_HALT_VECTOR: u8 = 0x44;
 
 const REG_ID: usize = 0x20;
 const REG_EOI: usize = 0xB0;
@@ -287,7 +312,43 @@ extern "x86-interrupt" fn test_ipi_handler(_frame: InterruptStackFrame) {
     eoi();
 }
 
+/// Never returns, never sends an EOI, never touches a lock: a receiving
+/// core is meant to stop dead, permanently, the instant this arrives --
+/// see [`PANIC_HALT_VECTOR`]'s doc comment for why. Deliberately as
+/// minimal as `lang_items::panic`'s own terminal loop (which this
+/// mirrors): anything more elaborate is itself a lock/allocation this
+/// core might now be unable to safely perform.
+extern "x86-interrupt" fn panic_halt_handler(_frame: InterruptStackFrame) {
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// Sends [`PANIC_HALT_VECTOR`] to every other *booted* core (skipping
+/// `this_core` and every slot [`percpu::assign_slot`] never claimed, the
+/// same "unassigned LAPIC ID" sentinel `percpu::core_index` itself relies
+/// on never colliding with a real one) — see [`PANIC_HALT_VECTOR`]'s doc
+/// comment for the full incident this exists to prevent. Must be the
+/// very first thing [`crate::lang_items::panic`] does, before even its
+/// own diagnostic print: lock-free (raw LAPIC MMIO, this core's own
+/// hardware only — see [`send_ipi`]), so unlike almost anything else this
+/// core could try next, it can never itself get stuck.
+pub fn broadcast_panic_halt(this_core: usize) {
+    for core in 0..percpu::MAX_CORES {
+        if core == this_core {
+            continue;
+        }
+        if !percpu::is_booted(core) {
+            continue;
+        }
+        send_ipi(percpu::slot(core).lapic_id(), PANIC_HALT_VECTOR);
+    }
+}
+
 pub(super) fn register_handlers(idt: &mut InterruptDescriptorTable) {
     idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
     idt[TEST_IPI_VECTOR].set_handler_fn(test_ipi_handler);
+    idt[PANIC_HALT_VECTOR].set_handler_fn(panic_halt_handler);
 }

@@ -13,7 +13,7 @@
 //! same reason — never from interrupt context.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Once;
 use tarnos_abi::ExitStatus;
@@ -109,6 +109,43 @@ fn set_current(sched: &mut Inner, core: usize, pid: Option<Pid>) {
 
 static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 
+/// Set for a process-table index whenever the core that just relinquished
+/// that identity there (self-exit, fault-kill, or a cross-core `SYS_KILL`
+/// eviction — see [`terminate_current_process`]/[`on_reschedule_ipi`])
+/// hasn't yet finished its own follow-up work on that process's kernel
+/// stack: [`switch_to_next_or_halt`]'s own dispatch, `maybe_print_switch`,
+/// `task::executor::run_ready_tasks` — everything that still runs *on
+/// that exact stack* after the table slot itself already reads `Empty`
+/// (reuse-eligible from the table's own point of view) but *before* this
+/// core has actually finished touching the fixed, per-index memory at
+/// [`Process::kernel_stack_top`].
+///
+/// `allocate_pid` refuses to hand out an index while this is still set,
+/// even once the table slot there reads `Empty` — closing a real,
+/// reproduced race distinct from (and not caught by) any of this
+/// process-table's own generation/slot-state bookkeeping: two cores
+/// physically using the *same* kernel stack memory at once, one still
+/// finishing an old process's exit/eviction path, the other just
+/// starting a brand-new process that reused the same table index,
+/// corrupting whatever each was doing there (observed in practice as
+/// `SpinLockGuard`'s own "guard taken before drop" panic and the
+/// `x86_64` crate's internal "entry should be mapped at this point"
+/// panic, both reachable only via corrupted stack-resident state, not a
+/// logic error in either). See `docs/adr/0012`.
+static STACK_BUSY: [AtomicBool; MAX_PROCESSES] = [const { AtomicBool::new(false) }; MAX_PROCESSES];
+
+fn mark_stack_busy(index: usize) {
+    STACK_BUSY[index].store(true, Ordering::Release);
+}
+
+/// Clears a slot [`mark_stack_busy`] set, once the core that set it has
+/// genuinely finished touching that index's kernel stack — see
+/// [`STACK_BUSY`]'s own doc comment for exactly what "finished" means
+/// for each caller.
+fn clear_stack_busy(index: usize) {
+    STACK_BUSY[index].store(false, Ordering::Release);
+}
+
 /// Reserves the next `Pid`: the index of the lowest currently-empty slot
 /// in the process table, so a terminated process's slot is available for
 /// reuse rather than the table filling up after `MAX_PROCESSES`
@@ -155,7 +192,10 @@ pub fn allocate_pid() -> Pid {
     let index = sched
         .processes
         .iter()
-        .position(|slot| matches!(slot, Slot::Empty))
+        .enumerate()
+        .position(|(i, slot)| {
+            matches!(slot, Slot::Empty) && !STACK_BUSY[i].load(Ordering::Acquire)
+        })
         .unwrap_or(MAX_PROCESSES);
     if index >= MAX_PROCESSES {
         return Pid::new(MAX_PROCESSES, 0);
@@ -305,6 +345,37 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     // the syscall entry trampoline needs its own record of "the current
     // kernel stack," read directly rather than via the TSS.
     crate::arch::x86_64::syscall::set_syscall_kernel_stack(kernel_stack_top);
+
+    // Validates the frame about to be handed back for an eventual
+    // `iretq` (either via `context_switch::resume` or an interrupt
+    // entry stub's own inline tail -- both trust this blindly, since
+    // neither has enough context to sanity-check it itself). Every
+    // resumed process's saved frame must describe a genuine,
+    // already-validated ring-3 return: `cs` was set once, either by
+    // `TrapFrame::initial_user_frame` or captured directly by hardware
+    // from a real ring-3 trap, and `rip` must be a canonical lower-half
+    // (user) address, never a canonical-upper-half kernel address or a
+    // non-canonical one. Exists to turn a still-unresolved, real
+    // cross-core corruption bug (see `docs/adr/0012`) from a mysterious
+    // fault at a garbage address, possibly on a totally different core
+    // and much later, into an immediate, attributable panic naming
+    // exactly which process's saved frame was already bad *before* this
+    // core ever tried to resume it.
+    let user_cs = gdt::selectors().user_code.0 as u64;
+    let frame = &process.trap_frame;
+    assert_eq!(
+        frame.cs, user_cs,
+        "switch_to: {pid:?}'s saved trap frame has cs={:#x}, expected the ring-3 code \
+         selector {user_cs:#x} -- corrupted before this core ever touched it (rip={:#x}, \
+         rsp={:#x})",
+        frame.cs, frame.rip, frame.rsp
+    );
+    assert!(
+        frame.rip < 0x0000_8000_0000_0000,
+        "switch_to: {pid:?}'s saved trap frame has rip={:#x}, outside the canonical user \
+         address range -- corrupted before this core ever touched it (cs={:#x}, rsp={:#x})",
+        frame.rip, frame.cs, frame.rsp
+    );
 
     (
         &mut process.trap_frame as *mut TrapFrame,
@@ -621,11 +692,26 @@ fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! 
 /// a `&'static str` it already had. `SCHEDULER` must actually still be
 /// locked by the caller that jumped here -- true for
 /// [`abandon_process_stack_and_idle`]'s one call site.
-extern "C" fn idle_loop_trampoline(core: u64, msg_ptr: *const u8, msg_len: u64) -> ! {
+extern "C" fn idle_loop_trampoline(
+    core: u64,
+    msg_ptr: *const u8,
+    msg_len: u64,
+    outgoing_index_or_sentinel: u64,
+) -> ! {
     let halt_message: &'static str =
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg_ptr, msg_len as usize)) };
     // SAFETY: see this function's own doc comment.
     unsafe { SCHEDULER.force_unlock() };
+    // The raw `mov rsp, {top}` just above this call is what actually
+    // stopped this core from using the outgoing process's kernel stack
+    // -- unlike `finish_switch`'s equivalent (which still has real work
+    // left to do on that stack after `switch_to` returns), by the time
+    // this function is even running, the switch has already happened.
+    // Safe to clear immediately, before anything else. See
+    // `STACK_BUSY`'s own doc comment.
+    if outgoing_index_or_sentinel != usize::MAX as u64 {
+        clear_stack_busy(outgoing_index_or_sentinel as usize);
+    }
     activate_idle_address_space();
     idle_loop_on_own_stack(core as usize, Some(halt_message))
 }
@@ -683,10 +769,17 @@ extern "C" fn idle_loop_trampoline(core: u64, msg_ptr: *const u8, msg_len: u64) 
 /// this stack's fixed address until [`idle_loop_trampoline`] releases the
 /// lock from the safe side of the switch. See
 /// `docs/adr/0010-cross-core-scheduling.md`.
-fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! {
+fn abandon_process_stack_and_idle(
+    core: usize,
+    halt_message: &'static str,
+    outgoing_index: Option<usize>,
+) -> ! {
     let idle_top = crate::arch::x86_64::smp::idle_stack_top_addr(core).as_u64();
     let msg_ptr = halt_message.as_ptr();
     let msg_len = halt_message.len() as u64;
+    // `usize::MAX` as a sentinel for "no busy index to clear" -- never a
+    // real table index (`MAX_PROCESSES` is nowhere near `usize::MAX`).
+    let outgoing_index_or_sentinel = outgoing_index.unwrap_or(usize::MAX) as u64;
     unsafe {
         core::arch::asm!(
             "mov rsp, {top}",
@@ -696,6 +789,7 @@ fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! 
             in("rdi") core as u64,
             in("rsi") msg_ptr,
             in("rdx") msg_len,
+            in("rcx") outgoing_index_or_sentinel,
             options(noreturn),
         );
     }
@@ -751,12 +845,22 @@ fn abandon_process_stack_and_idle(core: usize, halt_message: &'static str) -> ! 
 /// lock, so none of them can run until [`idle_loop_trampoline`] releases
 /// it from the safe side of the switch, once this core is no longer
 /// using the stack at all. See `docs/adr/0010-cross-core-scheduling.md`.
+/// `outgoing_index` names a process-table slot [`mark_stack_busy`] was
+/// just called for (this core just finalized or evicted its occupant,
+/// still running on that same, now-reuse-eligible index's kernel stack)
+/// — `None` for a caller that merely *blocked* the outgoing process
+/// (`block_current_process`/`wait_for_child`'s `MustBlock` arm), which
+/// stays `Slot::Occupied` and so was never marked busy in the first
+/// place. Whichever exit path this function takes clears it once this
+/// core has genuinely finished with that stack — see [`STACK_BUSY`]'s
+/// own doc comment.
 fn switch_to_next_or_halt(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     halt_message: &'static str,
+    outgoing_index: Option<usize>,
 ) -> *mut TrapFrame {
     if let Some(next_pid) = sched.ready.pop() {
-        return finish_switch(sched, next_pid);
+        return finish_switch(sched, next_pid, outgoing_index);
     }
 
     // No `drop(sched)` here -- see this function's doc comment.
@@ -765,7 +869,7 @@ fn switch_to_next_or_halt(
     // doc comment documents and relies on exactly this), so `SCHEDULER`
     // stays locked until `idle_loop_trampoline` releases it.
     core::mem::forget(sched);
-    abandon_process_stack_and_idle(percpu::core_index(), halt_message);
+    abandon_process_stack_and_idle(percpu::core_index(), halt_message, outgoing_index);
 }
 
 /// The BSP's own first entry, right after `main.rs` spawns `init`, and
@@ -781,11 +885,27 @@ pub fn ap_enter_scheduler() -> ! {
     idle_loop_on_own_stack(percpu::core_index(), None)
 }
 
-fn finish_switch(mut sched: crate::sync::SpinLockGuard<'_, Inner>, next_pid: Pid) -> *mut TrapFrame {
+fn finish_switch(
+    mut sched: crate::sync::SpinLockGuard<'_, Inner>,
+    next_pid: Pid,
+    outgoing_index: Option<usize>,
+) -> *mut TrapFrame {
     let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
     drop(sched);
     maybe_print_switch(next_pid, rax, rbx);
+    // Still running on `outgoing_index`'s own kernel stack all the way
+    // through here (this function never switches stacks itself — only
+    // the raw `iretq` in the caller's entry-stub tail, after this
+    // returns, does that) — `run_ready_tasks` in particular can do
+    // real, unbounded work (polling arbitrary kernel tasks). Clearing
+    // the busy marker only *after* it returns, not before, is what
+    // keeps `allocate_pid` from handing this index to a brand-new
+    // process while this core might still touch it. See
+    // `STACK_BUSY`'s own doc comment.
     crate::task::executor::run_ready_tasks();
+    if let Some(index) = outgoing_index {
+        clear_stack_busy(index);
+    }
     frame_ptr
 }
 
@@ -954,10 +1074,20 @@ pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
         sched.current[percpu::core_index()]
     };
     if let Some(pid) = current {
+        // Marked *before* `terminate_slot` runs (which is what actually
+        // makes this index reusable, via `take_and_finalize_slot`) --
+        // this core is about to keep running, on this exact stack,
+        // through everything `switch_to_next_or_halt` below still does.
+        // See `STACK_BUSY`'s own doc comment.
+        mark_stack_busy(pid.index());
         terminate_slot(pid, status);
     }
     let sched = SCHEDULER.lock();
-    switch_to_next_or_halt(sched, "[sched] last process exited, halting.")
+    switch_to_next_or_halt(
+        sched,
+        "[sched] last process exited, halting.",
+        current.map(|pid| pid.index()),
+    )
 }
 
 /// Called from the `SYS_EXIT` syscall path: exiting voluntarily is
@@ -1143,8 +1273,19 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         drop(sched);
         return current_frame;
     }
+    let evicted_pid = Pid(evict);
     set_current(&mut sched, core, None);
-    switch_to_next_or_halt(sched, "[sched] evicted core found nothing else ready, halting.")
+    // Same reasoning as `terminate_current_process`: this core is about
+    // to keep running, on `evicted_pid`'s own kernel stack, through
+    // everything `switch_to_next_or_halt` below still does, even though
+    // `terminate_process` (spinning on another core) is about to see
+    // `current[core]` cleared and finalize this slot. See `STACK_BUSY`.
+    mark_stack_busy(evicted_pid.index());
+    switch_to_next_or_halt(
+        sched,
+        "[sched] evicted core found nothing else ready, halting.",
+        Some(evicted_pid.index()),
+    )
 }
 
 /// `SYS_WAIT`'s implementation. If `target` (a child of `caller`) has
@@ -1212,7 +1353,11 @@ pub fn wait_for_child(current_frame: *mut TrapFrame, target: Pid, caller: Pid) -
                 process.wait_waiter = Some(caller);
             }
             block_current_process_locked(&mut sched, current_frame);
-            switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
+            switch_to_next_or_halt(
+                sched,
+                "[sched] every process blocked or exited, halting.",
+                None,
+            )
         }
         Outcome::Invalid => {
             drop(sched);
@@ -1410,7 +1555,11 @@ fn block_current_process_locked(sched: &mut Inner, current_frame: *mut TrapFrame
 pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
     block_current_process_locked(&mut sched, current_frame);
-    switch_to_next_or_halt(sched, "[sched] every process blocked or exited, halting.")
+    switch_to_next_or_halt(
+        sched,
+        "[sched] every process blocked or exited, halting.",
+        None,
+    )
 }
 
 /// Starts running processes on the BSP: called exactly once, from boot

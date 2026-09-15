@@ -110,6 +110,16 @@ pub fn slot(index: usize) -> &'static PerCpuSlot {
     &SLOTS[index]
 }
 
+/// Whether [`assign_slot`] has ever claimed `index` for a real core —
+/// i.e. whether sending that core an IPI is meaningful at all, rather
+/// than addressing a never-booted (or never-existing, if Limine reported
+/// fewer than [`MAX_CORES`] CPUs) slot. See
+/// `arch::x86_64::lapic::broadcast_panic_halt`, the one caller that needs
+/// to reach *every* real core rather than a specific known-booted one.
+pub fn is_booted(index: usize) -> bool {
+    SLOTS[index].lapic_id() != UNASSIGNED
+}
+
 /// This core's own local APIC ID, read fresh via `CPUID` — exposed for
 /// `smp::bring_up_aps`'s fallback path when Limine didn't honor
 /// `MP_REQUEST` at all (so there is no `MpRespData::bsp_lapic_id` to
