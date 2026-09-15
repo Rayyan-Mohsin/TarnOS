@@ -52,6 +52,29 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Non-blocking [`lock`](Self::lock): `None` if the lock is currently
+    /// held, without spinning. Restores interrupts to however they were
+    /// found on a failed attempt -- unlike a successful one, there is no
+    /// `SpinLockGuard` left alive to do that later.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        let interrupts_were_enabled = interrupts::are_enabled();
+        if interrupts_were_enabled {
+            interrupts::disable();
+        }
+        match self.inner.try_lock() {
+            Some(guard) => Some(SpinLockGuard {
+                guard: Some(guard),
+                interrupts_were_enabled,
+            }),
+            None => {
+                if interrupts_were_enabled {
+                    interrupts::enable();
+                }
+                None
+            }
+        }
+    }
+
     /// Releases this lock without going through the `SpinLockGuard` that
     /// took it — for the one case where that guard can't be carried to
     /// where it would normally be dropped: a caller that takes this lock,
@@ -75,6 +98,33 @@ impl<T> SpinLock<T> {
     /// see `idt::init`) and never re-enables them before calling this, so
     /// unlike `SpinLockGuard::drop`, this never needs to restore them.
     pub unsafe fn force_unlock(&self) {
+        unsafe { self.inner.force_unlock() };
+    }
+
+    /// Forcibly clears this lock's held state regardless of who -- if
+    /// anyone -- actually holds it right now. Unlike [`force_unlock`]
+    /// (whose contract requires the *caller* to hold the lock, for the
+    /// raw-stack-switch case above), this is for the opposite,
+    /// significantly more dangerous situation: suspecting the lock is
+    /// permanently orphaned by a *different* context that will never run
+    /// again to release it, and needing in anyway. See
+    /// `earlycon::panic_println`'s doc comment for the one legitimate
+    /// caller and the incident that motivated it (a page fault striking
+    /// mid-print, on the same core, while this exact lock was held for
+    /// an ordinary, unrelated `earlyprintln!` call -- orphaning it
+    /// forever, since a hardware fault jumps to a new handler without
+    /// ever running the interrupted frame's `Drop`).
+    ///
+    /// # Safety
+    /// Only ever call this when correctness no longer depends on this
+    /// lock's mutual exclusion actually holding for the data it guards --
+    /// i.e. from an unrecoverable-panic path, for a lock (like
+    /// `earlycon::COM1_TX_LOCK`) whose worst-case violation is corrupted
+    /// *output*, never memory unsafety. Calling this on a lock some other
+    /// context is still genuinely, correctly holding lets both writers
+    /// proceed concurrently against `T` -- fine for `EarlyCon`'s raw port
+    /// write, a data race for almost anything else.
+    pub unsafe fn break_lock(&self) {
         unsafe { self.inner.force_unlock() };
     }
 }

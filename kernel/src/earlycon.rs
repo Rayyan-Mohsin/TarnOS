@@ -67,6 +67,46 @@ pub fn _println(args: fmt::Arguments) {
     let _ = EarlyCon.write_str("\r\n");
 }
 
+/// `lang_items::panic`'s own print, in place of [`_println`]: bounded
+/// spin, then forces `COM1_TX_LOCK` open rather than waiting forever.
+///
+/// `arch::x86_64::lapic::broadcast_panic_halt` (which `panic` calls
+/// before this) stops every *other* core from ever contending for this
+/// lock again, but cannot help against this *same* core still, in
+/// effect, holding it -- caught live via GDB: a page fault struck this
+/// exact core mid-write of an ordinary, unrelated `earlyprintln!` call,
+/// jumping straight to `idt::page_fault_ring0` without ever running the
+/// interrupted frame's `Drop`, so its `COM1_TX_LOCK` guard never
+/// released. `panic`'s own first `earlyprintln!` then hung here forever
+/// -- indistinguishable, from the serial log alone, from the machine
+/// silently dying before printing anything at all. A bounded spin still
+/// prefers the correct, non-interleaved outcome when this really is
+/// just ordinary cross-core contention (the common case), and only
+/// forces the issue once that stops being plausible.
+pub fn panic_println(args: fmt::Arguments) {
+    const MAX_SPINS: u64 = 10_000_000;
+    let mut guard = COM1_TX_LOCK.try_lock();
+    let mut spins = 0u64;
+    while guard.is_none() && spins < MAX_SPINS {
+        core::hint::spin_loop();
+        spins += 1;
+        guard = COM1_TX_LOCK.try_lock();
+    }
+    if guard.is_none() {
+        // SAFETY: see `SpinLock::break_lock`'s doc comment -- this is
+        // exactly its one sanctioned caller. Correctness from here on
+        // depends only on `EarlyCon`'s raw port write, never on
+        // `COM1_TX_LOCK` genuinely excluding a still-live writer; the
+        // worst case is an interleaved, still-diagnosable line instead
+        // of silence forever.
+        unsafe { COM1_TX_LOCK.break_lock() };
+        guard = COM1_TX_LOCK.try_lock();
+    }
+    let _guard = guard;
+    let _ = EarlyCon.write_fmt(args);
+    let _ = EarlyCon.write_str("\r\n");
+}
+
 #[macro_export]
 macro_rules! earlyprint {
     ($($arg:tt)*) => {

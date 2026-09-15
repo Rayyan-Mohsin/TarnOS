@@ -49,19 +49,26 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    earlyprintln!();
+    // `panic_println`, not `earlyprintln!`/`_println`: the broadcast
+    // above only protects *other* cores from `COM1_TX_LOCK` being
+    // orphaned. This exact core can *also* have orphaned it, on itself,
+    // an instant ago -- an ordinary, unrelated `earlyprintln!` call
+    // interrupted mid-write by the very fault that led here, its guard
+    // never dropped. See `earlycon::panic_println`'s doc comment for the
+    // live-GDB-caught incident this closes.
+    crate::earlycon::panic_println(format_args!(""));
     if let Some(location) = info.location() {
-        earlyprintln!(
+        crate::earlycon::panic_println(format_args!(
             "[KERNEL PANIC] {}:{}:{}: {}",
             location.file(),
             location.line(),
             location.column(),
             info.message()
-        );
+        ));
     } else {
-        earlyprintln!("[KERNEL PANIC] {}", info.message());
+        crate::earlycon::panic_println(format_args!("[KERNEL PANIC] {}", info.message()));
     }
-    earlyprintln!("halting.");
+    crate::earlycon::panic_println(format_args!("halting."));
 
     loop {
         unsafe {
