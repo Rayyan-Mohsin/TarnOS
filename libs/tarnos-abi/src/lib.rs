@@ -251,6 +251,14 @@ pub enum SyscallError {
     /// this milestone), would overflow the break address, or would grow
     /// the heap past its fixed per-process ceiling.
     InvalidArgument = 8,
+    /// A blocked `SYS_SEND`/`SYS_RECV` was woken because the endpoint's
+    /// last remaining live holder of the complementary right (the only
+    /// process that could ever have completed this rendezvous) exited or
+    /// was killed while this call was still blocked — never returned for
+    /// any other reason. Without this, that call would otherwise block
+    /// forever: nothing else was ever going to send or receive on this
+    /// endpoint again. See `docs/adr/0013`.
+    PeerClosed = 9,
 }
 
 impl SyscallError {
@@ -281,6 +289,7 @@ impl SyscallError {
             6 => SyscallError::InvalidTarget,
             7 => SyscallError::SpawnFailed,
             8 => SyscallError::InvalidArgument,
+            9 => SyscallError::PeerClosed,
             _ => SyscallError::NoSuchSyscall,
         }
     }
@@ -406,6 +415,7 @@ mod proptests {
             SyscallError::InvalidTarget,
             SyscallError::SpawnFailed,
             SyscallError::InvalidArgument,
+            SyscallError::PeerClosed,
         ];
         for err in variants {
             assert_eq!(SyscallError::from_retval(err.as_retval()), err);

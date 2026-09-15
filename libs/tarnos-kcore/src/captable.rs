@@ -68,6 +68,16 @@ impl<T> CapTable<T> {
             Err(SyscallError::PermissionDenied)
         }
     }
+
+    /// Every occupied slot this table currently holds, in index order.
+    /// For a caller that needs to inspect *what* a table references
+    /// (e.g. a dying process's own capabilities, to find anyone still
+    /// waiting on an object only it could ever have sent to — see
+    /// `tarnos-kernel`'s `wake_orphaned_receivers`), not just look one
+    /// slot up by index.
+    pub fn iter(&self) -> impl Iterator<Item = &CapabilitySlot<T>> {
+        self.slots.iter().filter_map(|slot| slot.as_ref())
+    }
 }
 
 impl<T> Default for CapTable<T> {

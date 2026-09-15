@@ -12,16 +12,18 @@
 //! allocates a small, bounded `Vec` (see [`terminate_slot`]) for the
 //! same reason — never from interrupt context.
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Once;
-use tarnos_abi::ExitStatus;
+use tarnos_abi::{ExitStatus, Rights};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::context_switch::TrapFrame;
 use crate::arch::x86_64::percpu::{self, MAX_CORES};
 use crate::arch::x86_64::{gdt, lapic};
+use crate::ipc::{Endpoint, KernelObjectRef};
 use crate::memory::virt::AddressSpace;
 use crate::sync::SpinLock;
 
@@ -1053,7 +1055,83 @@ fn terminate_slot(pid: Pid, status: ExitStatus) {
         let mut sched = SCHEDULER.lock();
         take_and_finalize_slot(&mut sched, pid, status, &mut pending_drops);
     }
+    wake_orphaned_receivers(&pending_drops);
     drop(pending_drops); // outside the lock: frees every AddressSpace's frames
+}
+
+/// For each of `dying`'s own capabilities, wakes any process still
+/// blocked in `SYS_RECV` on an endpoint this was the *last* remaining
+/// live sender for — without this, that receiver blocks forever: once a
+/// process dies, only its own `Drop` ever ran, and nothing ever walked
+/// the *other* side of a rendezvous it might have been about to
+/// complete. Reproduced via `test-kitchen-sink`'s own IPC orchestrator
+/// hanging in `SYS_RECV` after `echo-child` faulted (killed by the
+/// ordinary ring-3 fault-isolation path, `docs/adr/0005`) before ever
+/// replying — a real, general IPC gap this closes, independent of
+/// whatever causes `echo-child` to fault in the first place. See
+/// `docs/adr/0013`.
+///
+/// Deliberately the receive side only, not send-side-symmetric: the
+/// reverse (a blocked `SYS_SEND`'s only possible *receiver* dies first)
+/// would need selectively draining `Waiter::Process` entries out of the
+/// middle of `ipc::endpoint::Slot`'s `SendersWaiting` ring buffer while
+/// preserving any interleaved `Waiter::Task` ones and delivery order —
+/// real, but unobserved in this codebase's own usage (every current
+/// caller has its receiver already alive and waiting *before* the
+/// sender ever calls `SYS_SEND`) — deferred rather than guessed at.
+///
+/// Must run with `SCHEDULER` *not* held — called only from
+/// `terminate_slot`/`terminate_process`, after their own `SCHEDULER`
+/// guard has already been dropped, mirroring `pending_drops`'s own
+/// established "finish the `SCHEDULER`-locked bookkeeping first, do the
+/// rest after releasing it" shape. Two passes, deliberately never
+/// nesting `SCHEDULER` with `ipc::Endpoint`'s own lock — a lock-ordering
+/// rule this codebase has never needed until now, and this function
+/// doesn't introduce one either (see `Endpoint::take_waiting_process_receiver`'s
+/// doc comment):
+/// 1. `SCHEDULER` locked: for each of `dying`'s `SEND`-rights endpoint
+///    references, check whether any *other* currently-occupied process
+///    also holds a `SEND`-rights reference to the exact same
+///    `Arc<Endpoint>` (`Arc::ptr_eq`). Collect the ones with none left.
+/// 2. `SCHEDULER` unlocked, per orphaned endpoint: take its waiting
+///    process-receiver, if any, and wake it with `PeerClosed`.
+///
+/// No correctness gap between the two passes: this kernel has no way to
+/// *revoke* a capability once granted (only a whole process dying ever
+/// removes one, via `SYS_GRANT`'s one-shot, parent-to-suspended-child
+/// transfer), so the set of live senders can only ever keep shrinking
+/// after pass 1 confirms it's already empty — never grow back in the
+/// gap before pass 2 runs.
+fn wake_orphaned_receivers(dying: &[Box<Process>]) {
+    let mut orphaned: Vec<Arc<Endpoint>> = Vec::new();
+    {
+        let sched = SCHEDULER.lock();
+        for process in dying {
+            for slot in process.cap_table.iter() {
+                if !slot.rights.contains(Rights::SEND) {
+                    continue;
+                }
+                let KernelObjectRef::Endpoint(endpoint) = &slot.object;
+                let still_has_a_live_sender = sched.processes.iter().any(|table_slot| {
+                    let Slot::Occupied(other) = table_slot else {
+                        return false;
+                    };
+                    other.cap_table.iter().any(|other_slot| {
+                        other_slot.rights.contains(Rights::SEND)
+                            && matches!(&other_slot.object, KernelObjectRef::Endpoint(e) if Arc::ptr_eq(e, endpoint))
+                    })
+                });
+                if !still_has_a_live_sender {
+                    orphaned.push(endpoint.clone());
+                }
+            }
+        }
+    }
+    for endpoint in orphaned {
+        if let Some(pid) = endpoint.take_waiting_process_receiver() {
+            wake_blocked_process(pid, WakeResult::PeerClosed);
+        }
+    }
 }
 
 /// Drops the calling process (no frame to preserve — it isn't coming
@@ -1186,10 +1264,12 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
                 }
             }
         };
-        // Outside the lock, exactly like `terminate_slot`: frees every
-        // finalized `AddressSpace`'s physical frames, a variable-length
-        // operation this codebase's convention keeps off the lock's
-        // critical path.
+        // Outside the lock, exactly like `terminate_slot`: wakes any
+        // receiver only `target` could ever have sent to, then frees
+        // every finalized `AddressSpace`'s physical frames -- both
+        // variable-length operations this codebase's convention keeps
+        // off the lock's critical path.
+        wake_orphaned_receivers(&pending_drops);
         drop(pending_drops);
 
         let Some(core) = owning_core else {
@@ -1404,6 +1484,10 @@ pub enum WakeResult {
     RecvCompleted { tag: u64, words: [u64; 3] },
     /// A blocked `SYS_WAIT` caller's target just terminated.
     WaitCompleted(ExitStatus),
+    /// A blocked `SYS_RECV` was woken because the last process that
+    /// could ever have sent to it just died — see
+    /// [`wake_orphaned_receivers`].
+    PeerClosed,
 }
 
 /// Writes a blocked process's saved registers for whatever just
@@ -1428,6 +1512,9 @@ fn apply_wake_result(process: &mut Process, result: WakeResult) {
             process.trap_frame.rax = 0;
             process.trap_frame.rdi = kind;
             process.trap_frame.rsi = code;
+        }
+        WakeResult::PeerClosed => {
+            process.trap_frame.rax = tarnos_abi::SyscallError::PeerClosed.as_retval() as u64;
         }
     }
     process.state = ProcessState::Ready;

@@ -177,6 +177,32 @@ impl Endpoint {
     pub fn recv(&self) -> RecvFuture<'_> {
         RecvFuture { endpoint: self }
     }
+
+    /// Takes this endpoint's currently-waiting receiver, but only if
+    /// it's a `Waiter::Process` — a `Waiter::Task` (a kernel task's own
+    /// async `.recv()`, e.g. `console_server`) is left completely
+    /// untouched, since a process dying should never disturb a kernel
+    /// task's unrelated wait. `None` if no receiver is waiting at all,
+    /// or the one waiting is a task.
+    ///
+    /// The one caller, `task::scheduler::wake_orphaned_receivers`, only
+    /// calls this once it has already confirmed — via a separate scan of
+    /// every other live process's own capabilities, deliberately done
+    /// *without* holding this endpoint's lock — that no other process
+    /// still holds a `SEND`-rights reference to this exact endpoint. See
+    /// that function's own doc comment for why the two checks are split
+    /// into separate passes rather than done under one lock.
+    pub fn take_waiting_process_receiver(&self) -> Option<Pid> {
+        let mut slot = self.slot.lock();
+        match &*slot {
+            Slot::ReceiverWaiting(Waiter::Process(pid)) => {
+                let pid = *pid;
+                *slot = Slot::Empty;
+                Some(pid)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for Endpoint {
