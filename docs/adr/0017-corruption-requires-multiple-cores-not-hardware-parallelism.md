@@ -66,22 +66,30 @@ core" check can never find one, so it always takes the trivial
 same-core-finalize path, never exercising the IPI/eviction protocol at all.
 That made it the first suspect.
 
-Two temporary, uncommitted experiments (spawning `test-kitchen-sink`'s
-process set with one orchestrator's spawn code deleted, then reverted) at
+Three temporary, uncommitted experiments (spawning `test-kitchen-sink`'s
+process set with one workload's spawn code deleted, then reverted) at
 `-smp 4`, 40 runs each, counting genuine `[KERNEL PANIC]` occurrences only:
 
 - **Kill orchestrator removed:** 10/40 panicked (25%).
 - **Heap orchestrator removed:** 7/40 panicked (17.5%).
+- **Both background `SYS_YIELD`-pressure processes removed** (IPC, heap,
+  lifecycle, and kill orchestrators all still present): 6/40 panicked
+  (15%) — pressure alone contributes about as much as heap does, and
+  removing it still leaves a substantial rate.
 
-Neither removal comes close to eliminating the panics. This rules out "the
-bug lives entirely in the `SYS_KILL` eviction protocol" and "the bug lives
-entirely in `sys_sbrk`'s heap-growth path" as complete explanations —
-removing either still leaves a substantial, genuine panic rate driven by
-whatever combination of IPC, lifecycle, and pressure remains. This is more
-consistent with either a shared underlying mechanism triggered by general
-scheduling pressure across multiple cores (not specific to any one
-syscall), or more than one independent bug, than with a single defect
-isolated to one workload.
+No single removal comes close to eliminating the panics, and no removal's
+effect stands out as dominant — kill, heap, and pressure each account for
+roughly the same order-of-magnitude share (15–25%) on their own. This
+argues against a defect isolated to any one workload's own syscall logic,
+and *for* a shared mechanism every workload exercises identically: the
+scheduler's own per-core dispatch loop (`scheduler::on_timer_tick` →
+`switch_to`, driven by every core's independent LAPIC timer against the
+one shared ready queue). That mechanism is the one thing structurally
+common to every remaining configuration in this table — IPC and lifecycle
+alone (kill, heap, *and* pressure all removed) were not yet tested in
+isolation, but every experiment so far is consistent with the bug living
+in how multiple cores' independent timer-driven dispatch loops interact
+with the shared scheduler state, not in any individual syscall handler.
 
 ## Two more hypotheses checked directly and ruled out this round
 
