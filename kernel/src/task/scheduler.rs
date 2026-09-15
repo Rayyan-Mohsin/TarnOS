@@ -120,21 +120,38 @@ static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 /// lifetime.
 const TRACE_LEN: usize = 24;
 
-/// Every [`set_current`] call, across every core, draws the next value
-/// from this counter — so two entries recorded on *different* cores can
-/// still be placed in a single, total, cross-core order after the fact
-/// (`Inner.current`'s own per-core arrays and even [`dump_cores_for_panic`]'s
-/// snapshot can only ever show each core's state at one instant, never
-/// the interleaving that produced it).
-static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// One core's ring buffer of its own last [`TRACE_LEN`] `set_current`
 /// calls: parallel `seq`/`pid_raw` arrays (an `AtomicU64` pair per slot,
 /// rather than one struct behind one atomic, since no hardware width
 /// covers both fields at once) plus a monotonic per-core write cursor
-/// that a slot index is derived from via `% TRACE_LEN`. `pid_raw == 0`
-/// means `set_current(.., None)` — matches `percpu::PerCpuSlot.current`'s
-/// own "0 means nothing running" convention, unambiguous since a real
+/// that a slot index is derived from via `% TRACE_LEN`. `seq` is each
+/// core's own `RDTSC` reading at record time, not a shared counter — an
+/// earlier version used one global `AtomicU64::fetch_add` shared by every
+/// core, on the theory that the cross-core cache-line contention a
+/// shared, contended read-modify-write adds to every dispatch transition
+/// was what made that version measurably suppress this very bug's own
+/// reproduction rate (105/105 clean runs at `-smp 4`, against an
+/// established ~50% baseline without any tracing at all). Switching to a
+/// plain per-core `RDTSC` read — no shared cache line, no atomic
+/// read-modify-write, nothing but a register read — did *not* restore
+/// the baseline rate either (still 0/40 clean at the same config,
+/// verified after this change). That rules the contention theory out:
+/// what actually suppresses the bug is that `set_current` runs under
+/// `SCHEDULER`'s own lock, so *any* extra instructions here (this
+/// function's, however cheap) lengthen that lock's critical section on
+/// every scheduling event system-wide, not just this one call — which is
+/// apparently enough, given how narrow this race already is (see
+/// `docs/adr/0017`'s scaling table). This is left in anyway: it's a
+/// correct, harmless, genuinely useful permanent diagnostic for whatever
+/// it *can* still catch (any panic under a lighter workload, or once a
+/// future fix attempt needs to confirm which core did what), it's simply
+/// not usable to catch *this specific* bug in the act at this specific
+/// stress level — see `docs/adr/0017`'s own note on why that also means
+/// any future fix attempt that happens to add overhead to a
+/// `SCHEDULER`-locked path cannot be trusted just because
+/// `test-kitchen-sink` starts passing more. `pid_raw == 0` means
+/// `set_current(.., None)` — matches `percpu::PerCpuSlot.current`'s own
+/// "0 means nothing running" convention, unambiguous since a real
 /// `Pid`'s generation half is bumped to at least 1 before its first use
 /// (see `allocate_pid`).
 ///
@@ -171,7 +188,9 @@ static DISPATCH_TRACE: [DispatchTrace; MAX_CORES] = [const { DispatchTrace::new(
 /// automatically, with no risk of a future new call site forgetting to
 /// instrument itself.
 fn record_dispatch_trace(core: usize, pid: Option<Pid>) {
-    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `RDTSC` is unconditionally available on every x86_64 CPU
+    // this kernel targets; reading it has no preconditions.
+    let seq = unsafe { core::arch::x86_64::_rdtsc() };
     let slot = DISPATCH_TRACE[core].cursor.fetch_add(1, Ordering::Relaxed) % TRACE_LEN;
     DISPATCH_TRACE[core].pid_raw[slot].store(pid.map_or(0, |p| p.0), Ordering::Relaxed);
     DISPATCH_TRACE[core].seq[slot].store(seq, Ordering::Release);
