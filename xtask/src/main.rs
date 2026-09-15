@@ -43,6 +43,9 @@ fn main() {
         "test-smp-sched-stress" => test_smp_sched_stress(),
         "test-smp-send-cross-core" => test_smp_send_cross_core(),
         "test-smp-forced-preempt" => test_smp_forced_preempt(),
+        // Milestone 9, in progress -- deliberately not part of `test-all`
+        // yet, see its own function doc comment.
+        "test-kitchen-sink" => test_kitchen_sink(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
             .and_then(|_| test_blocking_ipc())
@@ -135,6 +138,9 @@ fn print_usage() {
          \x20 test-smp-forced-preempt     Confirm a process making zero syscalls is still\n\
          \x20                    preempted by its own core's LAPIC timer, an ordinary process\n\
          \x20                    still runs alongside it, and SYS_KILL still evicts it (-smp 4)\n\
+         \x20 test-kitchen-sink            Milestone 9, in progress: IPC, heap growth,\n\
+         \x20                    process lifecycle, and cross-core kill running concurrently\n\
+         \x20                    (-smp 4) -- not yet reliable enough for test-all/CI\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -1435,6 +1441,65 @@ fn test_smp_forced_preempt() -> Result<(), String> {
         "xtask: test-smp-forced-preempt PASSED — a never-syscalling process was genuinely \
          preempted by its own core's LAPIC timer, an ordinary process still ran alongside it, \
          and SYS_KILL still evicted it despite it never cooperating"
+    );
+    Ok(())
+}
+
+/// Milestone 9's combined "kitchen sink" scenario: builds the kernel
+/// with the `kitchen-sink-test` feature and boots it at `-smp 4` with
+/// several small orchestrator processes running concurrently, each
+/// driving a *different*, already-proven-solid workload rather than in
+/// isolation -- an IPC round trip via `echo-child`, heap growth via
+/// `heap-child`, a bounded spawn+wait lifecycle loop via
+/// `exit-code-child`, a kill-mid-flight orchestrator against a
+/// never-yielding target, and background `SYS_YIELD` pressure processes
+/// keeping every core genuinely busy throughout.
+///
+/// Deliberately **not** part of `test-all`/CI yet: prototyping this
+/// scenario found and fixed two real cross-core bugs (see
+/// `docs/adr/0011`), but a further, deeper cross-core corruption issue
+/// remains under investigation (`docs/adr/0012`, once written) --
+/// intermittent kernel panics or process kills with a saved trap-frame
+/// RIP corrupted into what looks like a raw packed `Pid` value rather
+/// than a real code address. Kept as a standalone command so it can be
+/// run and iterated on directly while that's being root-caused, without
+/// making every `test-all`/CI run flaky in the meantime.
+fn test_kitchen_sink() -> Result<(), String> {
+    let log = run_scenario(&["kitchen-sink-test"], "kitchen-sink-test.log", 20, false, 4)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    // Underscore counts here match each orchestrator's own `WORD0`
+    // constant byte-for-byte (see `kitchen_sink_tests.rs`): "IPC" is 3
+    // letters, so `"KS_" + "IPC" + "_"` needs one more pad byte to fill
+    // the 8-byte word, giving a double underscore; "HEAP"/"LIFE"/"KILL"
+    // are each 4 letters, so `"KS_" + <word> + "_"` already fills all 8
+    // bytes with a single trailing underscore and no room for a second.
+    for (fail_marker, ok_marker, description) in [
+        ("KS_IPC__FAIL", "KS_IPC__OK", "the IPC round trip via echo-child"),
+        ("KS_HEAP_FAIL", "KS_HEAP_OK", "heap growth via heap-child"),
+        ("KS_LIFE_FAIL", "KS_LIFE_OK", "the exit-code-child lifecycle loop"),
+        ("KS_KILL_FAIL", "KS_KILL_OK", "the kill-mid-flight orchestrator"),
+    ] {
+        if log.contains(fail_marker) {
+            return Err(format!(
+                "kitchen-sink-test reported {fail_marker} -- {description} failed while running \
+                 concurrently with every other workload"
+            ));
+        }
+        if !log.contains(ok_marker) {
+            return Err(format!(
+                "expected \"{ok_marker}\" -- {description} never reported a result at all"
+            ));
+        }
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-kitchen-sink PASSED — IPC, heap growth, process lifecycle, and cross-core \
+         kill all held up correctly running concurrently under -smp 4"
     );
     Ok(())
 }

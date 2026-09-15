@@ -267,7 +267,30 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     set_current(sched, percpu::core_index(), Some(pid));
-    let process = match &mut sched.processes[pid.index()] {
+    let index = pid.index();
+    // Every other pid resolution in this module (`occupied_mut`,
+    // `wait_for_child`, `on_reschedule_ipi`) checks the table's current
+    // generation for this slot before trusting whatever's occupying it
+    // — `pid` alone (an attacker- or bug-controlled value elsewhere)
+    // never implies it still names the same process. `switch_to` is the
+    // one exception: every caller passes a `pid` freshly popped from
+    // `sched.ready`, which this module's own invariants should always
+    // keep in sync with the table's actual occupants, so this should
+    // never fire. Asserted anyway, defensively: silently trusting a
+    // stale entry here would mean genuinely running a *different*
+    // process's code and kernel stack under the wrong identity, not a
+    // clean, attributable failure — exactly the shape of a real,
+    // still-unresolved cross-core corruption bug under heavy
+    // concurrent load (see `docs/adr/0012`, once written).
+    assert_eq!(
+        sched.generations[index],
+        pid.generation(),
+        "switch_to: {pid:?} (slot {index}) does not match the table's current generation \
+         ({}) for that slot -- a stale ready-queue entry surviving a slot reuse, or a genuine \
+         cross-core scheduling race",
+        sched.generations[index]
+    );
+    let process = match &mut sched.processes[index] {
         Slot::Occupied(process) => process,
         _ => panic!("switch_to named a process that does not exist"),
     };

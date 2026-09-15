@@ -22,6 +22,7 @@ mod milestone4_tests;
 mod milestone5_tests;
 mod milestone7_tests;
 mod milestone8_tests;
+mod kitchen_sink_tests;
 mod sync;
 mod task;
 
@@ -1015,6 +1016,135 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(killer_process).expect("spawn failed");
 
         earlyprintln!("[boot] forced-preempt-test: spawned busy + ordinary + killer processes");
+        task::scheduler::start();
+    }
+
+    // Milestone 9's combined "kitchen sink" scenario: several small
+    // orchestrator processes, each driving a *different*,
+    // already-proven-solid workload concurrently rather than in
+    // isolation -- an IPC round trip via echo-child, heap growth via
+    // heap-child, a bounded spawn+wait lifecycle loop via
+    // exit-code-child, a kill-mid-flight orchestrator against a
+    // never-yielding target, and background SYS_YIELD pressure
+    // processes keeping every core genuinely busy throughout. Peak
+    // concurrent process-table usage stays comfortably under
+    // `task::scheduler::MAX_PROCESSES` (16). Never enabled for a normal
+    // build.
+    #[cfg(feature = "kitchen-sink-test")]
+    {
+        // Allocated and spawned first, with a placeholder `parent: None`
+        // -- same reasoning as `kill-cross-core-test`'s own boot code --
+        // so `kitchen_sink_tests::ks_kill_orchestrator`'s hardcoded
+        // `TARGET_PID` (table index 0, generation 1) is correct.
+        let kill_target_pid = task::scheduler::allocate_pid();
+        let kill_target_process = task::process::Process::new_dummy(
+            kill_target_pid,
+            kitchen_sink_tests::ks_kill_target_process,
+            None,
+        )
+        .expect("failed to create the kitchen-sink-test kill target process");
+        task::scheduler::spawn(kill_target_process).expect("spawn failed");
+
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let ipc_pid = task::scheduler::allocate_pid();
+        let mut ipc_process = task::process::Process::new_dummy(
+            ipc_pid,
+            kitchen_sink_tests::ks_ipc_orchestrator,
+            None,
+        )
+        .expect("failed to create the kitchen-sink-test IPC orchestrator");
+        ipc_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint.clone()),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        // The orchestrator's own link endpoint, reserved for talking to
+        // whatever child it spawns -- mirrors `tarnos_abi::CHILD_LINK_CAP`'s
+        // role for `init`, just seeded here instead of by the boot-module
+        // registry.
+        ipc_process.cap_table.insert(
+            tarnos_abi::CapIndex(1),
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(alloc::sync::Arc::new(ipc::Endpoint::new())),
+                rights: ipc::Rights::SEND | ipc::Rights::RECV,
+            },
+        );
+        task::scheduler::spawn(ipc_process).expect("spawn failed");
+
+        let heap_pid = task::scheduler::allocate_pid();
+        let mut heap_process = task::process::Process::new_dummy(
+            heap_pid,
+            kitchen_sink_tests::ks_heap_orchestrator,
+            None,
+        )
+        .expect("failed to create the kitchen-sink-test heap orchestrator");
+        heap_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint.clone()),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(heap_process).expect("spawn failed");
+
+        let lifecycle_pid = task::scheduler::allocate_pid();
+        let mut lifecycle_process = task::process::Process::new_dummy(
+            lifecycle_pid,
+            kitchen_sink_tests::ks_lifecycle_orchestrator,
+            None,
+        )
+        .expect("failed to create the kitchen-sink-test lifecycle orchestrator");
+        lifecycle_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint.clone()),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(lifecycle_process).expect("spawn failed");
+
+        let kill_orchestrator_pid = task::scheduler::allocate_pid();
+        task::scheduler::with_process(kill_target_pid, |p| p.parent = Some(kill_orchestrator_pid))
+            .expect("kitchen-sink-test kill target vanished before its parent could be set");
+        let mut kill_orchestrator_process = task::process::Process::new_dummy(
+            kill_orchestrator_pid,
+            kitchen_sink_tests::ks_kill_orchestrator,
+            None,
+        )
+        .expect("failed to create the kitchen-sink-test kill orchestrator");
+        kill_orchestrator_process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        task::scheduler::spawn(kill_orchestrator_process).expect("spawn failed");
+
+        // Background scheduling pressure: no capabilities needed at all,
+        // since these never do IPC -- just SYS_YIELD load spread across
+        // every core alongside the real workloads above. Two, not one
+        // per core (four): see `ks_pressure_process`'s own doc comment
+        // on why this is deliberately light background contention, not
+        // this scenario's own dominant workload.
+        for _ in 0..2 {
+            let pressure_pid = task::scheduler::allocate_pid();
+            let pressure_process = task::process::Process::new_dummy(
+                pressure_pid,
+                kitchen_sink_tests::ks_pressure_process,
+                None,
+            )
+            .expect("failed to create a kitchen-sink-test pressure process");
+            task::scheduler::spawn(pressure_process).expect("spawn failed");
+        }
+
+        earlyprintln!("[boot] kitchen-sink-test: spawned all orchestrator + pressure processes");
         task::scheduler::start();
     }
 

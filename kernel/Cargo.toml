@@ -128,6 +128,16 @@ smp-send-cross-core-test = []
 # whole time. Exercised by
 # `cargo run -p xtask -- test-smp-forced-preempt`.
 forced-preempt-test = []
+# Spawns several small orchestrator processes concurrently at -smp 4,
+# each driving a different, already-proven-solid workload rather than in
+# isolation: an IPC round trip via echo-child, heap growth via
+# heap-child, a bounded spawn+wait lifecycle loop via exit-code-child, a
+# kill-mid-flight orchestrator against a never-yielding target, and
+# background SYS_YIELD pressure processes keeping every core busy
+# throughout. Exercised by `cargo run -p xtask -- test-kitchen-sink`.
+# Milestone 9, in progress -- not yet reliable enough to be wired into
+# `test-all`/CI (see docs/adr/0011's Consequences).
+kitchen-sink-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
