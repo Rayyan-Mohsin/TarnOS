@@ -82,6 +82,37 @@ pub fn map(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFla
     })
 }
 
+/// Same operation as [`AddressSpace::map`], reachable from just a
+/// `pml4_frame` rather than a live `&AddressSpace` — for a caller that
+/// needs to release whatever lock is guarding the owning `Process`
+/// before doing this mapping (a `PhysFrame` is `Copy`, cheap to carry
+/// across that gap; see `arch::x86_64::syscall::sys_sbrk`, the one
+/// caller today, for why that matters).
+///
+/// # Safety
+/// `pml4_frame` must be a live `AddressSpace`'s own PML4 frame (i.e.
+/// obtained from [`AddressSpace::pml4_frame`]), and that `AddressSpace`
+/// must not be dropped while this call is in progress.
+pub unsafe fn map_in(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    let hhdm_offset = *HHDM_OFFSET
+        .get()
+        .expect("memory::virt::init() must run before map_in()");
+    // SAFETY: forwarded from this function's own safety contract --
+    // `pml4_frame` names a live, exclusively-owned PML4 table.
+    let table: &'static mut PageTable =
+        unsafe { &mut *phys_to_virt(pml4_frame.start_address()).as_mut_ptr() };
+    let mut mapper = unsafe { OffsetPageTable::new(table, hhdm_offset) };
+    let mut allocator = GlobalFrameAllocator;
+    unsafe { mapper.map_to(page, frame, flags, &mut allocator) }
+        .map(|flush| flush.flush())
+        .map_err(map_error_from)
+}
+
 /// Removes the mapping for `page`, returning the frame it was mapped to.
 /// Does not free the frame — callers that own the frame decide whether to
 /// return it to the allocator.
@@ -167,11 +198,10 @@ impl AddressSpace {
         frame: PhysFrame<Size4KiB>,
         flags: PageTableFlags,
     ) -> Result<(), MapError> {
-        let mut mapper = unsafe { self.mapper() };
-        let mut allocator = GlobalFrameAllocator;
-        unsafe { mapper.map_to(page, frame, flags, &mut allocator) }
-            .map(|flush| flush.flush())
-            .map_err(map_error_from)
+        // SAFETY: `self.pml4_frame` is this live `AddressSpace`'s own
+        // PML4 frame, and `self` (hence the address space) outlives this
+        // call.
+        unsafe { map_in(self.pml4_frame, page, frame, flags) }
     }
 
     /// Switches CR3 to this address space.

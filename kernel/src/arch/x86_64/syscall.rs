@@ -348,8 +348,19 @@ fn sys_spawn(frame: *mut TrapFrame) -> *mut TrapFrame {
         let elf_bytes =
             crate::task::process::lookup_spawnable_module(name).ok_or(SyscallError::NoSuchProgram)?;
         let child_pid = scheduler::allocate_pid();
-        let mut child = crate::task::process::Process::from_elf(child_pid, elf_bytes, Some(caller_pid))
-            .map_err(|_| SyscallError::SpawnFailed)?;
+        let mut child =
+            match crate::task::process::Process::from_elf(child_pid, elf_bytes, Some(caller_pid)) {
+                Ok(child) => child,
+                Err(_) => {
+                    // `allocate_pid` already reserved `child_pid`'s slot;
+                    // since nothing will ever call `spawn_suspended` for
+                    // it now, give it back rather than leaking it as a
+                    // permanently `Reserved` slot -- see
+                    // `scheduler::release_reservation`'s doc comment.
+                    scheduler::release_reservation(child_pid);
+                    return Err(SyscallError::SpawnFailed);
+                }
+            };
         child.state = ProcessState::Suspended;
         scheduler::spawn_suspended(child)?;
         Ok(child_pid.0)
@@ -483,35 +494,59 @@ fn sys_kill(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// allocator, so an adversarial request never allocates anything before
 /// being rejected.
 ///
-/// This is the first syscall handler to call something that takes a
-/// second lock (`GlobalFrameAllocator`'s, inside `p.address_space.map`)
-/// from *inside* `with_current_process`'s closure, i.e. while the
-/// scheduler's lock is already held. Every earlier handler
-/// (`resolve_endpoint`, `sys_grant`) deliberately avoided this. It's
-/// safe here because nothing in `memory::phys`/`memory::virt` ever
-/// calls back into `task::scheduler` — the lock order
-/// `SCHEDULER` -> phys-allocator is strictly one-directional, audited,
-/// with no cycle. Any *future* syscall that wants to nest a second lock
-/// inside `with_current_process` must repeat this same audit, not
-/// assume it's now generally safe.
+/// Deliberately does the frame-allocation-and-mapping loop *outside*
+/// `with_current_process`/`SCHEDULER` — two short, separate critical
+/// sections (validate-and-reserve, then commit) around it instead of
+/// one that spans the whole loop. An earlier version held `SCHEDULER`
+/// across the entire loop, on the reasoning that the lock order
+/// `SCHEDULER` -> phys-allocator has no cycle so nesting is safe; that
+/// reasoning was correct about *safety* but missed *liveness*: a
+/// multi-page grow (each iteration allocating a frame and walking page
+/// tables) held `SCHEDULER` for however long that took, and every other
+/// core's `on_timer_tick`/`on_syscall_yield`/`wake_blocked_process` — all
+/// of which need the same lock — stalled behind it the whole time. Never
+/// visibly wrong on any earlier single-workload heap-growth test, but a
+/// real, reproduced bug once something ran heap growth *concurrently*
+/// with other cores under constant forced preemption (found while
+/// prototyping a combined multi-workload stress scenario, deferred to a
+/// later milestone — see `docs/adr/0011`): those cores' scheduling could
+/// stall for the entire grow, and (with more than one such lock-holding
+/// stretch overlapping across cores) the resulting head-of-line
+/// blocking was severe enough to look like a hang.
+///
+/// Splitting the critical section is sound because only the calling
+/// process's own single execution thread ever touches its own
+/// `heap_end` or extends its own `AddressSpace` — nothing else can
+/// observe or race the gap between the two acquisitions. A concurrent
+/// `SYS_KILL` targeting this same process is still safe: it finds this
+/// process still `current` on this core (unchanged by releasing
+/// `SCHEDULER` here) and correctly waits for this syscall to finish
+/// before tearing anything down, exactly like it would for any other
+/// in-progress syscall.
 fn sys_sbrk(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
     let increment = regs.rdi as i64;
 
-    let outcome: Result<u64, SyscallError> = scheduler::with_current_process(|p| {
-        if increment < 0 {
-            return Err(SyscallError::InvalidArgument);
-        }
-        let old_end = p.heap_end;
-        let new_end = old_end
-            .checked_add(increment as u64)
-            .ok_or(SyscallError::InvalidArgument)?;
-        if new_end - USER_HEAP_START > USER_HEAP_MAX_SIZE {
-            return Err(SyscallError::InvalidArgument);
-        }
+    let outcome: Result<u64, SyscallError> = (|| {
+        let (old_end, new_end, old_top, new_top, pml4_frame) = scheduler::with_current_process(
+            |p| {
+                if increment < 0 {
+                    return Err(SyscallError::InvalidArgument);
+                }
+                let old_end = p.heap_end;
+                let new_end = old_end
+                    .checked_add(increment as u64)
+                    .ok_or(SyscallError::InvalidArgument)?;
+                if new_end - USER_HEAP_START > USER_HEAP_MAX_SIZE {
+                    return Err(SyscallError::InvalidArgument);
+                }
+                let old_top = align_up(old_end, 4096);
+                let new_top = align_up(new_end, 4096);
+                Ok((old_end, new_end, old_top, new_top, p.address_space.pml4_frame()))
+            },
+        )
+        .unwrap_or(Err(SyscallError::InvalidTarget))?;
 
-        let old_top = align_up(old_end, 4096);
-        let new_top = align_up(new_end, 4096);
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
@@ -523,16 +558,19 @@ fn sys_sbrk(frame: *mut TrapFrame) -> *mut TrapFrame {
                 .allocate_frame()
                 .ok_or(SyscallError::ResourceExhausted)?;
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-            p.address_space
-                .map(page, new_frame, flags)
+            // SAFETY: `pml4_frame` is this same, still-live process's own
+            // PML4 (nothing else can drop it -- see this function's doc
+            // comment on why the gap since the first `with_current_process`
+            // call is safe).
+            unsafe { crate::memory::virt::map_in(pml4_frame, page, new_frame, flags) }
                 .map_err(|_| SyscallError::ResourceExhausted)?;
             addr += 4096;
         }
 
-        p.heap_end = new_end;
+        scheduler::with_current_process(|p| p.heap_end = new_end)
+            .ok_or(SyscallError::InvalidTarget)?;
         Ok(old_end)
-    })
-    .unwrap_or(Err(SyscallError::InvalidTarget));
+    })();
 
     regs.rax = match outcome {
         Ok(old_end) => old_end,

@@ -50,8 +50,14 @@ type ReadyQueue = tarnos_kcore::RingBuffer<Pid, MAX_PROCESSES>;
 /// ever becomes a `Zombie` when someone could legitimately reap it — a
 /// process with no parent goes straight to `Empty` on exit instead. See
 /// `docs/adr/0007-process-lifecycle-and-termination.md`.
+///
+/// `Reserved` exists only for the window between [`allocate_pid`]
+/// claiming an index and the matching [`spawn`]/[`spawn_suspended`]
+/// actually filling it with a constructed `Process` — see
+/// `allocate_pid`'s doc comment for the cross-core race this closes.
 enum Slot {
     Empty,
+    Reserved,
     Occupied(Box<Process>),
     Zombie { parent: Pid, status: ExitStatus },
 }
@@ -116,13 +122,34 @@ static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
 /// see `Pid`'s doc comment for why a stale reference to whatever
 /// *previously* occupied this slot can never alias the new occupant.
 ///
-/// Safe to call without reserving the slot atomically against a second
-/// `allocate_pid()` racing in before the first's matching `spawn`/
-/// `spawn_suspended` runs: every caller (trusted boot code, and
-/// `SYS_SPAWN`'s handler, which runs with interrupts disabled for its
-/// entire duration — see `arch::x86_64::syscall`) allocates and spawns
-/// in the same straight-line sequence with nothing else able to run in
-/// between on this single core.
+/// Immediately marks the chosen slot [`Slot::Reserved`], in the same
+/// `SCHEDULER` acquisition that found it — closing a real, reproduced
+/// cross-core race: an earlier version of this function only bumped the
+/// generation counter and returned, leaving the slot itself `Empty`
+/// until the caller's own later `spawn`/`spawn_suspended` call filled
+/// it. That was safe against a *second* `allocate_pid()` call racing in
+/// from the *same* core (nothing else can run there in between), but
+/// not from a *different* one — and once `SYS_SPAWN` could itself be a
+/// process's very first instruction after being scheduled (found while
+/// prototyping a combined multi-workload stress scenario, deferred to a
+/// later milestone, that spawns several concurrently-runnable processes
+/// each immediately spawning a child of their own), a second core's
+/// `allocate_pid()` could land in the
+/// exact gap between the first core's own `allocate_pid()` and its
+/// matching `spawn`, see the same slot as `Empty`, and be handed the
+/// identical index with a bumped generation. Whichever side's `spawn`/
+/// `spawn_suspended` ran second then silently overwrote the other's
+/// `Process` in the table — while the loser's own `Pid` (a different
+/// generation) legitimately kept resolving to *that* overwriting
+/// process's own current generation, aliasing a totally unrelated
+/// process. Observed in practice as a process running another
+/// process's code from process index confusion alone, no memory
+/// corruption or unsafe code involved. See `docs/adr/0011`.
+///
+/// A caller that fails before its matching `spawn`/`spawn_suspended`
+/// ever runs (today: only `SYS_SPAWN`'s handler, if ELF loading fails)
+/// must call [`release_reservation`] to give the slot back — see its
+/// own doc comment.
 pub fn allocate_pid() -> Pid {
     let mut sched = SCHEDULER.lock();
     let index = sched
@@ -134,7 +161,24 @@ pub fn allocate_pid() -> Pid {
         return Pid::new(MAX_PROCESSES, 0);
     }
     sched.generations[index] = sched.generations[index].wrapping_add(1);
+    sched.processes[index] = Slot::Reserved;
     Pid::new(index, sched.generations[index])
+}
+
+/// Gives back a slot [`allocate_pid`] reserved when its caller fails
+/// before ever calling the matching `spawn`/`spawn_suspended` — today,
+/// only `SYS_SPAWN`'s handler on an ELF-load failure. A no-op if `pid`'s
+/// generation no longer matches (defensive; shouldn't happen, since
+/// nothing else can legitimately touch a still-`Reserved` slot).
+pub fn release_reservation(pid: Pid) {
+    let mut sched = SCHEDULER.lock();
+    let index = pid.index();
+    if index >= MAX_PROCESSES || sched.generations[index] != pid.generation() {
+        return;
+    }
+    if matches!(sched.processes[index], Slot::Reserved) {
+        sched.processes[index] = Slot::Empty;
+    }
 }
 
 /// Registers a fully constructed process and marks it ready to run.
