@@ -82,6 +82,30 @@ fn kernel_stack_slot_base(pid: Pid) -> u64 {
     KERNEL_STACKS_BASE + pid.index() as u64 * KERNEL_STACK_SLOT_STRIDE
 }
 
+/// Reverse-maps a raw address into "which process-table slot's kernel
+/// stack owns this, and how far below its own top" — for panic
+/// diagnostics only (see `arch::x86_64::idt`'s ring0 fault handlers).
+/// Exists because the still-open cross-core corruption bug (`docs/adr/0013`)
+/// manifests as a `ret` landing on a *kernel-stack* address rather than a
+/// `.text` one; naming which slot that address belongs to, directly from
+/// the fault address alone, is strictly more informative than the bare
+/// hex address a live-GDB session was previously needed to decode by
+/// hand. Returns `None` for an address outside the whole kernel-stacks
+/// region, or landing on some slot's unmapped guard page (offset `0` from
+/// that slot's own base, i.e. `offset_in_slot < 4096`).
+pub fn describe_kernel_stack_address(addr: u64) -> Option<(usize, u64)> {
+    let offset = addr.checked_sub(KERNEL_STACKS_BASE)?;
+    let slot = offset / KERNEL_STACK_SLOT_STRIDE;
+    if slot >= MAX_PROCESSES as u64 {
+        return None;
+    }
+    let offset_in_slot = offset % KERNEL_STACK_SLOT_STRIDE;
+    if offset_in_slot < 4096 {
+        return None; // the guard page, not real stack memory
+    }
+    Some((slot as usize, offset_in_slot))
+}
+
 /// Maps every possible process's kernel stack (with its guard page) into
 /// the shared kernel half. Must run once, after `memory::init()` and
 /// before the first `AddressSpace::new()` call — see the module-level

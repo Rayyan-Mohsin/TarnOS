@@ -148,6 +148,34 @@ fn clear_stack_busy(index: usize) {
     STACK_BUSY[index].store(false, Ordering::Release);
 }
 
+/// Prints every core's own `current` pid (lock-free — safe to call from a
+/// ring0 fault handler right before it panics, without risking contending
+/// or deadlocking on `SCHEDULER` itself) and every process-table index
+/// currently marked [`STACK_BUSY`]. A single corrupted-frame panic only
+/// ever shows the *faulting* core's own state (see `arch::x86_64::idt`'s
+/// ring0 handlers) — this gives the global picture across every core at
+/// the exact instant of the fault, since the still-open cross-core
+/// corruption bug (`docs/adr/0013`) is, by its own evidence, a
+/// *cross*-core phenomenon: whatever wrote the bad value did so from a
+/// different execution context than the one that later faulted reading
+/// it.
+pub fn dump_cores_for_panic() {
+    for core in 0..MAX_CORES {
+        let raw = percpu::slot(core).current.load(Ordering::Acquire);
+        let idle = percpu::slot(core).idle.load(Ordering::Acquire);
+        if percpu::is_booted(core) {
+            crate::earlyprintln!(
+                "[panic-dump] core {core}: current=Pid({raw:#x}) idle={idle}"
+            );
+        }
+    }
+    for index in 0..MAX_PROCESSES {
+        if STACK_BUSY[index].load(Ordering::Acquire) {
+            crate::earlyprintln!("[panic-dump] STACK_BUSY[{index}] = true");
+        }
+    }
+}
+
 /// Reserves the next `Pid`: the index of the lowest currently-empty slot
 /// in the process table, so a terminated process's slot is available for
 /// reuse rather than the table filling up after `MAX_PROCESSES`
@@ -308,7 +336,30 @@ pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallEr
 /// reading them here avoids the caller needing to re-lock `SCHEDULER`
 /// after this drops its guard).
 fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
-    set_current(sched, percpu::core_index(), Some(pid));
+    let this_core = percpu::core_index();
+    // Defense-in-depth, specific to *dispatch* rather than pid validity
+    // (the generation/frame checks below already cover that): a genuine
+    // double-dispatch of the same process onto two cores at once means
+    // two execution contexts sharing the exact same physical kernel
+    // stack simultaneously -- silent, catastrophic corruption (a `ret`
+    // on one core popping a return address the other core just
+    // overwrote), not a clean, attributable failure. This is exactly the
+    // shape of live-GDB evidence gathered for the still-open cross-core
+    // corruption bug (see `docs/adr/0013`): a corrupted return address
+    // landing back in kernel-stack memory rather than `.text`. Checked
+    // before `set_current` below claims this core, so a genuine
+    // violation is caught here rather than overwritten by it.
+    for other_core in 0..MAX_CORES {
+        if other_core != this_core {
+            assert_ne!(
+                sched.current[other_core],
+                Some(pid),
+                "switch_to: {pid:?} is already `current` on core {other_core} -- a genuine \
+                 double-dispatch of the same process onto two cores at once"
+            );
+        }
+    }
+    set_current(sched, this_core, Some(pid));
     let index = pid.index();
     // Every other pid resolution in this module (`occupied_mut`,
     // `wait_for_child`, `on_reschedule_ipi`) checks the table's current

@@ -18,6 +18,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 use super::context_switch::{FaultFrameWithCode, TrapFrame};
 use super::gdt::DOUBLE_FAULT_IST_INDEX;
+use super::percpu;
 use crate::earlyprintln;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -129,10 +130,26 @@ pub extern "C" fn invalid_opcode_ring3(frame: *mut TrapFrame) -> *mut TrapFrame 
 #[unsafe(no_mangle)]
 pub extern "C" fn general_protection_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
     let (rip, error_code) = unsafe { ((*frame).rip, (*frame).error_code) };
-    panic!(
-        "general protection fault (error code {:#x}) at {:#x}",
-        error_code, rip
-    );
+    let core = percpu::core_index();
+    let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
+    crate::task::scheduler::dump_cores_for_panic();
+    // See `page_fault_ring0`'s matching comment: naming which process-table
+    // slot's kernel stack `rip` itself falls in (when it does) is direct
+    // evidence for the still-open cross-core corruption bug (`docs/adr/0013`)
+    // without needing a live-GDB session to decode it by hand.
+    match crate::task::process::describe_kernel_stack_address(rip) {
+        Some((slot, offset)) => panic!(
+            "general protection fault (error code {:#x}) at {:#x} -- core {core} was running raw \
+             pid {current_raw:#x}; the faulting rip is kernel-stack slot {slot} (offset {offset:#x} \
+             from its own top)",
+            error_code, rip
+        ),
+        None => panic!(
+            "general protection fault (error code {:#x}) at {:#x} -- core {core} was running raw \
+             pid {current_raw:#x}",
+            error_code, rip
+        ),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -150,12 +167,32 @@ pub extern "C" fn general_protection_fault_ring3(
 pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
     let rip = unsafe { (*frame).rip };
     let error_code = PageFaultErrorCode::from_bits_truncate(unsafe { (*frame).error_code });
-    panic!(
-        "page fault accessing {:#x} (error {:?}) at {:#x}",
-        Cr2::read().map(|a| a.as_u64()).unwrap_or(0),
-        error_code,
-        rip
-    );
+    let fault_addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
+    let core = percpu::core_index();
+    // Lock-free (`percpu::PerCpuSlot.current`'s whole reason to exist) --
+    // safe to read from a panic handler that must never risk contending
+    // (or deadlocking on) `SCHEDULER` itself.
+    let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
+    crate::task::scheduler::dump_cores_for_panic();
+    // Naming which process-table slot's kernel stack `fault_addr` itself
+    // falls in (when it does) turns the still-open cross-core corruption
+    // bug (`docs/adr/0013`) -- previously decoded by hand from a raw hex
+    // address via a live-GDB session -- into something this panic message
+    // states directly: which stack got a bad return address landed on it,
+    // and which pid this faulting core itself was running when it happened.
+    match crate::task::process::describe_kernel_stack_address(fault_addr) {
+        Some((slot, offset)) => panic!(
+            "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
+             {current_raw:#x}; the faulting address is kernel-stack slot {slot} (offset \
+             {offset:#x} from its own top)",
+            fault_addr, error_code, rip
+        ),
+        None => panic!(
+            "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
+             {current_raw:#x}",
+            fault_addr, error_code, rip
+        ),
+    }
 }
 
 #[unsafe(no_mangle)]
