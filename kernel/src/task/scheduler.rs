@@ -14,7 +14,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Once;
 use tarnos_abi::{ExitStatus, Rights};
@@ -107,9 +107,113 @@ fn set_current(sched: &mut Inner, core: usize, pid: Option<Pid>) {
     percpu::slot(core)
         .current
         .store(pid.map_or(0, |p| p.0), Ordering::Release);
+    record_dispatch_trace(core, pid);
 }
 
 static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
+
+/// How many of each core's most recent [`set_current`] transitions
+/// [`DISPATCH_TRACE`] remembers. Small and fixed: this is a debugging aid
+/// for the still-open cross-core corruption bug (`docs/adr/0017`), not a
+/// general-purpose log, so it only needs to cover the handful of
+/// transitions immediately preceding a panic, not a process's whole
+/// lifetime.
+const TRACE_LEN: usize = 24;
+
+/// Every [`set_current`] call, across every core, draws the next value
+/// from this counter — so two entries recorded on *different* cores can
+/// still be placed in a single, total, cross-core order after the fact
+/// (`Inner.current`'s own per-core arrays and even [`dump_cores_for_panic`]'s
+/// snapshot can only ever show each core's state at one instant, never
+/// the interleaving that produced it).
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One core's ring buffer of its own last [`TRACE_LEN`] `set_current`
+/// calls: parallel `seq`/`pid_raw` arrays (an `AtomicU64` pair per slot,
+/// rather than one struct behind one atomic, since no hardware width
+/// covers both fields at once) plus a monotonic per-core write cursor
+/// that a slot index is derived from via `% TRACE_LEN`. `pid_raw == 0`
+/// means `set_current(.., None)` — matches `percpu::PerCpuSlot.current`'s
+/// own "0 means nothing running" convention, unambiguous since a real
+/// `Pid`'s generation half is bumped to at least 1 before its first use
+/// (see `allocate_pid`).
+///
+/// Deliberately lock-free and best-effort, mirroring
+/// [`dump_cores_for_panic`]'s own reasoning: a torn read racing a
+/// concurrent write while dumping this after a panic can show a stale or
+/// mismatched `(seq, pid)` pair for at most one slot on one core, an
+/// acceptable cost for a diagnostic whose entire purpose is showing what
+/// *other*, still-running cores were doing right before the fault —
+/// waiting on `SCHEDULER` here (most of them are contending it right now)
+/// would defeat that purpose entirely.
+struct DispatchTrace {
+    seq: [AtomicU64; TRACE_LEN],
+    pid_raw: [AtomicU64; TRACE_LEN],
+    cursor: AtomicUsize,
+}
+
+impl DispatchTrace {
+    const fn new() -> Self {
+        Self {
+            seq: [const { AtomicU64::new(0) }; TRACE_LEN],
+            pid_raw: [const { AtomicU64::new(0) }; TRACE_LEN],
+            cursor: AtomicUsize::new(0),
+        }
+    }
+}
+
+static DISPATCH_TRACE: [DispatchTrace; MAX_CORES] = [const { DispatchTrace::new() }; MAX_CORES];
+
+/// Records one `set_current(core, pid)` transition into `core`'s own
+/// ring buffer. Called from [`set_current`] itself rather than from each
+/// of its individual callers, so every dispatch, block, evict, and
+/// finalize path that ever changes who a core is running is captured
+/// automatically, with no risk of a future new call site forgetting to
+/// instrument itself.
+fn record_dispatch_trace(core: usize, pid: Option<Pid>) {
+    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let slot = DISPATCH_TRACE[core].cursor.fetch_add(1, Ordering::Relaxed) % TRACE_LEN;
+    DISPATCH_TRACE[core].pid_raw[slot].store(pid.map_or(0, |p| p.0), Ordering::Relaxed);
+    DISPATCH_TRACE[core].seq[slot].store(seq, Ordering::Release);
+}
+
+/// Prints every core's [`DISPATCH_TRACE`] ring buffer, oldest recorded
+/// entry first, as `seq` / `pid.index()` / `pid.generation()` triples (or
+/// `<idle>` for a `None` transition) — see [`dump_cores_for_panic`],
+/// which calls this. Reading `seq` (`Acquire`) before `pid_raw`
+/// (`Relaxed`) matches `record_dispatch_trace`'s own write order, so a
+/// torn slot is far more likely to show a stale-but-self-consistent
+/// older entry than a mismatched `(seq, pid)` pair.
+fn dump_dispatch_trace_for_panic() {
+    for core in 0..MAX_CORES {
+        if !percpu::is_booted(core) {
+            continue;
+        }
+        crate::earlyprintln!("[panic-dump] core {core} dispatch trace (oldest first):");
+        let trace = &DISPATCH_TRACE[core];
+        let cursor = trace.cursor.load(Ordering::Acquire);
+        let recorded = cursor.min(TRACE_LEN);
+        // Not yet wrapped (`cursor <= TRACE_LEN`): the oldest entry is
+        // always at slot 0. Wrapped at least once: the oldest surviving
+        // entry is exactly the slot about to be overwritten next.
+        let start = if cursor <= TRACE_LEN { 0 } else { cursor % TRACE_LEN };
+        for i in 0..recorded {
+            let slot = (start + i) % TRACE_LEN;
+            let seq = trace.seq[slot].load(Ordering::Acquire);
+            let raw = trace.pid_raw[slot].load(Ordering::Relaxed);
+            if raw == 0 {
+                crate::earlyprintln!("[panic-dump]   seq={seq} <idle>");
+            } else {
+                let pid = Pid(raw);
+                crate::earlyprintln!(
+                    "[panic-dump]   seq={seq} pid index={} generation={}",
+                    pid.index(),
+                    pid.generation()
+                );
+            }
+        }
+    }
+}
 
 /// Set for a process-table index whenever the core that just relinquished
 /// that identity there (self-exit, fault-kill, or a cross-core `SYS_KILL`
@@ -174,6 +278,10 @@ pub fn dump_cores_for_panic() {
             crate::earlyprintln!("[panic-dump] STACK_BUSY[{index}] = true");
         }
     }
+    // See `docs/adr/0017`: a snapshot of each core's *current* state
+    // (above) can't show the actual sequence of transitions that
+    // produced it -- this can.
+    dump_dispatch_trace_for_panic();
 }
 
 /// Reserves the next `Pid`: the index of the lowest currently-empty slot
