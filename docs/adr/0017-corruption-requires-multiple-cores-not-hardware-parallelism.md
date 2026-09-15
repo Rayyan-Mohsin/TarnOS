@@ -66,8 +66,8 @@ core" check can never find one, so it always takes the trivial
 same-core-finalize path, never exercising the IPI/eviction protocol at all.
 That made it the first suspect.
 
-Three temporary, uncommitted experiments (spawning `test-kitchen-sink`'s
-process set with one workload's spawn code deleted, then reverted) at
+Four temporary, uncommitted experiments (spawning `test-kitchen-sink`'s
+process set with some workload's spawn code deleted, then reverted) at
 `-smp 4`, 40 runs each, counting genuine `[KERNEL PANIC]` occurrences only:
 
 - **Kill orchestrator removed:** 10/40 panicked (25%).
@@ -76,20 +76,30 @@ process set with one workload's spawn code deleted, then reverted) at
   lifecycle, and kill orchestrators all still present): 6/40 panicked
   (15%) — pressure alone contributes about as much as heap does, and
   removing it still leaves a substantial rate.
+- **Kill, heap, *and* pressure all removed** — only the IPC round-trip
+  and lifecycle spawn/wait orchestrators (plus their spawned
+  `echo-child`/`exit-code-child` children) still running: 9/40 panicked
+  (22.5%), squarely in the same range as every partial configuration
+  above.
 
-No single removal comes close to eliminating the panics, and no removal's
-effect stands out as dominant — kill, heap, and pressure each account for
-roughly the same order-of-magnitude share (15–25%) on their own. This
-argues against a defect isolated to any one workload's own syscall logic,
-and *for* a shared mechanism every workload exercises identically: the
-scheduler's own per-core dispatch loop (`scheduler::on_timer_tick` →
-`switch_to`, driven by every core's independent LAPIC timer against the
-one shared ready queue). That mechanism is the one thing structurally
-common to every remaining configuration in this table — IPC and lifecycle
-alone (kill, heap, *and* pressure all removed) were not yet tested in
-isolation, but every experiment so far is consistent with the bug living
-in how multiple cores' independent timer-driven dispatch loops interact
-with the shared scheduler state, not in any individual syscall handler.
+No removal, including stacking three of them together, comes close to
+eliminating the panics, and no single workload's share stands out as
+dominant — every configuration tested lands in the same 15–25% band
+regardless of which specific syscalls are in flight. `SYS_SPAWN`,
+`SYS_GRANT`, `SYS_PROCESS_START`, `SYS_WAIT`, and `SYS_SEND`/`SYS_RECV`
+are the only syscalls the surviving IPC+lifecycle configuration still
+exercises — `SYS_KILL`'s cross-core eviction protocol and `SYS_SBRK`'s
+split-critical-section growth path are both completely absent from that
+run, yet the panic rate barely moved. This rules out a defect confined to
+any individual syscall handler and confirms the one thing every
+configuration in this table still has in common regardless of which
+workloads survive: the scheduler's own per-core dispatch loop
+(`scheduler::on_timer_tick` → `switch_to`, driven by every core's
+independent LAPIC timer against the one shared ready queue) plus the
+ordinary spawn/wait/wake machinery every syscall here ultimately funnels
+through (`scheduler::spawn`/`wait_for_child`/`wake_blocked_process`).
+The search should now focus there, not on any workload-specific code
+path.
 
 ## Two more hypotheses checked directly and ruled out this round
 
@@ -127,29 +137,38 @@ with the shared scheduler state, not in any individual syscall handler.
 
 ## What remains open
 
-The root cause is still not found. What changed this round is the shape of
-the search: this is now known to be a genuine cross-core scheduling/IPI
-protocol logic error, reachable via ordinary interleaving (no true
-parallelism needed), not exclusively tied to the kill path or the heap
-path alone. The most promising next step is a finer-grained slice than
-"remove one whole orchestrator": disable the two background pressure
-processes (the one piece every other workload runs alongside, purely for
-`SYS_YIELD` load, with no IPC/heap/kill semantics of its own) and re-measure
-at `-smp 4`, to check whether raw preemption *frequency* alone (independent
-of which syscalls are in flight) is the actual variable driving the
-failure rate — the scaling data (0% → ~1% → 50%) already looks more
-consistent with "more cores means more preemption/dispatch events per
-wall-clock second, and the bad sequence needs a certain density of those"
-than with any single workload's own correctness.
+The root cause is still not found, but the search space is now about as
+narrow as workload-isolation alone can make it: with kill, heap, and
+pressure all removed, the smallest configuration tested (IPC round-trip +
+lifecycle spawn/wait, four short-lived orchestrator/child processes total)
+still panics at close to half the full scenario's own rate. Further
+subtracting individual workloads is unlikely to isolate this any further —
+the next step has to be looking *inside* the shared dispatch/wake path
+itself (`on_timer_tick`, `switch_to`, `spawn`, `wait_for_child`,
+`wake_blocked_process_locked`/`block_current_process_locked`) rather than
+removing more of what surrounds it. Candidate approach for next session:
+instrument `switch_to`'s existing double-dispatch assertion and
+generation check (already present as defense-in-depth, never yet observed
+to fire) with a ring buffer of the last N transitions per core — pid,
+generation, and a monotonic sequence number — captured *unconditionally*,
+so a panic anywhere can dump exactly what every core's dispatch loop did
+in the instants leading up to it, rather than relying on the fault's own
+core to have caught something informative. The scaling data (0% → ~1% →
+50%) already looks more consistent with "more cores means more
+preemption/dispatch events per wall-clock second, and the bad sequence
+needs a certain density of those" than with any single workload's own
+correctness — a per-core trace buffer is the most direct way to actually
+see that sequence instead of continuing to infer its shape indirectly.
 
 ## Testing
 
 - The four-configuration scaling table above (160 total runs).
-- Two 40-run single-workload-removed batches at `-smp 4`.
+- Four 40-run workload-removal batches at `-smp 4` (160 more runs).
 - Full ~23-scenario regression suite green with the double-fault
   diagnostic addition (the only committed source change this round).
-- Both experimental workload-removal changes to `main.rs` were reverted
-  before committing; nothing from this section persists in the tree.
+- All four experimental workload-removal changes to `main.rs` were
+  reverted before committing; nothing from this section persists in the
+  tree.
 
 ## Consequences
 
