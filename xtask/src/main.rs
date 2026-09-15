@@ -17,10 +17,13 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[1.min(args.len())..];
 
+    let features = parse_features(rest);
+    let feature_refs: Vec<&str> = features.iter().map(String::as_str).collect();
+
     let result = match cmd {
-        "build" => build(false),
-        "iso" => iso(false, &[]),
-        "run" => run(rest),
+        "build" => build(false, &feature_refs),
+        "iso" => iso(false, &feature_refs),
+        "run" => run(rest, &feature_refs),
         "test-fault" => test_fault(),
         "test-fault-isolation" => test_fault_isolation(),
         "test-blocking-ipc" => test_blocking_ipc(),
@@ -85,11 +88,14 @@ fn print_usage() {
         "TarnOS build automation\n\n\
          Usage: cargo run -p xtask -- <command> [flags]\n\n\
          Commands:\n\
-         \x20 build            Build the kernel and init ELF binaries\n\
-         \x20 iso              Build (if needed) and assemble build/tarnos.iso\n\
+         \x20 build [flags]    Build the kernel and init ELF binaries\n\
+         \x20 iso [flags]      Build (if needed) and assemble build/tarnos.iso\n\
          \x20 run [flags]      Build the ISO (if needed) and boot it in QEMU\n\
          \x20                    --uefi    boot via OVMF instead of legacy BIOS\n\
          \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot\n\
+         \x20                    --features a,b   enable kernel Cargo features (build/iso/run\n\
+         \x20                    all accept this -- e.g. `build --features kitchen-sink-test`\n\
+         \x20                    for a manual stress batch outside any one test-* scenario)\n\
          \x20 test-fault       Build with a deliberate page fault injected at boot and\n\
          \x20                    confirm it produces a clean panic + halt, not a triple fault\n\
          \x20 test-fault-isolation  Confirm a faulting ring-3 process is killed alone,\n\
@@ -151,6 +157,36 @@ fn print_usage() {
          \x20                    test-smp-sched-stress, test-smp-send-cross-core, and\n\
          \x20                    test-smp-forced-preempt in sequence"
     );
+}
+
+/// Parses a `--features a,b,c` flag out of `build`/`iso`/`run`'s own raw
+/// argument list (comma-separated, same convention as `cargo build
+/// --features`). Was missing entirely until this milestone's own
+/// cross-core corruption investigation silently ran several stress
+/// batches against a stale, unrelated ISO for an entire debugging
+/// session: `cargo run -p xtask -- build --features kitchen-sink-test`
+/// looked like it worked (no error, "xtask: build OK") but `build`
+/// never parsed `rest` at all and never touched `build/tarnos.iso` in
+/// the first place, so the flag was silently a no-op both ways. Every
+/// other feature-gated scenario already goes through a dedicated
+/// `test-*` function that passes its own fixed feature list directly in
+/// Rust (`run_scenario(&["kitchen-sink-test"], ...)`); this only matters
+/// for driving `build`/`iso`/`run` manually with an arbitrary feature
+/// set from the command line, e.g. for a repeated manual stress batch
+/// outside any one fixed `test-*` scenario's own assertions.
+fn parse_features(args: &[String]) -> Vec<String> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--features" {
+            return args
+                .get(i + 1)
+                .map(|list| list.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+        }
+        if let Some(list) = arg.strip_prefix("--features=") {
+            return list.split(',').map(str::to_string).collect();
+        }
+    }
+    Vec::new()
 }
 
 fn workspace_root() -> PathBuf {
@@ -236,9 +272,9 @@ fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), Str
 /// still boot the same `limine.conf`.
 const USER_CRATES: &[&str] = &["init", "echo-child", "exit-code-child", "heap-child"];
 
-fn build(release: bool) -> Result<(), String> {
+fn build(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
-    build_kernel(&root, release, &[])?;
+    build_kernel(&root, release, kernel_features)?;
     for package in USER_CRATES {
         build_user_crate(&root, release, package)?;
     }
@@ -401,12 +437,12 @@ fn find_ovmf_vars_template() -> Option<PathBuf> {
     .find(|p| p.exists())
 }
 
-fn run(flags: &[String]) -> Result<(), String> {
+fn run(flags: &[String], kernel_features: &[&str]) -> Result<(), String> {
     let uefi = flags.iter().any(|f| f == "--uefi");
     let debug = flags.iter().any(|f| f == "--debug");
 
     let root = workspace_root();
-    iso(false, &[])?;
+    iso(false, kernel_features)?;
 
     let iso_path = root.join("build").join("tarnos.iso");
     let mut cmd = Command::new("qemu-system-x86_64");
