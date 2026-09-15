@@ -139,9 +139,30 @@ pub extern "C" fn invalid_opcode_ring3(frame: *mut TrapFrame) -> *mut TrapFrame 
     kill_faulting_process_and_reschedule(format_args!("invalid opcode at {:#x}", rip))
 }
 
+/// Renders `describe_kernel_stack_address`'s result for a panic message,
+/// or `"outside any kernel stack"` if `addr` doesn't land in one — shared
+/// by the GP-fault and page-fault ring0 handlers so both can report not
+/// just the faulting `rip`'s own attribution but `rsp`'s too: if a core
+/// is genuinely executing *on* a kernel stack that isn't the one its own
+/// `current` pid names, `rsp` itself (not just some corrupted value that
+/// got fetched as if it were code) will show that directly, which no
+/// previous diagnostic in this investigation (`docs/adr/0013`-`0017`)
+/// captured — every prior capture only ever showed a bad *value* landing
+/// somewhere, never whether the core's own live stack pointer was
+/// already on the wrong stack before that value was even fetched.
+fn describe_stack_addr(addr: u64) -> alloc::string::String {
+    match crate::task::process::describe_kernel_stack_address(addr) {
+        // `offset` is measured from the slot's own *base* (just above its
+        // guard page), not its top -- see that function's own doc
+        // comment on `KERNEL_STACK_SLOT_STRIDE`.
+        Some((slot, offset)) => alloc::format!("kernel-stack slot {slot} (offset {offset:#x} from its own base)"),
+        None => alloc::string::String::from("outside any kernel stack"),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn general_protection_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
-    let (rip, error_code) = unsafe { ((*frame).rip, (*frame).error_code) };
+    let (rip, rsp, error_code) = unsafe { ((*frame).rip, (*frame).rsp, (*frame).error_code) };
     let core = percpu::core_index();
     let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
     crate::task::scheduler::dump_cores_for_panic();
@@ -149,19 +170,15 @@ pub extern "C" fn general_protection_fault_ring0(frame: *mut FaultFrameWithCode)
     // slot's kernel stack `rip` itself falls in (when it does) is direct
     // evidence for the still-open cross-core corruption bug (`docs/adr/0013`)
     // without needing a live-GDB session to decode it by hand.
-    match crate::task::process::describe_kernel_stack_address(rip) {
-        Some((slot, offset)) => panic!(
-            "general protection fault (error code {:#x}) at {:#x} -- core {core} was running raw \
-             pid {current_raw:#x}; the faulting rip is kernel-stack slot {slot} (offset {offset:#x} \
-             from its own top)",
-            error_code, rip
-        ),
-        None => panic!(
-            "general protection fault (error code {:#x}) at {:#x} -- core {core} was running raw \
-             pid {current_raw:#x}",
-            error_code, rip
-        ),
-    }
+    panic!(
+        "general protection fault (error code {:#x}) at {:#x} -- core {core} was running raw pid \
+         {current_raw:#x}; the faulting rip is {}; rsp ({:#x}) is {}",
+        error_code,
+        rip,
+        describe_stack_addr(rip),
+        rsp,
+        describe_stack_addr(rsp)
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -177,7 +194,7 @@ pub extern "C" fn general_protection_fault_ring3(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
-    let rip = unsafe { (*frame).rip };
+    let (rip, rsp) = unsafe { ((*frame).rip, (*frame).rsp) };
     let error_code = PageFaultErrorCode::from_bits_truncate(unsafe { (*frame).error_code });
     let fault_addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     let core = percpu::core_index();
@@ -192,19 +209,25 @@ pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
     // address via a live-GDB session -- into something this panic message
     // states directly: which stack got a bad return address landed on it,
     // and which pid this faulting core itself was running when it happened.
-    match crate::task::process::describe_kernel_stack_address(fault_addr) {
-        Some((slot, offset)) => panic!(
-            "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
-             {current_raw:#x}; the faulting address is kernel-stack slot {slot} (offset \
-             {offset:#x} from its own top)",
-            fault_addr, error_code, rip
-        ),
-        None => panic!(
-            "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
-             {current_raw:#x}",
-            fault_addr, error_code, rip
-        ),
-    }
+    // Also reports `rsp`'s own attribution (see `describe_stack_addr`'s
+    // doc comment): a genuine capture (`docs/adr/0017`) showed a core's
+    // own `current` pid faulting on an instruction fetch from a
+    // *different* pid's kernel-stack slot, but that capture predates
+    // this diagnostic and never recorded whether `rsp` itself was
+    // already on the wrong stack (the more serious case) or still
+    // correctly on the running pid's own stack with only the fetched
+    // *value* being corrupted (a narrower, different bug). The next
+    // capture will show which.
+    panic!(
+        "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
+         {current_raw:#x}; the faulting address is {}; rsp ({:#x}) is {}",
+        fault_addr,
+        error_code,
+        rip,
+        describe_stack_addr(fault_addr),
+        rsp,
+        describe_stack_addr(rsp)
+    );
 }
 
 #[unsafe(no_mangle)]
