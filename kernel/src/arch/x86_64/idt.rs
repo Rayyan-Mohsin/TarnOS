@@ -82,11 +82,23 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
-    panic!(
-        "DOUBLE FAULT (error code {:#x}) at {:#x}",
-        error_code,
-        stack_frame.instruction_pointer.as_u64()
-    );
+    let core = percpu::core_index();
+    let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
+    crate::task::scheduler::dump_cores_for_panic();
+    let rip = stack_frame.instruction_pointer.as_u64();
+    match crate::task::process::describe_kernel_stack_address(rip) {
+        Some((slot, offset)) => panic!(
+            "DOUBLE FAULT (error code {:#x}) at {:#x} -- core {core} was running raw pid \
+             {current_raw:#x}; the faulting rip is kernel-stack slot {slot} (offset {offset:#x} \
+             from its own top)",
+            error_code, rip
+        ),
+        None => panic!(
+            "DOUBLE FAULT (error code {:#x}) at {:#x} -- core {core} was running raw pid \
+             {current_raw:#x}",
+            error_code, rip
+        ),
+    }
 }
 
 /// Common tail for every process-facing exception's ring-3 path: names
