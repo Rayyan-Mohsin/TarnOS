@@ -208,7 +208,7 @@ fn dump_dispatch_trace_for_panic() {
         if !percpu::is_booted(core) {
             continue;
         }
-        crate::earlyprintln!("[panic-dump] core {core} dispatch trace (oldest first):");
+        crate::panic_earlyprintln!("[panic-dump] core {core} dispatch trace (oldest first):");
         let trace = &DISPATCH_TRACE[core];
         let cursor = trace.cursor.load(Ordering::Acquire);
         let recorded = cursor.min(TRACE_LEN);
@@ -221,10 +221,10 @@ fn dump_dispatch_trace_for_panic() {
             let seq = trace.seq[slot].load(Ordering::Acquire);
             let raw = trace.pid_raw[slot].load(Ordering::Relaxed);
             if raw == 0 {
-                crate::earlyprintln!("[panic-dump]   seq={seq} <idle>");
+                crate::panic_earlyprintln!("[panic-dump]   seq={seq} <idle>");
             } else {
                 let pid = Pid(raw);
-                crate::earlyprintln!(
+                crate::panic_earlyprintln!(
                     "[panic-dump]   seq={seq} pid index={} generation={}",
                     pid.index(),
                     pid.generation()
@@ -282,19 +282,34 @@ fn clear_stack_busy(index: usize) {
 /// *cross*-core phenomenon: whatever wrote the bad value did so from a
 /// different execution context than the one that later faulted reading
 /// it.
+///
+/// Calls `broadcast_panic_halt` and uses `panic_earlyprintln!` for every
+/// line, exactly like `lang_items::panic` itself does -- and for the same
+/// reason. This function runs *before* that `panic!()` ever fires (called
+/// directly from `arch::x86_64::idt`'s ring0 handlers), so without its own
+/// copy of both protections, every print here inherited neither: a
+/// genuine, reproduced hang (`docs/adr/0018`) where a single-core dump
+/// froze mid-line, indistinguishable from the machine silently dying,
+/// because an earlier ordinary `earlyprintln!` call elsewhere had already
+/// orphaned `earlycon::COM1_TX_LOCK` by being interrupted mid-write. Safe
+/// to call `broadcast_panic_halt` again here even though `panic!()` (via
+/// `lang_items::panic`) will call it a second time moments later -- it is
+/// lock-free and idempotent (re-sending an IPI to an already-halting or
+/// already-halted core is harmless).
 pub fn dump_cores_for_panic() {
+    crate::arch::x86_64::lapic::broadcast_panic_halt(percpu::core_index());
     for core in 0..MAX_CORES {
         let raw = percpu::slot(core).current.load(Ordering::Acquire);
         let idle = percpu::slot(core).idle.load(Ordering::Acquire);
         if percpu::is_booted(core) {
-            crate::earlyprintln!(
+            crate::panic_earlyprintln!(
                 "[panic-dump] core {core}: current=Pid({raw:#x}) idle={idle}"
             );
         }
     }
     for index in 0..MAX_PROCESSES {
         if STACK_BUSY[index].load(Ordering::Acquire) {
-            crate::earlyprintln!("[panic-dump] STACK_BUSY[{index}] = true");
+            crate::panic_earlyprintln!("[panic-dump] STACK_BUSY[{index}] = true");
         }
     }
     // See `docs/adr/0017`: a snapshot of each core's *current* state

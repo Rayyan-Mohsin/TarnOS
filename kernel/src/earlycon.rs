@@ -123,3 +123,22 @@ macro_rules! earlyprintln {
         $crate::earlycon::_println(format_args!($($arg)*))
     };
 }
+
+/// Like [`earlyprintln!`], but through [`panic_println`] instead of
+/// [`_println`] — for any diagnostic print that can run *before*
+/// `lang_items::panic` gets a chance to call `broadcast_panic_halt` and
+/// switch to this same safe path itself. `task::scheduler::dump_cores_for_panic`
+/// (called from `arch::x86_64::idt`'s ring0 fault handlers, ahead of the
+/// `panic!()` that eventually reaches `lang_items::panic`) is exactly
+/// that case: without this, its own `earlyprintln!` calls inherit none of
+/// `panic_println`'s protection, and can hang this core forever on a
+/// `COM1_TX_LOCK` orphaned by an earlier, unrelated interrupted write —
+/// the identical hazard `panic_println`'s own doc comment describes,
+/// just reopened by every diagnostic print added since that fix landed
+/// that didn't route through it. See `docs/adr/0018`.
+#[macro_export]
+macro_rules! panic_earlyprintln {
+    ($($arg:tt)*) => {
+        $crate::earlycon::panic_println(format_args!($($arg)*))
+    };
+}
