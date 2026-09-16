@@ -162,7 +162,25 @@ fn describe_stack_addr(addr: u64) -> alloc::string::String {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn general_protection_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
-    let (rip, rsp, error_code) = unsafe { ((*frame).rip, (*frame).rsp, (*frame).error_code) };
+    let (rip, error_code) = unsafe { ((*frame).rip, (*frame).error_code) };
+    // This handler only ever runs when the interrupted context was
+    // already in ring 0 (`exception_entry_with_code!`'s `test al, 3`
+    // branch) -- a same-privilege exception, for which the CPU never
+    // pushes RSP/SS at all (SDM Vol. 3 6.13: those two words only exist
+    // when the exception also raises the privilege level). Reading
+    // `(*frame).rsp` here would dereference memory the CPU never wrote --
+    // whatever stale bytes already happened to sit on this stack below
+    // the frame it actually pushed, not a real value; every prior
+    // capture using that field (docs/adr/0018, 0019) was comparing a
+    // genuine `rip` against noise, not real evidence of which stack this
+    // core was on. The real rsp this core had at the moment of the fault
+    // is recovered as a pure address computation instead: `frame`'s own
+    // address, plus the byte offset the (unwritten) `rsp` field would
+    // occupy, is exactly where the CPU's rsp was pointing right before
+    // it took this exception -- a same-privilege exception never moves
+    // the stack, so that address is real and correct even though nothing
+    // was ever stored there.
+    let rsp = frame as u64 + core::mem::offset_of!(FaultFrameWithCode, rsp) as u64;
     let core = percpu::core_index();
     let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
     crate::task::scheduler::dump_cores_for_panic();
@@ -194,7 +212,14 @@ pub extern "C" fn general_protection_fault_ring3(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
-    let (rip, rsp) = unsafe { ((*frame).rip, (*frame).rsp) };
+    let rip = unsafe { (*frame).rip };
+    // See `general_protection_fault_ring0`'s matching comment: this
+    // handler only runs for a same-privilege (ring0 -> ring0) exception,
+    // for which the CPU never pushes RSP/SS, so `(*frame).rsp` would be
+    // stale stack noise rather than a real value. `rsp` is instead
+    // recovered as the address the CPU's real rsp had at fault time (a
+    // same-privilege exception never moves the stack).
+    let rsp = frame as u64 + core::mem::offset_of!(FaultFrameWithCode, rsp) as u64;
     let error_code = PageFaultErrorCode::from_bits_truncate(unsafe { (*frame).error_code });
     let fault_addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     let core = percpu::core_index();
@@ -210,14 +235,13 @@ pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
     // states directly: which stack got a bad return address landed on it,
     // and which pid this faulting core itself was running when it happened.
     // Also reports `rsp`'s own attribution (see `describe_stack_addr`'s
-    // doc comment): a genuine capture (`docs/adr/0017`) showed a core's
-    // own `current` pid faulting on an instruction fetch from a
-    // *different* pid's kernel-stack slot, but that capture predates
-    // this diagnostic and never recorded whether `rsp` itself was
-    // already on the wrong stack (the more serious case) or still
-    // correctly on the running pid's own stack with only the fetched
-    // *value* being corrupted (a narrower, different bug). The next
-    // capture will show which.
+    // doc comment, and this function's own comment on how `rsp` is now
+    // computed) -- now a real address rather than the stale-stack-memory
+    // garbage this diagnostic read before the fix above (docs/adr/0020):
+    // every earlier capture's "current names one pid, rsp sits inside a
+    // different one's stack" observation (docs/adr/0018, 0019) needs to
+    // be treated as unreliable, since it was comparing a genuine `rip`
+    // against noise. The next capture is the first trustworthy one.
     panic!(
         "page fault accessing {:#x} (error {:?}) at {:#x} -- core {core} was running raw pid \
          {current_raw:#x}; the faulting address is {}; rsp ({:#x}) is {}",
