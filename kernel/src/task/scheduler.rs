@@ -861,25 +861,51 @@ fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! 
 /// `extern "C"` landing pad for [`abandon_process_stack_and_idle`]'s raw
 /// stack switch -- reassembles the `&'static str` its two register
 /// arguments were decomposed into (a fat pointer can't cross a raw
-/// `asm!` call directly), releases the `SCHEDULER` lock
+/// `asm!` call directly), switches this core's own CR3 off whatever
+/// address space it was using, *then* releases the `SCHEDULER` lock
 /// [`switch_to_next_or_halt`] deliberately left held across the switch
 /// (see that function's doc comment), and hands off to
 /// [`idle_loop_on_own_stack`].
 ///
+/// # Ordering: `activate_idle_address_space()` before `force_unlock()`
+/// An earlier version of this function released the lock *before*
+/// switching CR3 (clearing `STACK_BUSY` and unlocking first, activating
+/// the idle address space last) -- reasonable-looking, since none of
+/// those three steps touch each other's data. But releasing `SCHEDULER`
+/// is exactly the signal every other core's `terminate_process` (cross-
+/// core `SYS_KILL`) waits on before finalizing and freeing an evicted
+/// process's own `AddressSpace`: with the lock already free, a killer
+/// re-scanning at that exact instant can see this core's `current`
+/// correctly cleared, conclude the target isn't running anywhere, and
+/// free its PML4 -- while this core's CR3 *still points at that exact
+/// frame*, not yet having reached the `activate_idle_address_space()`
+/// call below. A genuine, reproduced instance of the same use-after-free
+/// [`terminate_current_process`]'s own deferred-drop fix closes for
+/// self-exit (see `docs/adr/0018`), just reached via eviction instead:
+/// switching CR3 while `SCHEDULER` is still held closes it here too,
+/// since a killer can't even begin its own re-scan until this lock is
+/// actually free.
+///
 /// # Safety
 /// `msg_ptr`/`msg_len` must together describe a valid, `'static` UTF-8
 /// string -- true for every real caller, which only ever passes through
-/// a `&'static str` it already had. `SCHEDULER` must actually still be
-/// locked by the caller that jumped here -- true for
-/// [`abandon_process_stack_and_idle`]'s one call site.
+/// a `&'static str` it already had. `pending_drops_ptr` must be a valid
+/// `Box::into_raw`'d `Vec<Box<Process>>` pointer -- true for
+/// [`abandon_process_stack_and_idle`]'s one call site, the only place
+/// that ever constructs one. `SCHEDULER` must actually still be locked
+/// by the caller that jumped here -- also true for that one call site.
 extern "C" fn idle_loop_trampoline(
     core: u64,
     msg_ptr: *const u8,
     msg_len: u64,
     outgoing_index_or_sentinel: u64,
+    pending_drops_ptr: u64,
 ) -> ! {
     let halt_message: &'static str =
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg_ptr, msg_len as usize)) };
+    // See this function's own doc comment on why this must run *before*
+    // `force_unlock()` below, not after.
+    activate_idle_address_space();
     // SAFETY: see this function's own doc comment.
     unsafe { SCHEDULER.force_unlock() };
     // The raw `mov rsp, {top}` just above this call is what actually
@@ -892,7 +918,15 @@ extern "C" fn idle_loop_trampoline(
     if outgoing_index_or_sentinel != usize::MAX as u64 {
         clear_stack_busy(outgoing_index_or_sentinel as usize);
     }
-    activate_idle_address_space();
+    // Safe now that `activate_idle_address_space()` above has already
+    // moved this core's own CR3 off of whatever address space(s)
+    // `pending_drops` belongs to -- dropping it here can no longer race
+    // a concurrent reallocation of its PML4/page-table frames against
+    // this core's own in-flight instruction fetches through them. See
+    // `docs/adr/0018`.
+    // SAFETY: see this function's own doc comment.
+    let pending_drops = unsafe { Box::from_raw(pending_drops_ptr as *mut Vec<Box<Process>>) };
+    drop(pending_drops);
     idle_loop_on_own_stack(core as usize, Some(halt_message))
 }
 
@@ -953,6 +987,7 @@ fn abandon_process_stack_and_idle(
     core: usize,
     halt_message: &'static str,
     outgoing_index: Option<usize>,
+    pending_drops: Vec<Box<Process>>,
 ) -> ! {
     let idle_top = crate::arch::x86_64::smp::idle_stack_top_addr(core).as_u64();
     let msg_ptr = halt_message.as_ptr();
@@ -960,6 +995,12 @@ fn abandon_process_stack_and_idle(
     // `usize::MAX` as a sentinel for "no busy index to clear" -- never a
     // real table index (`MAX_PROCESSES` is nowhere near `usize::MAX`).
     let outgoing_index_or_sentinel = outgoing_index.unwrap_or(usize::MAX) as u64;
+    // `pending_drops` (see `switch_to_next_or_halt`'s doc comment) must
+    // survive the raw stack switch below, but a `Vec` is three words, not
+    // one register -- boxed so a single pointer carries it across, then
+    // reconstructed and dropped by `idle_loop_trampoline` once this core
+    // has actually moved off whatever address space(s) it references.
+    let pending_drops_ptr = Box::into_raw(Box::new(pending_drops)) as u64;
     unsafe {
         core::arch::asm!(
             "mov rsp, {top}",
@@ -970,6 +1011,7 @@ fn abandon_process_stack_and_idle(
             in("rsi") msg_ptr,
             in("rdx") msg_len,
             in("rcx") outgoing_index_or_sentinel,
+            in("r8") pending_drops_ptr,
             options(noreturn),
         );
     }
@@ -1034,13 +1076,25 @@ fn abandon_process_stack_and_idle(
 /// place. Whichever exit path this function takes clears it once this
 /// core has genuinely finished with that stack — see [`STACK_BUSY`]'s
 /// own doc comment.
+/// `pending_drops`: any `Box<Process>`(es) a caller already extracted
+/// from the table (typically the outgoing process's own, from
+/// `terminate_current_process`) but has *not yet dropped* — see that
+/// function's own doc comment for why dropping one (which frees its
+/// `AddressSpace`'s physical frames, including its PML4) must wait until
+/// *after* this core's own CR3 has moved off of it, not merely until the
+/// `SCHEDULER` lock is released. Empty for every caller that isn't
+/// terminating anything (`wait_for_child`'s `MustBlock` arm,
+/// `block_current_process`) or whose finalize happens on a *different*
+/// core (`on_reschedule_ipi`'s eviction branch — see that function's own
+/// doc comment on why this specific path isn't covered yet).
 fn switch_to_next_or_halt(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     halt_message: &'static str,
     outgoing_index: Option<usize>,
+    pending_drops: Vec<Box<Process>>,
 ) -> *mut TrapFrame {
     if let Some(next_pid) = sched.ready.pop() {
-        return finish_switch(sched, next_pid, outgoing_index);
+        return finish_switch(sched, next_pid, outgoing_index, pending_drops);
     }
 
     // No `drop(sched)` here -- see this function's doc comment.
@@ -1049,7 +1103,7 @@ fn switch_to_next_or_halt(
     // doc comment documents and relies on exactly this), so `SCHEDULER`
     // stays locked until `idle_loop_trampoline` releases it.
     core::mem::forget(sched);
-    abandon_process_stack_and_idle(percpu::core_index(), halt_message, outgoing_index);
+    abandon_process_stack_and_idle(percpu::core_index(), halt_message, outgoing_index, pending_drops);
 }
 
 /// The BSP's own first entry, right after `main.rs` spawns `init`, and
@@ -1069,9 +1123,24 @@ fn finish_switch(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     next_pid: Pid,
     outgoing_index: Option<usize>,
+    pending_drops: Vec<Box<Process>>,
 ) -> *mut TrapFrame {
     let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
     drop(sched);
+    // Only safe now that `switch_to` above has activated `next_pid`'s own
+    // (different) address space: dropping `pending_drops` here frees any
+    // outgoing process's `AddressSpace`, including its PML4 frame. Doing
+    // that any earlier -- e.g. back when the process was first finalized,
+    // before this core had switched off its CR3 -- would return that
+    // exact physical frame to the allocator while this core's own MMU was
+    // still walking it for every instruction fetch, letting a concurrent
+    // allocation on another core (or a new process's own `AddressSpace`)
+    // overwrite it out from under this core. A real, reproduced bug (a
+    // page fault on a genuine `.text` address that IS mapped everywhere
+    // else, or `rsp` landing inside a *different* process's own
+    // kernel-stack slot despite `current` correctly reading idle) --
+    // see `docs/adr/0018`.
+    drop(pending_drops);
     maybe_print_switch(next_pid, rax, rbx);
     // Still running on `outgoing_index`'s own kernel stack all the way
     // through here (this function never switches stacks itself — only
@@ -1219,22 +1288,35 @@ fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec
     }
 }
 
-/// Shared core of self-exit, fault-kill, and `SYS_KILL`: finalizes the
-/// process named by `pid` and everything that cascades from it (see
-/// [`take_and_finalize_slot`]), then drops its `Box<Process>` — freeing
-/// its `AddressSpace`'s physical frames via `Drop for AddressSpace`
-/// (`memory::virt`) — only *after* releasing the scheduler lock, since
-/// that walk is a variable-length operation this codebase's convention
-/// keeps off the lock's critical path (see `resolve_endpoint`'s and
-/// `sys_grant`'s doc comments for the same rule applied elsewhere).
-fn terminate_slot(pid: Pid, status: ExitStatus) {
+/// Shared core of self-exit and fault-kill: finalizes the process named
+/// by `pid` and everything that cascades from it (see
+/// [`take_and_finalize_slot`]), and hands back its `Box<Process>` (and
+/// any orphaned children's) *without dropping it* — dropping one frees
+/// its `AddressSpace`'s physical frames, including its own PML4, via
+/// `Drop for AddressSpace` (`memory::virt`).
+///
+/// Deliberately does not drop `pending_drops` itself, unlike this
+/// function's own name might suggest from `docs/adr/0007`/`0012`'s
+/// original design: `pid` here always names the process still actually
+/// *executing* this exact call, on its own kernel stack, under its own
+/// still-active CR3 (self-exit and fault-kill are the only two callers,
+/// both reached from a process killing itself or being killed for its
+/// own fault — never a third party). Freeing its `AddressSpace` this
+/// early would return its PML4 frame to the allocator while this core's
+/// own MMU is still walking it for every subsequent instruction fetch —
+/// a genuine, reproduced use-after-free once a *different* core
+/// reallocates that exact frame for a new process's own page tables in
+/// the gap before this core's CR3 actually changes (see
+/// [`terminate_current_process`], which is the only caller and is what
+/// actually defers the drop to the right moment). See `docs/adr/0018`.
+fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<Box<Process>> {
     let mut pending_drops = Vec::new();
     {
         let mut sched = SCHEDULER.lock();
         take_and_finalize_slot(&mut sched, pid, status, &mut pending_drops);
     }
     wake_orphaned_receivers(&pending_drops);
-    drop(pending_drops); // outside the lock: frees every AddressSpace's frames
+    pending_drops
 }
 
 /// For each of `dying`'s own capabilities, wakes any process still
@@ -1329,20 +1411,27 @@ pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
         let sched = SCHEDULER.lock();
         sched.current[percpu::core_index()]
     };
-    if let Some(pid) = current {
+    // Held here, not dropped, until `switch_to_next_or_halt` below has
+    // actually moved this core's own CR3 off of `pid`'s `AddressSpace` --
+    // see `terminate_slot`'s own doc comment for the use-after-free this
+    // closes (`docs/adr/0018`).
+    let pending_drops = if let Some(pid) = current {
         // Marked *before* `terminate_slot` runs (which is what actually
         // makes this index reusable, via `take_and_finalize_slot`) --
         // this core is about to keep running, on this exact stack,
         // through everything `switch_to_next_or_halt` below still does.
         // See `STACK_BUSY`'s own doc comment.
         mark_stack_busy(pid.index());
-        terminate_slot(pid, status);
-    }
+        terminate_slot(pid, status)
+    } else {
+        Vec::new()
+    };
     let sched = SCHEDULER.lock();
     switch_to_next_or_halt(
         sched,
         "[sched] last process exited, halting.",
         current.map(|pid| pid.index()),
+        pending_drops,
     )
 }
 
@@ -1539,10 +1628,18 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     // `terminate_process` (spinning on another core) is about to see
     // `current[core]` cleared and finalize this slot. See `STACK_BUSY`.
     mark_stack_busy(evicted_pid.index());
+    // No `pending_drops` here: `terminate_process` -- on the *killer's*
+    // core, not this one -- is what actually finalizes and frees
+    // `evicted_pid`'s own `AddressSpace`, once its own spin-wait observes
+    // this core's `current` clear. That still races this core's own CR3
+    // switch below exactly like `docs/adr/0018` describes for self-exit
+    // -- not yet closed for this cross-core path; see that ADR's own
+    // "what remains open."
     switch_to_next_or_halt(
         sched,
         "[sched] evicted core found nothing else ready, halting.",
         Some(evicted_pid.index()),
+        Vec::new(),
     )
 }
 
@@ -1615,6 +1712,7 @@ pub fn wait_for_child(current_frame: *mut TrapFrame, target: Pid, caller: Pid) -
                 sched,
                 "[sched] every process blocked or exited, halting.",
                 None,
+                Vec::new(),
             )
         }
         Outcome::Invalid => {
@@ -1824,6 +1922,7 @@ pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         sched,
         "[sched] every process blocked or exited, halting.",
         None,
+        Vec::new(),
     )
 }
 
