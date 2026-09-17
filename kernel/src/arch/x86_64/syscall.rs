@@ -189,6 +189,15 @@ pub fn set_syscall_kernel_stack(top: VirtAddr) {
     KERNEL_RSP_SLOTS[percpu::core_index()].store(top.as_u64(), Ordering::Relaxed);
 }
 
+/// Reads back this calling core's own `SYSCALL` kernel-stack scratch
+/// cell — see [`set_syscall_kernel_stack`]'s own doc comment. Exists
+/// purely for `task::scheduler::switch_to`'s own read-back assertion
+/// (see `docs/adr/0023`), mirroring `gdt::kernel_stack`'s identical
+/// purpose for `TSS.RSP0`.
+pub fn syscall_kernel_stack() -> VirtAddr {
+    VirtAddr::new(KERNEL_RSP_SLOTS[percpu::core_index()].load(Ordering::Relaxed))
+}
+
 /// Programs the MSRs `SYSCALL` needs: `STAR` (segment selectors, laid out
 /// so this matches the GDT ordering fixed back when the GDT itself was
 /// built — see `gdt`'s module doc comment), `LSTAR` (this core's own

@@ -502,6 +502,21 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
         }
     }
     set_current(sched, this_core, Some(pid));
+    // Read-back, immediately: confirms the write just above actually
+    // stuck, rather than trusting it silently. See `docs/adr/0023` —
+    // this and the other read-back/cross-checks added alongside it
+    // exist because this investigation's entire body of evidence is
+    // "a core resumed into a plausible-looking but wrong state," which
+    // is exactly what a write that silently failed or got clobbered
+    // between here and its next read would look like from the outside.
+    assert_eq!(
+        sched.current[this_core],
+        Some(pid),
+        "switch_to: core {this_core}'s own current[] slot reads back {:?} immediately after \
+         being set to Some({pid:?}) -- the write itself was corrupted or clobbered before this \
+         function could even finish",
+        sched.current[this_core]
+    );
     let index = pid.index();
     // Every other pid resolution in this module (`occupied_mut`,
     // `wait_for_child`, `on_reschedule_ipi`) checks the table's current
@@ -529,17 +544,75 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
         Slot::Occupied(process) => process,
         _ => panic!("switch_to named a process that does not exist"),
     };
+    // The flagship check for this round (see `docs/adr/0023`): the
+    // generation assert above already validated the *table's own*
+    // bookkeeping for this slot, but `Process::kernel_stack_top`
+    // computes its address from `self.pid` -- the struct's *own*
+    // stored field, not from `index`. These are two independent
+    // pieces of state that nothing before now ever cross-checked
+    // against each other. If they were ever to desync, this assert
+    // fires here, immediately and attributably; without it,
+    // `kernel_stack_top` below would silently compute the address of
+    // some *other* slot's kernel stack, and every following line in
+    // this function (TSS.RSP0, the SYSCALL scratch cell) would then
+    // faithfully point this core at that wrong stack.
+    assert_eq!(
+        process.pid, pid,
+        "switch_to: slot {index}'s own stored Process.pid is {:?}, but it was looked up by \
+         {pid:?} -- kernel_stack_top() is about to compute its address from the stored (wrong) \
+         pid, not this slot's real identity",
+        process.pid
+    );
     process.state = ProcessState::Running;
 
     let kernel_stack_top: VirtAddr = process.kernel_stack_top();
     unsafe {
         process.address_space.activate();
+        // Read-back: every other write in this function (TSS.RSP0, the
+        // SYSCALL scratch cell, `current[]`) already gets one -- CR3 never
+        // did, despite being the one write that determines whether every
+        // *subsequent* memory access in this function (and everything the
+        // resumed process itself does) lands in the right address space at
+        // all. See `docs/adr/0023`: a real double fault was captured this
+        // round with its RIP immediately after `syscall_dispatch`'s own
+        // `mov rax, rsp` / first `pop`, i.e. immediately after a resume
+        // whose `activate()` had already run -- consistent with, though
+        // not proof of, exactly this write silently not sticking.
+        assert_eq!(
+            x86_64::registers::control::Cr3::read().0,
+            process.address_space.pml4_frame(),
+            "switch_to: CR3 reads back frame {:#x} immediately after being set to this slot's \
+             own pml4_frame {:#x} for {pid:?} -- the write itself was corrupted or clobbered \
+             before this function could even finish",
+            x86_64::registers::control::Cr3::read().0.start_address().as_u64(),
+            process.address_space.pml4_frame().start_address().as_u64()
+        );
         gdt::set_kernel_stack(kernel_stack_top);
+        // Read-back: see this function's other identical checks and
+        // `docs/adr/0023`.
+        assert_eq!(
+            gdt::kernel_stack(),
+            kernel_stack_top,
+            "switch_to: TSS.RSP0 reads back {:#x} immediately after being set to {:#x} for \
+             {pid:?} -- the write itself was corrupted or clobbered before this function could \
+             even finish",
+            gdt::kernel_stack().as_u64(),
+            kernel_stack_top.as_u64()
+        );
     }
     // SYSCALL (unlike an interrupt) never switches stacks on its own, so
     // the syscall entry trampoline needs its own record of "the current
     // kernel stack," read directly rather than via the TSS.
     crate::arch::x86_64::syscall::set_syscall_kernel_stack(kernel_stack_top);
+    assert_eq!(
+        crate::arch::x86_64::syscall::syscall_kernel_stack(),
+        kernel_stack_top,
+        "switch_to: the SYSCALL kernel-stack scratch cell reads back {:#x} immediately after \
+         being set to {:#x} for {pid:?} -- the write itself was corrupted or clobbered before \
+         this function could even finish",
+        crate::arch::x86_64::syscall::syscall_kernel_stack().as_u64(),
+        kernel_stack_top.as_u64()
+    );
 
     // Validates the frame about to be handed back for an eventual
     // `iretq` (either via `context_switch::resume` or an interrupt
@@ -557,6 +630,7 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     // exactly which process's saved frame was already bad *before* this
     // core ever tried to resume it.
     let user_cs = gdt::selectors().user_code.0 as u64;
+    let user_ss = gdt::selectors().user_data.0 as u64;
     let frame = &process.trap_frame;
     assert_eq!(
         frame.cs, user_cs,
@@ -570,6 +644,24 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
         "switch_to: {pid:?}'s saved trap frame has rip={:#x}, outside the canonical user \
          address range -- corrupted before this core ever touched it (cs={:#x}, rsp={:#x})",
         frame.rip, frame.cs, frame.rsp
+    );
+    // The `rsp`/`ss` counterpart to the `cs`/`rip` checks above (see
+    // `docs/adr/0023`): this whole investigation's evidence has
+    // repeatedly shown a core resuming onto a stack that doesn't match
+    // its own tracked identity, but nothing before now validated a
+    // saved frame's `rsp`/`ss` the same way `cs`/`rip` already were.
+    assert_eq!(
+        frame.ss, user_ss,
+        "switch_to: {pid:?}'s saved trap frame has ss={:#x}, expected the ring-3 data \
+         selector {user_ss:#x} -- corrupted before this core ever touched it (rip={:#x}, \
+         rsp={:#x})",
+        frame.ss, frame.rip, frame.rsp
+    );
+    assert!(
+        frame.rsp < 0x0000_8000_0000_0000,
+        "switch_to: {pid:?}'s saved trap frame has rsp={:#x}, outside the canonical user \
+         address range -- corrupted before this core ever touched it (rip={:#x}, cs={:#x})",
+        frame.rsp, frame.rip, frame.cs
     );
 
     (

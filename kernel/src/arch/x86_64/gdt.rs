@@ -242,3 +242,20 @@ pub unsafe fn set_kernel_stack(rsp0: VirtAddr) {
         (*TSS_TABLE[core_index].0.get()).privilege_stack_table[0] = rsp0;
     }
 }
+
+/// Reads back this calling core's own TSS.RSP0 — see
+/// [`set_kernel_stack`]'s own doc comment for what it holds. Exists
+/// purely for `task::scheduler::switch_to`'s own read-back assertion
+/// (see `docs/adr/0023`): re-reading the value immediately after
+/// writing it turns "TSS.RSP0 silently held the wrong value" into an
+/// immediate, attributable panic naming exactly that, rather than a
+/// fault an unknown number of instructions later on whatever core
+/// next takes a privilege-raising trap.
+///
+/// # Safety
+/// Same as [`set_kernel_stack`]: must only be called with interrupts
+/// disabled.
+pub unsafe fn kernel_stack() -> VirtAddr {
+    let core_index = percpu::core_index();
+    unsafe { (*TSS_TABLE[core_index].0.get()).privilege_stack_table[0] }
+}

@@ -83,6 +83,7 @@ extern "x86-interrupt" fn double_fault_handler(
     error_code: u64,
 ) -> ! {
     let core = percpu::core_index();
+    crate::lang_items::claim_panic_reporter(core);
     let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
     crate::task::scheduler::dump_cores_for_panic();
     let rip = stack_frame.instruction_pointer.as_u64();
@@ -182,6 +183,7 @@ pub extern "C" fn general_protection_fault_ring0(frame: *mut FaultFrameWithCode)
     // was ever stored there.
     let rsp = frame as u64 + core::mem::offset_of!(FaultFrameWithCode, rsp) as u64;
     let core = percpu::core_index();
+    crate::lang_items::claim_panic_reporter(core);
     let current_raw = percpu::slot(core).current.load(core::sync::atomic::Ordering::Acquire);
     crate::task::scheduler::dump_cores_for_panic();
     // See `page_fault_ring0`'s matching comment: naming which process-table
@@ -223,6 +225,7 @@ pub extern "C" fn page_fault_ring0(frame: *mut FaultFrameWithCode) -> ! {
     let error_code = PageFaultErrorCode::from_bits_truncate(unsafe { (*frame).error_code });
     let fault_addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     let core = percpu::core_index();
+    crate::lang_items::claim_panic_reporter(core);
     // Lock-free (`percpu::PerCpuSlot.current`'s whole reason to exist) --
     // safe to read from a panic handler that must never risk contending
     // (or deadlocking on) `SCHEDULER` itself.
