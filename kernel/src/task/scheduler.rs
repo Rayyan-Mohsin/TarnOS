@@ -7,13 +7,16 @@
 //! lock is not interrupt-reentrant. A fixed-capacity design means the
 //! hot preemption path never allocates, so it can never deadlock against
 //! normal code caught mid-allocation when the timer fires. Process
-//! *creation* ([`spawn`]) does allocate (`Box::new`), but only ever runs
+//! *creation* ([`spawn`]) does allocate (`ProcessBox::new`, see
+//! `docs/adr/0027` — a dedicated guard-paged slot pool, not the general
+//! kernel heap, but still gated by its own lock), but only ever runs
 //! from normal, non-interrupt code. Process *termination* similarly
 //! allocates a small, bounded `Vec` (see [`terminate_slot`]) for the
 //! same reason — never from interrupt context.
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Once;
@@ -62,7 +65,7 @@ type ReadyQueue = tarnos_kcore::RingBuffer<Pid, MAX_PROCESSES>;
 enum Slot {
     Empty,
     Reserved,
-    Occupied(Box<Process>),
+    Occupied(ProcessBox),
     Zombie { parent: Pid, status: ExitStatus },
 }
 
@@ -145,16 +148,7 @@ const SCHED_FIELD_STRIDE: u64 = 0x1_0000;
 /// this exact primitive for `Process::trap_frame`'s own guarded slots —
 /// see `docs/adr/0026`.
 pub(crate) fn map_guarded<T>(slot_base: u64, init: T) -> &'static mut T {
-    let mut allocator = GlobalFrameAllocator;
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let pages = (core::mem::size_of::<T>() as u64).div_ceil(4096).max(1);
-    for i in 1..=pages {
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
-        let frame = allocator
-            .allocate_frame()
-            .expect("out of memory mapping guarded scheduler state");
-        virt::map(page, frame, flags).expect("failed to map a guarded scheduler state page");
-    }
+    map_guarded_raw(slot_base, core::mem::size_of::<T>());
     // `slot_base` itself (below the real data) and
     // `slot_base + 4096 * (1 + pages)` (immediately above it) are
     // deliberately left unmapped -- see this function's own doc comment.
@@ -172,6 +166,30 @@ pub(crate) fn map_guarded<T>(slot_base: u64, init: T) -> &'static mut T {
     }
 }
 
+/// Maps `size` bytes' worth of pages at `slot_base + 4096`, leaving the
+/// page immediately below and the page immediately above unmapped as
+/// guard pages -- the same shape [`map_guarded`] maps, factored out for
+/// [`map_guarded`] itself and for callers that need a slot big enough to
+/// hold a value later, without writing a placeholder one now. See
+/// [`ProcessBox`] (`docs/adr/0027`): unlike `task::process::init_trap_frames`'s
+/// all-zero placeholder `TrapFrame`, a placeholder `Process` isn't
+/// written up front here, since it would need a real, wastefully
+/// allocated `AddressSpace` (a whole PML4 frame) just to be droppable
+/// correctly, for every one of [`PROCESS_SLOT_COUNT`]'s slots, most of
+/// which sit unused most of the time.
+fn map_guarded_raw(slot_base: u64, size: usize) {
+    let mut allocator = GlobalFrameAllocator;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let pages = (size as u64).div_ceil(4096).max(1);
+    for i in 1..=pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
+        let frame = allocator
+            .allocate_frame()
+            .expect("out of memory mapping a guarded slot");
+        virt::map(page, frame, flags).expect("failed to map a guarded slot page");
+    }
+}
+
 /// Builds [`Inner`] by giving each of its four fields its own call to
 /// [`map_guarded`], at four separate slots spaced [`SCHED_FIELD_STRIDE`]
 /// apart starting from [`SCHED_STATE_BASE`].
@@ -182,6 +200,153 @@ fn map_guarded_scheduler_state() -> Inner {
         generations: map_guarded(SCHED_STATE_BASE + SCHED_FIELD_STRIDE, [0u32; MAX_PROCESSES]),
         ready: map_guarded(SCHED_STATE_BASE + 2 * SCHED_FIELD_STRIDE, ReadyQueue::new()),
         current: map_guarded(SCHED_STATE_BASE + 3 * SCHED_FIELD_STRIDE, [None; MAX_CORES]),
+    }
+}
+
+/// Number of guard-paged whole-[`Process`] slots [`ProcessBox`] hands
+/// out from -- see `docs/adr/0027`. Twice [`MAX_PROCESSES`], not equal
+/// to it: a terminating process's own `ProcessBox` is extracted from
+/// the table into `pending_drops` -- deferred until this core's CR3 has
+/// moved off its `AddressSpace`, see `terminate_slot` -- *before* its
+/// old table index is freed for reuse, so a fresh process can already
+/// occupy that same index while the old occupant's `ProcessBox` still
+/// hasn't actually dropped. Worst case, one terminate batch carries an
+/// entire dying parent plus every orphaned child it reaps alongside it
+/// (up to `MAX_PROCESSES` distinct, still-undropped `ProcessBox`es --
+/// see `reap_children_of`) at the exact moment a fresh `MAX_PROCESSES`
+/// already fill the table again.
+const PROCESS_SLOT_COUNT: usize = MAX_PROCESSES * 2;
+
+/// Base of the guard-paged region holding every [`ProcessBox`]'s actual
+/// `Process` storage -- see `docs/adr/0027`. Sits between the trap-frame
+/// region (`0xffff_9750_...`, see `task::process`'s `TRAP_FRAME_BASE`)
+/// and the kernel-stacks region (`0xffff_9800_...`, see
+/// `task::process`'s `KERNEL_STACKS_BASE`).
+const PROCESS_BOX_BASE: u64 = 0xffff_9770_0000_0000;
+
+/// 64 KiB per slot -- comfortably more than `Process`'s own size, for
+/// the same "can't ever collide as the type grows" reason
+/// [`SCHED_FIELD_STRIDE`] documents.
+const PROCESS_BOX_STRIDE: u64 = 0x1_0000;
+
+fn process_box_slot_base(slot: usize) -> u64 {
+    PROCESS_BOX_BASE + slot as u64 * PROCESS_BOX_STRIDE
+}
+
+/// Free/in-use bitmap for [`PROCESS_SLOT_COUNT`]'s guard-paged slots.
+/// Deliberately its own ordinary, un-guarded `.bss` storage, and its own
+/// dedicated lock rather than `SCHEDULER`'s: [`ProcessBox`]'s `Drop`
+/// must be able to free a slot from `idle_loop_trampoline`, which runs
+/// *after* `SCHEDULER` has already been released (see that function's
+/// own doc comment) -- reacquiring `SCHEDULER` there would be a
+/// use-after-unlock, not merely a lock-ordering inversion. A wild write
+/// landing on this bitmap would corrupt slot bookkeeping, not process
+/// data, which is what this experiment (`docs/adr/0027`) is actually
+/// about -- so unlike the slots themselves, it doesn't need guard pages.
+static PROCESS_SLOT_FREE: SpinLock<[bool; PROCESS_SLOT_COUNT]> =
+    SpinLock::new([false; PROCESS_SLOT_COUNT]);
+
+/// Maps every one of [`PROCESS_SLOT_COUNT`]'s slots -- each large enough
+/// for a whole `Process`, guard-paged front and back -- without writing
+/// any value into them yet; see [`map_guarded_raw`]'s own doc comment.
+/// Must run before the first `AddressSpace::new()` call, same as every
+/// other guard-paged region in this codebase -- see [`map_guarded`]'s
+/// doc comment.
+pub fn init_process_slots() {
+    for slot in 0..PROCESS_SLOT_COUNT {
+        map_guarded_raw(process_box_slot_base(slot), core::mem::size_of::<Process>());
+    }
+}
+
+fn alloc_process_slot() -> usize {
+    let mut free = PROCESS_SLOT_FREE.lock();
+    let slot = free
+        .iter()
+        .position(|used| !used)
+        .expect("out of guarded process slots -- see docs/adr/0027's PROCESS_SLOT_COUNT");
+    free[slot] = true;
+    slot
+}
+
+fn free_process_slot(slot: usize) {
+    PROCESS_SLOT_FREE.lock()[slot] = false;
+}
+
+/// Owns exactly one [`Process`], the same way `Box<Process>` used to --
+/// `Deref`/`DerefMut` to it transparently everywhere, drops its
+/// resources (`AddressSpace`'s own `Drop` frees its PML4 and every
+/// mapped user frame) exactly once, when this value itself drops. The
+/// difference, and the entire point of this type: backing storage is
+/// one of [`PROCESS_SLOT_COUNT`]'s guard-paged slots
+/// ([`PROCESS_BOX_BASE`]), not an ordinary allocation from the general
+/// kernel heap -- see `docs/adr/0027`, motivated by `docs/adr/0026`'s
+/// own decisive capture of a live `Process`'s `trap_frame` field itself
+/// (not the guard-paged memory it points to) reading back as null,
+/// proving something reaches inside a `Process`'s own heap allocation.
+/// Guard-paging that allocation itself is this investigation's next
+/// falsifiable test of the same "a wild write overshoots into this
+/// specific region" hypothesis ADR 0025/0026 already ran clean for
+/// every other kind of scheduler state. Never actually deallocated for
+/// the lifetime of the kernel; [`Drop`] returns the slot to
+/// [`PROCESS_SLOT_FREE`] for the next `ProcessBox` to reuse instead.
+pub(crate) struct ProcessBox {
+    ptr: *mut Process,
+    slot: usize,
+}
+
+// SAFETY: same reasoning `Send for Box<T> where T: Send` already relies
+// on -- `ProcessBox` exclusively owns its `Process`, so transferring
+// that ownership to another core (e.g. via `pending_drops` crossing the
+// raw stack switch in `abandon_process_stack_and_idle`) is sound exactly
+// when `Process` itself contains no non-`Send` state, which it doesn't.
+unsafe impl Send for ProcessBox {}
+
+impl ProcessBox {
+    fn new(process: Process) -> Self {
+        let slot = alloc_process_slot();
+        let ptr = (process_box_slot_base(slot) + 4096) as *mut Process;
+        // SAFETY: `init_process_slots` mapped this exact address,
+        // writable, before any `Process` could exist; `alloc_process_slot`
+        // just marked this slot in-use under its own lock, so nothing
+        // else can be using it concurrently, and no live value needs
+        // dropping here first -- `init_process_slots` never wrote one,
+        // and this slot can only have held a previous `Process` if some
+        // earlier `ProcessBox` already ran its own `Drop` (which frees
+        // the slot only *after* dropping whatever was there) before
+        // `alloc_process_slot` could ever hand it out again.
+        unsafe { ptr.write(process) };
+        Self { ptr, slot }
+    }
+}
+
+impl Deref for ProcessBox {
+    type Target = Process;
+    fn deref(&self) -> &Process {
+        // SAFETY: `new` wrote a live `Process` at `ptr`, and nothing
+        // else writes to or frees this slot's memory before this same
+        // value's own `Drop` runs.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl DerefMut for ProcessBox {
+    fn deref_mut(&mut self) -> &mut Process {
+        // SAFETY: see `Deref::deref` above; `&mut self` here rules out
+        // any other live borrow through this same `ProcessBox`.
+        unsafe { &mut *self.ptr }
+    }
+}
+
+impl Drop for ProcessBox {
+    fn drop(&mut self) {
+        // SAFETY: this `ProcessBox` exclusively owns this `Process` and
+        // is dropped at most once (ordinary `Drop` semantics); running
+        // its destructor here, exactly once, mirrors what `Box<Process>`
+        // used to do automatically -- `AddressSpace::drop` frees its
+        // PML4 and every mapped user frame, and `CapTable`'s own backing
+        // `Vec` frees its general-heap storage.
+        unsafe { core::ptr::drop_in_place(self.ptr) };
+        free_process_slot(self.slot);
     }
 }
 
@@ -537,7 +702,7 @@ pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
     let mut sched = scheduler_lock();
-    sched.processes[index] = Slot::Occupied(Box::new(process));
+    sched.processes[index] = Slot::Occupied(ProcessBox::new(process));
     sched.ready.push(pid);
     drop(sched);
     notify_idle_cores();
@@ -558,7 +723,7 @@ pub fn spawn_suspended(process: Process) -> Result<(), tarnos_abi::SyscallError>
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
     let mut sched = scheduler_lock();
-    sched.processes[index] = Slot::Occupied(Box::new(process));
+    sched.processes[index] = Slot::Occupied(ProcessBox::new(process));
     Ok(())
 }
 
@@ -1141,7 +1306,7 @@ fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! 
 /// `msg_ptr`/`msg_len` must together describe a valid, `'static` UTF-8
 /// string -- true for every real caller, which only ever passes through
 /// a `&'static str` it already had. `pending_drops_ptr` must be a valid
-/// `Box::into_raw`'d `Vec<Box<Process>>` pointer -- true for
+/// `Box::into_raw`'d `Vec<ProcessBox>` pointer -- true for
 /// [`abandon_process_stack_and_idle`]'s one call site, the only place
 /// that ever constructs one. `SCHEDULER` must actually still be locked
 /// by the caller that jumped here -- also true for that one call site.
@@ -1176,7 +1341,7 @@ extern "C" fn idle_loop_trampoline(
     // this core's own in-flight instruction fetches through them. See
     // `docs/adr/0018`.
     // SAFETY: see this function's own doc comment.
-    let pending_drops = unsafe { Box::from_raw(pending_drops_ptr as *mut Vec<Box<Process>>) };
+    let pending_drops = unsafe { Box::from_raw(pending_drops_ptr as *mut Vec<ProcessBox>) };
     drop(pending_drops);
     idle_loop_on_own_stack(core as usize, Some(halt_message))
 }
@@ -1238,7 +1403,7 @@ fn abandon_process_stack_and_idle(
     core: usize,
     halt_message: &'static str,
     outgoing_index: Option<usize>,
-    pending_drops: Vec<Box<Process>>,
+    pending_drops: Vec<ProcessBox>,
 ) -> ! {
     let idle_top = crate::arch::x86_64::smp::idle_stack_top_addr(core).as_u64();
     let msg_ptr = halt_message.as_ptr();
@@ -1327,7 +1492,7 @@ fn abandon_process_stack_and_idle(
 /// place. Whichever exit path this function takes clears it once this
 /// core has genuinely finished with that stack — see [`STACK_BUSY`]'s
 /// own doc comment.
-/// `pending_drops`: any `Box<Process>`(es) a caller already extracted
+/// `pending_drops`: any `ProcessBox`(es) a caller already extracted
 /// from the table (typically the outgoing process's own, from
 /// `terminate_current_process`) but has *not yet dropped* — see that
 /// function's own doc comment for why dropping one (which frees its
@@ -1342,7 +1507,7 @@ fn switch_to_next_or_halt(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     halt_message: &'static str,
     outgoing_index: Option<usize>,
-    pending_drops: Vec<Box<Process>>,
+    pending_drops: Vec<ProcessBox>,
 ) -> *mut TrapFrame {
     if let Some(next_pid) = sched.ready.pop() {
         return finish_switch(sched, next_pid, outgoing_index, pending_drops);
@@ -1374,7 +1539,7 @@ fn finish_switch(
     mut sched: crate::sync::SpinLockGuard<'_, Inner>,
     next_pid: Pid,
     outgoing_index: Option<usize>,
-    pending_drops: Vec<Box<Process>>,
+    pending_drops: Vec<ProcessBox>,
 ) -> *mut TrapFrame {
     let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
     drop(sched);
@@ -1445,14 +1610,14 @@ fn remove_from_ready_queue(sched: &mut Inner, target: Pid) {
 /// - sweeps its own leftover children the same way (see
 ///   [`reap_children_of`]).
 ///
-/// The extracted `Box<Process>` (and any orphaned children's) is pushed
+/// The extracted `ProcessBox` (and any orphaned children's) is pushed
 /// onto `pending_drops` rather than dropped here — see [`terminate_slot`]
 /// for why that has to happen after the scheduler lock is released.
 fn take_and_finalize_slot(
     sched: &mut Inner,
     pid: Pid,
     status: ExitStatus,
-    pending_drops: &mut Vec<Box<Process>>,
+    pending_drops: &mut Vec<ProcessBox>,
 ) {
     let index = pid.index();
     let process = match core::mem::replace(&mut sched.processes[index], Slot::Empty) {
@@ -1518,7 +1683,7 @@ fn take_and_finalize_slot(
 ///   straight to `Empty` instead (the same path a process with no parent
 ///   at all already takes), matching a real OS re-parenting an orphan
 ///   rather than leaving it un-reapable.
-fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec<Box<Process>>) {
+fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec<ProcessBox>) {
     for index in 0..MAX_PROCESSES {
         let is_orphaned_suspended = matches!(
             &sched.processes[index],
@@ -1545,7 +1710,7 @@ fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec
 
 /// Shared core of self-exit and fault-kill: finalizes the process named
 /// by `pid` and everything that cascades from it (see
-/// [`take_and_finalize_slot`]), and hands back its `Box<Process>` (and
+/// [`take_and_finalize_slot`]), and hands back its `ProcessBox` (and
 /// any orphaned children's) *without dropping it* — dropping one frees
 /// its `AddressSpace`'s physical frames, including its own PML4, via
 /// `Drop for AddressSpace` (`memory::virt`).
@@ -1564,7 +1729,7 @@ fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec
 /// the gap before this core's CR3 actually changes (see
 /// [`terminate_current_process`], which is the only caller and is what
 /// actually defers the drop to the right moment). See `docs/adr/0018`.
-fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<Box<Process>> {
+fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<ProcessBox> {
     let mut pending_drops = Vec::new();
     {
         let mut sched = scheduler_lock();
@@ -1617,7 +1782,7 @@ fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<Box<Process>> {
 /// transfer), so the set of live senders can only ever keep shrinking
 /// after pass 1 confirms it's already empty — never grow back in the
 /// gap before pass 2 runs.
-fn wake_orphaned_receivers(dying: &[Box<Process>]) {
+fn wake_orphaned_receivers(dying: &[ProcessBox]) {
     let mut orphaned: Vec<Arc<Endpoint>> = Vec::new();
     {
         let sched = scheduler_lock();

@@ -175,6 +175,11 @@ extern "C" fn _start() -> ! {
     // (docs/adr/0026).
     task::process::init_trap_frames();
 
+    // Same ordering requirement as every call above, for the same
+    // reason -- see `task::scheduler::init_process_slots`'s own doc
+    // comment (docs/adr/0027).
+    task::scheduler::init_process_slots();
+
     // Every boot module besides "init" itself becomes a program
     // SYS_SPAWN can create a process from by name — there is no
     // filesystem yet, so this fixed, boot-time set is the only source a
