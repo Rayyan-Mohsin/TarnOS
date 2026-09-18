@@ -710,13 +710,26 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 
     if let Some(current_pid) = sched.current[core] {
         percpu::slot(core).preempt_count.fetch_add(1, Ordering::Relaxed);
+        // Only re-queue `current_pid` if its slot is genuinely still
+        // `Occupied` by it -- every other `sched.ready.push` call site
+        // (`spawn`, `start_child`, `wake_blocked_process_locked`,
+        // `block_current_process_locked`) already gates on this same
+        // check before pushing; this one didn't, and was the one place
+        // in the whole dispatch path that could take a `current[core]`
+        // that no longer names a live process (any cause -- a genuine
+        // cross-core race, or the still-open corruption this
+        // investigation has been chasing) and hand it straight back to
+        // `switch_to` instead of dropping it. See `docs/adr/0023`'s
+        // "phantom pid" capture (`switch_to named a process that does
+        // not exist`) for why silently trusting `current[core]` here is
+        // exactly the propagation path that finding needs ruled out.
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
             process.trap_frame = unsafe { *current_frame };
             process.state = ProcessState::Ready;
+            sched.ready.push(current_pid);
         }
-        sched.ready.push(current_pid);
     }
 
     let result_frame = match sched.ready.pop() {
