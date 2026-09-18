@@ -18,14 +18,16 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Once;
 use tarnos_abi::{ExitStatus, Rights};
+use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::context_switch::TrapFrame;
 use crate::arch::x86_64::percpu::{self, MAX_CORES};
 use crate::arch::x86_64::{gdt, lapic};
 use crate::ipc::{Endpoint, KernelObjectRef};
-use crate::memory::virt::AddressSpace;
-use crate::sync::SpinLock;
+use crate::memory::phys::GlobalFrameAllocator;
+use crate::memory::virt::{self, AddressSpace};
+use crate::sync::{SpinLock, SpinLockGuard};
 
 use super::process::{Process, ProcessState};
 use super::Pid;
@@ -64,14 +66,37 @@ enum Slot {
     Zombie { parent: Pid, status: ExitStatus },
 }
 
+/// The scheduler's own mutable state. Every field is a reference into
+/// its **own**, independently guard-paged region (see [`map_guarded`]) —
+/// a wild write overshooting any *one* of these now faults immediately,
+/// whether it overshoots past the end of the kernel's mapped memory
+/// entirely or lands on what, before this split, would have been one of
+/// this struct's own *other* fields sitting right next to it. `&mut [T;
+/// N]`/`&mut ReadyQueue` auto-deref for indexing/method calls exactly
+/// like the plain, by-value fields this replaces did, so no call site
+/// anywhere else in this module changed syntactically to make this
+/// split — only construction, in [`map_guarded_scheduler_state`], did.
+///
+/// This exists because every one of these fields has, across this
+/// investigation's many rounds (`docs/adr/0012` onward), individually
+/// shown symptoms consistent with a wild write landing on it from
+/// somewhere else in the kernel — most recently and most decisively, a
+/// `RingBuffer::pop` bounds panic on `ready`'s own `head` field that is
+/// architecturally impossible to produce through the ring buffer's own,
+/// already-correct logic (`docs/adr/0024`). See `docs/adr/0025` for the
+/// full account, including a first, cheaper attempt (one shared guarded
+/// region for all four fields together) that ran clean through a stress
+/// batch without ever catching anything — informative in its own right
+/// (ruling out "overshoots the whole block from outside"), and the
+/// reason this per-field version exists at all.
 struct Inner {
-    processes: [Slot; MAX_PROCESSES],
+    processes: &'static mut [Slot; MAX_PROCESSES],
     /// Generation counter per table slot, independent of whatever
     /// `processes` currently holds there (so it survives
     /// `Occupied` -> `Zombie` -> `Empty` transitions without resetting)
     /// — see `Pid`'s doc comment.
-    generations: [u32; MAX_PROCESSES],
-    ready: ReadyQueue,
+    generations: &'static mut [u32; MAX_PROCESSES],
+    ready: &'static mut ReadyQueue,
     /// The process currently running *on each core* — `current[i]` is
     /// core `i`'s own, indexed by `percpu::core_index()`. A single
     /// scalar sufficed before this milestone (there was only ever one
@@ -83,18 +108,76 @@ struct Inner {
     /// any) still shows a terminating `pid` as current, since a
     /// cross-core `SYS_KILL` can terminate a process another core is
     /// running right now.
-    current: [Option<Pid>; MAX_CORES],
+    current: &'static mut [Option<Pid>; MAX_CORES],
 }
 
-impl Inner {
-    const fn new() -> Self {
-        const EMPTY: Slot = Slot::Empty;
-        Self {
-            processes: [EMPTY; MAX_PROCESSES],
-            generations: [0; MAX_PROCESSES],
-            ready: ReadyQueue::new(),
-            current: [None; MAX_CORES],
-        }
+/// Base of a small family of dedicated virtual-memory regions, one per
+/// [`Inner`] field — see `docs/adr/0025`. Sits between the existing
+/// idle-stack (`0xffff_9600_...`) and kernel-stack (`0xffff_9800_...`)
+/// regions, following the same numbering convention every other fixed
+/// kernel region in this codebase already uses.
+const SCHED_STATE_BASE: u64 = 0xffff_9700_0000_0000;
+
+/// Distance between one field's own guarded slot and the next — 64 KiB
+/// is comfortably more than any of these fields' own size (each needs
+/// at most a handful of KiB), so no field's guard pages can ever collide
+/// with its neighbor's real data regardless of how these types grow.
+const SCHED_FIELD_STRIDE: u64 = 0x1_0000;
+
+/// Maps a single `T` into its own dedicated pages at `slot_base`,
+/// leaving the page immediately below *and* the page immediately above
+/// it unmapped as guard pages — the same "slot + guard page" shape
+/// `task::process::init_kernel_stacks`/`arch::x86_64::gdt`'s double-fault
+/// stacks already use, applied here to one of [`Inner`]'s own fields
+/// instead of a stack. A write that overshoots into either guard page
+/// now faults immediately, naming the exact instruction responsible,
+/// instead of silently corrupting this state and only being noticed
+/// much later, often on an unrelated core doing something else
+/// entirely.
+///
+/// Must run once, after `memory::init()` and before any process's
+/// `AddressSpace` is ever created — same ordering requirement as
+/// `task::process::init_kernel_stacks`, for the same reason: every
+/// address space's one-time kernel-half PML4 snapshot must already
+/// include every one of these regions.
+fn map_guarded<T>(slot_base: u64, init: T) -> &'static mut T {
+    let mut allocator = GlobalFrameAllocator;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let pages = (core::mem::size_of::<T>() as u64).div_ceil(4096).max(1);
+    for i in 1..=pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(slot_base + i * 4096));
+        let frame = allocator
+            .allocate_frame()
+            .expect("out of memory mapping guarded scheduler state");
+        virt::map(page, frame, flags).expect("failed to map a guarded scheduler state page");
+    }
+    // `slot_base` itself (below the real data) and
+    // `slot_base + 4096 * (1 + pages)` (immediately above it) are
+    // deliberately left unmapped -- see this function's own doc comment.
+    let ptr = (slot_base + 4096) as *mut T;
+    // SAFETY: `ptr` points at freshly mapped, writable, exclusively-owned
+    // memory (just mapped above, never aliased or previously in use), of
+    // the right size and alignment for `T` (page-aligned is a stricter
+    // alignment than any of `Inner`'s field types need), so writing a
+    // fresh value there and handing out a `'static` reference to it is
+    // sound -- this mapping is never torn down for the lifetime of the
+    // kernel.
+    unsafe {
+        ptr.write(init);
+        &mut *ptr
+    }
+}
+
+/// Builds [`Inner`] by giving each of its four fields its own call to
+/// [`map_guarded`], at four separate slots spaced [`SCHED_FIELD_STRIDE`]
+/// apart starting from [`SCHED_STATE_BASE`].
+fn map_guarded_scheduler_state() -> Inner {
+    const EMPTY: Slot = Slot::Empty;
+    Inner {
+        processes: map_guarded(SCHED_STATE_BASE, [EMPTY; MAX_PROCESSES]),
+        generations: map_guarded(SCHED_STATE_BASE + SCHED_FIELD_STRIDE, [0u32; MAX_PROCESSES]),
+        ready: map_guarded(SCHED_STATE_BASE + 2 * SCHED_FIELD_STRIDE, ReadyQueue::new()),
+        current: map_guarded(SCHED_STATE_BASE + 3 * SCHED_FIELD_STRIDE, [None; MAX_CORES]),
     }
 }
 
@@ -110,7 +193,49 @@ fn set_current(sched: &mut Inner, core: usize, pid: Option<Pid>) {
     record_dispatch_trace(core, pid);
 }
 
-static SCHEDULER: SpinLock<Inner> = SpinLock::new(Inner::new());
+/// Unlike every other lazily-populated `Once` in this codebase
+/// (`gdt::GDT`, `idt::IDT`, ...), this one can't be a plain
+/// `SpinLock<Inner>` initialized in place: `Inner`'s fields need
+/// [`map_guarded`]'s runtime page-table setup to have already run for
+/// each of them, which a `const fn` can't do. See [`init`].
+static SCHEDULER: Once<SpinLock<Inner>> = Once::new();
+
+/// Maps every one of [`Inner`]'s fields into its own guard-paged region
+/// and brings [`SCHEDULER`] up. Must run once, early in boot, after
+/// `memory::init()` and before any process's `AddressSpace` is created —
+/// see [`map_guarded`]'s own doc comment for exactly why, and `main.rs`'s
+/// call site for where that ordering is satisfied.
+pub fn init() {
+    SCHEDULER.call_once(|| SpinLock::new(map_guarded_scheduler_state()));
+}
+
+/// Every one of this module's own functions used to write `SCHEDULER.lock()`
+/// directly, back when `SCHEDULER` was a plain `SpinLock<Inner>` rather
+/// than a `Once`-guarded one — this is the one-line replacement for
+/// exactly that call, so nothing else about how this module reaches its
+/// own state had to change.
+fn scheduler_lock() -> SpinLockGuard<'static, Inner> {
+    SCHEDULER
+        .get()
+        .expect("task::scheduler::init() must run before the scheduler is used")
+        .lock()
+}
+
+/// [`scheduler_lock`]'s counterpart for `SpinLock::force_unlock`'s one
+/// legitimate caller (`idle_loop_trampoline`'s raw stack switch) — same
+/// reason this needed a wrapper at all: `SCHEDULER` is no longer a bare
+/// `SpinLock` this can be called on directly.
+///
+/// # Safety
+/// Same as [`SpinLock::force_unlock`].
+unsafe fn scheduler_force_unlock() {
+    unsafe {
+        SCHEDULER
+            .get()
+            .expect("task::scheduler::init() must run before the scheduler is used")
+            .force_unlock()
+    }
+}
 
 /// How many of each core's most recent [`set_current`] transitions
 /// [`DISPATCH_TRACE`] remembers. Small and fixed: this is a debugging aid
@@ -360,7 +485,7 @@ pub fn dump_cores_for_panic() {
 /// must call [`release_reservation`] to give the slot back — see its
 /// own doc comment.
 pub fn allocate_pid() -> Pid {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let index = sched
         .processes
         .iter()
@@ -383,7 +508,7 @@ pub fn allocate_pid() -> Pid {
 /// generation no longer matches (defensive; shouldn't happen, since
 /// nothing else can legitimately touch a still-`Reserved` slot).
 pub fn release_reservation(pid: Pid) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let index = pid.index();
     if index >= MAX_PROCESSES || sched.generations[index] != pid.generation() {
         return;
@@ -407,7 +532,7 @@ pub fn spawn(process: Process) -> Result<(), tarnos_abi::SyscallError> {
     if index >= MAX_PROCESSES {
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     sched.processes[index] = Slot::Occupied(Box::new(process));
     sched.ready.push(pid);
     drop(sched);
@@ -428,7 +553,7 @@ pub fn spawn_suspended(process: Process) -> Result<(), tarnos_abi::SyscallError>
     if index >= MAX_PROCESSES {
         return Err(tarnos_abi::SyscallError::ResourceExhausted);
     }
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     sched.processes[index] = Slot::Occupied(Box::new(process));
     Ok(())
 }
@@ -458,7 +583,7 @@ fn occupied_mut(sched: &mut Inner, pid: Pid) -> Option<&mut Process> {
 /// rest of the child's life (see `docs/adr/0007`), but no further
 /// *grant/start*-shaped syscall does.
 pub fn start_child(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let Some(process) = occupied_mut(&mut sched, target) else {
         return Err(tarnos_abi::SyscallError::InvalidTarget);
     };
@@ -705,7 +830,7 @@ fn maybe_print_switch(pid: Pid, rax: u64, rbx: u64) {
 /// process if nothing else is ready, otherwise whichever process the
 /// round-robin queue hands back next.
 pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let core = percpu::core_index();
 
     if let Some(current_pid) = sched.current[core] {
@@ -890,13 +1015,13 @@ fn activate_idle_address_space() {
 fn park_until_woken(core: usize) {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
 
-    if !SCHEDULER.lock().ready.is_empty() {
+    if !scheduler_lock().ready.is_empty() {
         unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
         return;
     }
 
     percpu::slot(core).idle.store(true, Ordering::SeqCst);
-    if !SCHEDULER.lock().ready.is_empty() {
+    if !scheduler_lock().ready.is_empty() {
         percpu::slot(core).idle.store(false, Ordering::SeqCst);
         unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
         return;
@@ -960,7 +1085,7 @@ fn idle_loop_on_own_stack(core: usize, halt_message: Option<&'static str>) -> ! 
         // loop only ever spins again after `park_until_woken`'s own
         // interrupt-driven wait, never busily.
         crate::task::executor::run_ready_tasks();
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         if let Some(next_pid) = sched.ready.pop() {
             let (frame_ptr, rax, rbx) = switch_to(&mut sched, next_pid);
             drop(sched);
@@ -1027,7 +1152,7 @@ extern "C" fn idle_loop_trampoline(
     // `force_unlock()` below, not after.
     activate_idle_address_space();
     // SAFETY: see this function's own doc comment.
-    unsafe { SCHEDULER.force_unlock() };
+    unsafe { scheduler_force_unlock() };
     // The raw `mov rsp, {top}` just above this call is what actually
     // stopped this core from using the outgoing process's kernel stack
     // -- unlike `finish_switch`'s equivalent (which still has real work
@@ -1292,7 +1417,11 @@ fn remove_from_ready_queue(sched: &mut Inner, target: Pid) {
             let _ = kept.push(pid);
         }
     }
-    sched.ready = kept;
+    // Writes *through* the guard-paged reference (into the same,
+    // still-guarded memory `ready` already points at) rather than
+    // rebinding the reference itself to `kept`'s own (ordinary,
+    // unguarded) stack storage -- see `docs/adr/0025`.
+    *sched.ready = kept;
 }
 
 /// Extracts the process at `pid` (a no-op if its slot isn't currently
@@ -1432,7 +1561,7 @@ fn reap_children_of(sched: &mut Inner, exiting_pid: Pid, pending_drops: &mut Vec
 fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<Box<Process>> {
     let mut pending_drops = Vec::new();
     {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         take_and_finalize_slot(&mut sched, pid, status, &mut pending_drops);
     }
     wake_orphaned_receivers(&pending_drops);
@@ -1485,7 +1614,7 @@ fn terminate_slot(pid: Pid, status: ExitStatus) -> Vec<Box<Process>> {
 fn wake_orphaned_receivers(dying: &[Box<Process>]) {
     let mut orphaned: Vec<Arc<Endpoint>> = Vec::new();
     {
-        let sched = SCHEDULER.lock();
+        let sched = scheduler_lock();
         for process in dying {
             for slot in process.cap_table.iter() {
                 if !slot.rights.contains(Rights::SEND) {
@@ -1528,7 +1657,7 @@ fn wake_orphaned_receivers(dying: &[Box<Process>]) {
 /// same "finalize it, run whatever's next" handling.
 pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
     let current = {
-        let sched = SCHEDULER.lock();
+        let sched = scheduler_lock();
         sched.current[percpu::core_index()]
     };
     // Held here, not dropped, until `switch_to_next_or_halt` below has
@@ -1546,7 +1675,7 @@ pub fn terminate_current_process(status: ExitStatus) -> *mut TrapFrame {
     } else {
         Vec::new()
     };
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     switch_to_next_or_halt(
         sched,
         "[sched] last process exited, halting.",
@@ -1625,7 +1754,7 @@ pub fn on_syscall_exit(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 /// step closes it the same way those fixes do.
 pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::SyscallError> {
     {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let Some(process) = occupied_mut(&mut sched, target) else {
             return Err(tarnos_abi::SyscallError::InvalidTarget);
         };
@@ -1637,7 +1766,7 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
     loop {
         let mut pending_drops = Vec::new();
         let owning_core = {
-            let mut sched = SCHEDULER.lock();
+            let mut sched = scheduler_lock();
             match (0..MAX_CORES).find(|&core| sched.current[core] == Some(target)) {
                 Some(core) => Some(core),
                 None => {
@@ -1734,7 +1863,7 @@ pub fn terminate_process(target: Pid, caller: Pid) -> Result<(), tarnos_abi::Sys
 /// reschedule IPI shares.
 pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = percpu::core_index();
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let evict = percpu::slot(core).evict_request.swap(0, Ordering::AcqRel);
     if evict == 0 || sched.current[core].map(|p| p.0) != Some(evict) {
         drop(sched);
@@ -1793,7 +1922,7 @@ pub fn on_reschedule_ipi(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 /// no wait *queue* is needed, just this one field. See
 /// `docs/adr/0010-cross-core-scheduling.md`.
 pub fn wait_for_child(current_frame: *mut TrapFrame, target: Pid, caller: Pid) -> *mut TrapFrame {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let index = target.index();
     if index >= MAX_PROCESSES || sched.generations[index] != target.generation() {
         drop(sched);
@@ -1850,7 +1979,7 @@ pub fn wait_for_child(current_frame: *mut TrapFrame, target: Pid, caller: Pid) -
 /// arbitrary `u64`), so this looks up via [`occupied_mut`] (bounds- and
 /// generation-checked) rather than direct indexing.
 pub fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let process = occupied_mut(&mut sched, pid)?;
     Some(f(process))
 }
@@ -1861,7 +1990,7 @@ pub fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process) -> R) -> Option<R>
 /// only runs while some process is executing).
 pub fn with_current_process<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
     let pid = {
-        let sched = SCHEDULER.lock();
+        let sched = scheduler_lock();
         sched.current[percpu::core_index()]?
     };
     with_process(pid, f)
@@ -1954,7 +2083,7 @@ fn wake_blocked_process_locked(sched: &mut Inner, pid: Pid, result: WakeResult) 
 /// blocked — see `arch::x86_64::idt`/`SYS_KILL` — or its slot has since
 /// been reused by an unrelated process; see `Pid`'s doc comment).
 pub fn wake_blocked_process(pid: Pid, result: WakeResult) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     wake_blocked_process_locked(&mut sched, pid, result);
 }
 
@@ -2036,7 +2165,7 @@ fn block_current_process_locked(sched: &mut Inner, current_frame: *mut TrapFrame
 /// first place -- see its doc comment for why that matters with more
 /// than one core.
 pub fn block_current_process(current_frame: *mut TrapFrame) -> *mut TrapFrame {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     block_current_process_locked(&mut sched, current_frame);
     switch_to_next_or_halt(
         sched,

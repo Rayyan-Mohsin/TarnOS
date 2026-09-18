@@ -163,6 +163,13 @@ extern "C" fn _start() -> ! {
     // half eagerly, right now, rather than lazily per-process later.
     task::process::init_kernel_stacks();
 
+    // Same ordering requirement as the call just above, for the same
+    // reason -- see `task::scheduler::map_guarded`'s doc comment
+    // (docs/adr/0025). Also brings `task::scheduler`'s own state up in
+    // the first place: nothing else in this module locks `SCHEDULER`
+    // before this point.
+    task::scheduler::init();
+
     // Every boot module besides "init" itself becomes a program
     // SYS_SPAWN can create a process from by name — there is no
     // filesystem yet, so this fixed, boot-time set is the only source a
