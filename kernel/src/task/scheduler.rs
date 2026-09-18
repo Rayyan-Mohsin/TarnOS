@@ -140,7 +140,11 @@ const SCHED_FIELD_STRIDE: u64 = 0x1_0000;
 /// `task::process::init_kernel_stacks`, for the same reason: every
 /// address space's one-time kernel-half PML4 snapshot must already
 /// include every one of these regions.
-fn map_guarded<T>(slot_base: u64, init: T) -> &'static mut T {
+///
+/// `pub(crate)`, not private: `task::process::init_trap_frames` reuses
+/// this exact primitive for `Process::trap_frame`'s own guarded slots —
+/// see `docs/adr/0026`.
+pub(crate) fn map_guarded<T>(slot_base: u64, init: T) -> &'static mut T {
     let mut allocator = GlobalFrameAllocator;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     let pages = (core::mem::size_of::<T>() as u64).div_ceil(4096).max(1);
@@ -756,7 +760,7 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     // core ever tried to resume it.
     let user_cs = gdt::selectors().user_code.0 as u64;
     let user_ss = gdt::selectors().user_data.0 as u64;
-    let frame = &process.trap_frame;
+    let frame = &*process.trap_frame;
     assert_eq!(
         frame.cs, user_cs,
         "switch_to: {pid:?}'s saved trap frame has cs={:#x}, expected the ring-3 code \
@@ -790,7 +794,7 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     );
 
     (
-        &mut process.trap_frame as *mut TrapFrame,
+        &mut *process.trap_frame as *mut TrapFrame,
         process.trap_frame.rax,
         process.trap_frame.rbx,
     )
@@ -851,7 +855,9 @@ pub fn on_timer_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame — it was just captured by the entry stub.
-            process.trap_frame = unsafe { *current_frame };
+            // Writes *through* the guard-paged reference (see
+            // `docs/adr/0026`) rather than rebinding it.
+            *process.trap_frame = unsafe { *current_frame };
             process.state = ProcessState::Ready;
             sched.ready.push(current_pid);
         }
@@ -2118,8 +2124,10 @@ fn block_current_process_locked(sched: &mut Inner, current_frame: *mut TrapFrame
         if let Slot::Occupied(process) = &mut sched.processes[current_pid.index()] {
             // SAFETY: `current_frame` is a valid, fully-initialized
             // TrapFrame -- it's the same frame the syscall entry
-            // trampoline built for this process's own trap.
-            process.trap_frame = unsafe { *current_frame };
+            // trampoline built for this process's own trap. Writes
+            // *through* the guard-paged reference (see
+            // `docs/adr/0026`) rather than rebinding it.
+            *process.trap_frame = unsafe { *current_frame };
             process.state = ProcessState::Blocked;
             if let Some(pending) = process.pending_wake.take() {
                 apply_wake_result(process, pending);

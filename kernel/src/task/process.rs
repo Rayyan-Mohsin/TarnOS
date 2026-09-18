@@ -13,7 +13,7 @@ use crate::ipc::CapTable;
 use crate::memory::phys::GlobalFrameAllocator;
 use crate::memory::virt::{self, AddressSpace};
 
-use super::scheduler::{WakeResult, MAX_PROCESSES};
+use super::scheduler::{map_guarded, WakeResult, MAX_PROCESSES};
 use super::Pid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,10 +126,83 @@ pub fn init_kernel_stacks() {
     }
 }
 
+/// Base of a dedicated virtual-memory region holding one guard-paged
+/// [`TrapFrame`] slot per possible process-table index — see
+/// `docs/adr/0026`. Sits between the scheduler's own guarded-field
+/// region (`0xffff_9700_...`, see `task::scheduler::SCHED_STATE_BASE`)
+/// and this module's own kernel-stacks region just above
+/// ([`KERNEL_STACKS_BASE`], `0xffff_9800_...`).
+const TRAP_FRAME_BASE: u64 = 0xffff_9750_0000_0000;
+/// 64 KiB per slot — comfortably more than `TrapFrame`'s own size (160
+/// bytes: 20 `u64` fields), so no slot's guard pages can ever collide
+/// with its neighbor's real data regardless of how the type grows.
+const TRAP_FRAME_STRIDE: u64 = 0x1_0000;
+
+fn trap_frame_slot_base(pid: Pid) -> u64 {
+    TRAP_FRAME_BASE + pid.index() as u64 * TRAP_FRAME_STRIDE
+}
+
+/// Maps every possible process-table slot's own [`TrapFrame`] into its
+/// own guard-paged region, mirroring [`init_kernel_stacks`]'s "eager,
+/// for every possible slot, once" discipline and for the identical
+/// reason: every process's `AddressSpace` takes its one-time
+/// kernel-half PML4 snapshot at creation time, so every one of these
+/// regions must already be mapped before the first one is ever built.
+///
+/// Unlike `task::scheduler::map_guarded_scheduler_state` (mapped once,
+/// referenced for the rest of the kernel's life), this only *maps* —
+/// the real `TrapFrame` value for a given slot is written fresh each
+/// time [`Process::new`] constructs a process for it, via
+/// [`trap_frame_for`]; the all-zero value written here is only ever
+/// live in the gap between this call and the first real process ever
+/// built for that slot.
+///
+/// Motivated by `docs/adr/0023`'s double-fault capture (a fault
+/// immediately after resuming into `process.trap_frame`'s own address)
+/// and `docs/adr/0025`'s own guard-page experiments against the
+/// *scheduler's* state coming back clean twice over: `trap_frame` lives
+/// in a separate, per-process heap allocation (`Box<Process>`) that
+/// `Inner`'s own guard pages never covered.
+pub fn init_trap_frames() {
+    const ZEROED: TrapFrame = TrapFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0, rbp: 0, rdi: 0, rsi: 0,
+        rdx: 0, rcx: 0, rbx: 0, rax: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    for index in 0..MAX_PROCESSES {
+        // Only the index half of this placeholder `Pid` is ever read
+        // (by `trap_frame_slot_base`) -- pure address arithmetic over a
+        // fixed, eagerly-mapped region, not a real `Pid` naming a real
+        // process, so the generation value here is arbitrary.
+        let slot_base = trap_frame_slot_base(Pid::new(index, 0));
+        let _: &'static mut TrapFrame = map_guarded(slot_base, ZEROED);
+    }
+}
+
+/// Returns this slot's own guard-paged [`TrapFrame`], freshly
+/// re-borrowed from the mapping [`init_trap_frames`] already
+/// established. Safe because a process-table slot only ever has one
+/// live `Process` occupying it at a time — the same invariant
+/// [`Process::kernel_stack_top`] already relies on for its own per-slot
+/// stack — and every slot is mapped before the first `Process` can
+/// exist.
+fn trap_frame_for(pid: Pid) -> &'static mut TrapFrame {
+    let ptr = (trap_frame_slot_base(pid) + 4096) as *mut TrapFrame;
+    // SAFETY: `init_trap_frames` mapped this exact address, writable,
+    // before any `Process` could exist. This slot's only live user at
+    // any moment is whichever `Process` currently occupies this
+    // process-table index; the scheduler's own generation check
+    // (`switch_to`'s `sched.generations[index] == pid.generation()`,
+    // and `Process.pid == pid` alongside it since `docs/adr/0023`)
+    // already guarantees at most one of those exists at a time.
+    unsafe { &mut *ptr }
+}
+
 pub struct Process {
     pub pid: Pid,
     pub address_space: AddressSpace,
-    pub trap_frame: TrapFrame,
+    /// Lives in its own guard-paged slot (see [`trap_frame_for`]), not
+    /// inline in this struct's own `Box` allocation — `docs/adr/0026`.
+    pub trap_frame: &'static mut TrapFrame,
     pub cap_table: CapTable,
     pub state: ProcessState,
     /// The process that created this one via `SYS_SPAWN`, if any —
@@ -212,7 +285,11 @@ impl Process {
                 .map_err(|_| "failed to map user stack")?;
         }
 
-        let trap_frame = TrapFrame::initial_user_frame(entry, stack_top);
+        // Writes fresh into this slot's own guard-paged `TrapFrame`
+        // rather than embedding one inline in this struct's own `Box`
+        // allocation — see `docs/adr/0026`.
+        let trap_frame = trap_frame_for(pid);
+        *trap_frame = TrapFrame::initial_user_frame(entry, stack_top);
 
         Ok(Self {
             pid,
