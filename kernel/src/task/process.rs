@@ -256,11 +256,12 @@ impl Process {
     }
 
     /// Core constructor: an address space plus an entry point becomes a
-    /// process ready to run, with a freshly mapped user stack. Both this
-    /// milestone's dummy-process smoke test ([`Process::new_dummy`]) and
-    /// a real ELF-loaded process (wired up in a later milestone task)
-    /// build on this one path — there is exactly one way a process's
-    /// initial state gets constructed.
+    /// process ready to run, with a freshly mapped user stack. Both the
+    /// dummy-process scheduler smoke test ([`Process::new_dummy`]) and a
+    /// real ELF-loaded process ([`Process::from_elf`], the path every
+    /// spawned or boot-loaded process actually takes) build on this one
+    /// path — there is exactly one way a process's initial state gets
+    /// constructed.
     fn new(
         pid: Pid,
         address_space: AddressSpace,
@@ -306,10 +307,13 @@ impl Process {
 
     /// Builds a process by copying an existing kernel-compiled
     /// function's machine code into fresh, process-owned pages in a new
-    /// address space, standing in for a real ELF-loaded process before
-    /// the boot sequence loads one (a later milestone task). Validates
-    /// the scheduler and context-switch machinery in isolation from ELF
-    /// and syscall complexity, per the milestone plan.
+    /// address space — originally a stand-in for a real ELF-loaded
+    /// process before [`Process::from_elf`] existed, kept on now as a
+    /// dummy-process scheduler smoke test (the `kitchen-sink-test`/
+    /// pure-yield reproduction's own process shape — see
+    /// `kernel/src/kitchen_sink_tests.rs`), still useful for validating
+    /// scheduler and context-switch machinery in isolation from ELF and
+    /// syscall complexity.
     ///
     /// Copies rather than remaps the kernel's own `.text` frame
     /// directly: `AddressSpace::drop` frees every leaf frame it finds

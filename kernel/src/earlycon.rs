@@ -1,9 +1,15 @@
 //! Bare, direct-port-I/O debug console.
 //!
-//! Used for boot diagnostics and fault handlers before the real UART driver
-//! (`driver::uart`, with proper 16550 initialization and LSR busy-checking)
-//! exists. QEMU's 16550 emulation accepts bytes on THR (0x3F8) with no
-//! prior setup.
+//! Originally just boot diagnostics before the real UART driver
+//! (`driver::uart`, with proper 16550 initialization and LSR
+//! busy-checking) existed — QEMU's 16550 emulation accepts bytes on THR
+//! (0x3F8) with no prior setup, so no init sequence is needed here. It's
+//! kept on afterward as the *permanent* fault/panic diagnostic path for
+//! the rest of the kernel's life too, not just before `driver::uart`
+//! exists: [`panic_println`]/[`panic_earlyprintln!`] are simpler and more
+//! robust than the real driver's own writes, deliberately, since a panic
+//! is exactly the moment other kernel state (including `driver::uart`'s
+//! own) might itself be the thing that's broken.
 //!
 //! `SpinLock`, not a plain `spin::Mutex`: fault handlers call
 //! `earlyprintln!` directly from interrupt/exception context, and now that

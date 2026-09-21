@@ -1,12 +1,12 @@
 //! Cooperative executor for kernel-space futures (driver state machines,
-//! the future console server).
+//! the UART console server — `driver::uart::console_server`).
 //!
-//! Deliberately separate from the (future) preemptive process scheduler:
-//! kernel tasks are trusted and stackless, so they don't need forced
-//! preemption or a full register/stack context switch the way untrusted
-//! usermode code does. The two share one bridge primitive — a `Waker`
-//! that ends up here, in the ready queue — rather than one unified
-//! run-loop; see `docs/adr/0002-async-executor-and-scheduler.md`.
+//! Deliberately separate from `task::scheduler`'s preemptive process
+//! scheduler: kernel tasks are trusted and stackless, so they don't need
+//! forced preemption or a full register/stack context switch the way
+//! untrusted usermode code does. The two share one bridge primitive — a
+//! `Waker` that ends up here, in the ready queue — rather than one
+//! unified run-loop; see `docs/adr/0002-async-executor-and-scheduler.md`.
 //!
 //! The load-bearing rule: an interrupt handler may only ever *enqueue*
 //! (call [`Waker::wake`]) — never poll a future or run task code inline.

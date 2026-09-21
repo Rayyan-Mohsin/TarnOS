@@ -634,10 +634,10 @@ pub fn dump_cores_for_panic() {
 /// from the *same* core (nothing else can run there in between), but
 /// not from a *different* one — and once `SYS_SPAWN` could itself be a
 /// process's very first instruction after being scheduled (found while
-/// prototyping a combined multi-workload stress scenario, deferred to a
-/// later milestone, that spawns several concurrently-runnable processes
-/// each immediately spawning a child of their own), a second core's
-/// `allocate_pid()` could land in the
+/// prototyping what later became `kitchen_sink_tests.rs`'s combined
+/// multi-workload stress scenario: several concurrently-runnable
+/// processes each immediately spawning a child of their own), a second
+/// core's `allocate_pid()` could land in the
 /// exact gap between the first core's own `allocate_pid()` and its
 /// matching `spawn`, see the same slot as `Empty`, and be handed the
 /// identical index with a bumped generation. Whichever side's `spawn`/

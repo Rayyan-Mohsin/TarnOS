@@ -7,8 +7,9 @@
 //! range and the actual input length before anything is mapped, the same
 //! scrutiny a less-trusted future binary would need to go through. Maps
 //! through the caller-supplied [`Mapper`], so this works unchanged
-//! against either the boot-time kernel mapper or a fresh per-process
-//! address space once one exists.
+//! against any mapper a caller hands it — in practice always a fresh
+//! per-process `AddressSpace`'s own mapper (see
+//! `task::process::Process::from_elf`), but nothing here assumes that.
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 

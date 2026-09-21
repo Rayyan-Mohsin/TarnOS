@@ -1,12 +1,14 @@
 //! Global Descriptor Table + Task State Segment.
 //!
 //! Limine hands off with its own temporary GDT; this module replaces it
-//! with TarnOS's own, laid out so it can be reused unchanged once SYSCALL/
-//! SYSRET is wired up (a later milestone task): the x86_64 SYSCALL/SYSRET
-//! architecture hard-codes segment selectors as fixed offsets from two MSR
-//! base values, which only works if kernel_data sits exactly one GDT slot
-//! after kernel_code, and user_code exactly one slot after user_data. That
-//! ordering is set up now so it never has to be revisited.
+//! with TarnOS's own, laid out so it could be reused unchanged once
+//! SYSCALL/SYSRET was wired up (`arch::x86_64::syscall`, now built): the
+//! x86_64 SYSCALL/SYSRET architecture hard-codes segment selectors as
+//! fixed offsets from two MSR base values, which only works if
+//! kernel_data sits exactly one GDT slot after kernel_code, and
+//! user_code exactly one slot after user_data. That ordering was set up
+//! from the start specifically so it never had to be revisited, and it
+//! hasn't been.
 //!
 //! One shared `GlobalDescriptorTable`, not one per core: every core's
 //! CS/SS/DS/ES selectors stay numerically identical, and only the
@@ -226,11 +228,11 @@ pub fn selectors() -> &'static Selectors {
 /// process's kernel stack, never a different process's.
 ///
 /// Resolves "which core is calling me" via `percpu::core_index()` rather
-/// than taking an explicit core index: this milestone never runs a
-/// process anywhere but the BSP, so every caller today is implicitly
-/// core 0, but writing it this way means it's already correct for a
-/// future milestone that schedules processes on other cores too, with no
-/// change needed here or at any call site.
+/// than taking an explicit core index: `task::scheduler::switch_to` calls
+/// this from whichever core is dispatching a process, which is genuinely
+/// any of them (see `docs/adr/0010-cross-core-scheduling.md`) — a process
+/// is never pinned to the core it last ran on, so this must always target
+/// the calling core's own TSS, never a fixed one.
 ///
 /// # Safety
 /// Must only be called with interrupts disabled — the caller is

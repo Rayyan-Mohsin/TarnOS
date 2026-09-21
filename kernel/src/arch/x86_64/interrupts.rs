@@ -1,10 +1,15 @@
 //! Hardware interrupt plumbing: the legacy 8259 PIC (remapped clear of the
 //! CPU exception vectors) and the PIT timer tick.
 //!
-//! ACPI/MADT parsing and the LAPIC/IOAPIC migration this implies are
-//! deferred to the SMP milestone — the RSDP is already captured at boot
-//! (see `main.rs`) specifically so that migration is additive later
-//! rather than requiring a boot-protocol change now.
+//! The SMP milestone's own timer/interrupt needs (per-core preemption,
+//! IPIs) are handled by `arch::x86_64::lapic` instead of an ACPI/MADT-
+//! parsed IOAPIC migration — Limine's `MP_REQUEST` boot protocol feature
+//! hands the kernel each core's LAPIC ID directly (see `main.rs`/`smp`),
+//! making manual MADT parsing unnecessary. This module now exists purely
+//! for the PIT/legacy-PIC path this predates: the BSP-only [`TICKS`]
+//! heartbeat and the one-time PIT reference `lapic::calibrate_against_pit`
+//! measures its own LAPIC timer against — every core's actual preemption
+//! timer is `lapic`'s, not this module's.
 use core::sync::atomic::{AtomicU64, Ordering};
 use pic8259::ChainedPics;
 use x86_64::instructions::port::Port;
@@ -38,9 +43,13 @@ static PICS: SpinLock<ChainedPics> =
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Number of timer ticks since [`init`]. Will back scheduler timeslice
-/// accounting once a scheduler exists; for now it only drives the
-/// heartbeat print that proves interrupts are actually firing.
+/// Number of PIT ticks since [`init`], counted only on the BSP (this is
+/// the legacy PIT/PIC path — see the module doc comment). The scheduler
+/// itself doesn't use this for timeslice accounting: `task::scheduler`
+/// preempts on every LAPIC timer tick unconditionally, with no multi-tick
+/// quantum. This counter instead backs [`on_timer_tick_bookkeeping`]'s
+/// heartbeat print, `lapic::calibrate_against_pit`'s one-time reference
+/// measurement, and several `main.rs` smoke tests' "wait N ticks" loops.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
@@ -51,7 +60,7 @@ const PIT_BASE_FREQUENCY_HZ: u32 = 1_193_182;
 /// Programs PIT channel 0 for a periodic tick at [`PIT_FREQUENCY_HZ`] and
 /// remaps + configures the PICs so only IRQ0 (timer) starts unmasked.
 /// IRQ4 (COM1) is registered in the IDT (see `idt::init`) but stays
-/// masked here — the UART driver (a later milestone task) unmasks it
+/// masked here — `driver::uart` unmasks it (via [`unmask_irq4`]) only
 /// once it has actually enabled RX-available interrupts on the device,
 /// so nothing can fire on that line before anything is listening.
 ///

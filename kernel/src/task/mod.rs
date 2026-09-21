@@ -2,10 +2,13 @@ pub mod executor;
 pub mod process;
 pub mod scheduler;
 
-/// A process identifier. Defined here (rather than in `task::process`,
-/// which doesn't exist yet) because `ipc::endpoint::Waiter` needs to name
-/// a process without depending on the process/scheduler machinery a
-/// later milestone task adds.
+/// A process identifier. Defined here rather than in `task::process` —
+/// which didn't exist yet at the point this type was first needed —
+/// because `ipc::endpoint::Waiter` needs to name a process without
+/// depending on the process/scheduler machinery a later milestone task
+/// added. Left here rather than moved once `task::process` existed:
+/// every current caller already imports it from `task::Pid`, and moving
+/// it now would be churn with no behavioral benefit.
 ///
 /// Packs a process-table index (low 32 bits) and a generation counter
 /// (high 32 bits) into the same `u64` — deliberately not two separate

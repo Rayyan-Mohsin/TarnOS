@@ -6,14 +6,17 @@
 //!   addresses — the only module allowed to touch raw page table memory.
 //! - [`heap`]: backs `alloc::*` for the rest of the kernel.
 //!
-//! Re-exports the address/frame/page types from the audited `x86_64`
-//! crate rather than redefining them, so the rest of the kernel imports
-//! them from `crate::memory` without reaching into `x86_64` directly.
+//! Re-exports `PhysAddr`/`VirtAddr` from the audited `x86_64` crate
+//! rather than redefining them, so the rest of the kernel imports them
+//! from `crate::memory` without reaching into `x86_64` directly. The
+//! paging types (`Page`, `PageTableFlags`, `PhysFrame`, `Size4KiB`)
+//! aren't re-exported the same way: every real caller imports them
+//! straight from `x86_64::structures::paging` instead, since they're
+//! almost always used alongside other items from that same module.
 pub mod heap;
 pub mod phys;
 pub mod virt;
 
-pub use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 pub use x86_64::{PhysAddr, VirtAddr};
 
 use limine::memmap::Entry;

@@ -13,7 +13,14 @@ use x86_64::structures::paging::FrameAllocator;
 /// nowhere near this address for any machine this milestone targets) and
 /// the kernel image itself (linked at `0xffffffff80000000`).
 const HEAP_START: u64 = 0xffff_9000_0000_0000;
-const HEAP_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB to start; grows in a later milestone.
+// 8 MiB, fixed since this module was first written and never yet grown or
+// made dynamic -- still comfortably enough for everything the kernel
+// itself allocates through `alloc::*` today (every guard-paged region
+// added since is separately mapped, outside this heap entirely). Revisit
+// once filesystem/driver work adds kernel-side buffers or caches that
+// could actually pressure it -- see docs/MILESTONE-10-LAST-BASE-LEVEL-CHECK.md's
+// Phase 7.
+const HEAP_SIZE: u64 = 8 * 1024 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();

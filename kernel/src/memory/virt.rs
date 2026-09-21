@@ -1,11 +1,13 @@
 //! Virtual memory: the single place that touches raw page table memory.
 //!
 //! Everything above this module (the ELF loader, process creation, the
-//! heap) works through the safe, typed [`map`]/[`unmap`]/[`translate`]
-//! functions here — never by walking or dereferencing a page table entry
-//! directly. That boundary is what "zero-trust memory" means in practice:
-//! the unsafety of raw paging is audited once, here, instead of trusted
-//! ad hoc at every call site that needs a mapping.
+//! heap) works through the safe, typed functions here — [`map`]/
+//! [`map_in`] today, plus [`unmap`]/[`translate`] for whichever future
+//! caller needs to remove a mapping or look one up (neither has a real
+//! caller yet at this milestone) — never by walking or dereferencing a
+//! page table entry directly. That boundary is what "zero-trust memory"
+//! means in practice: the unsafety of raw paging is audited once, here,
+//! instead of trusted ad hoc at every call site that needs a mapping.
 use spin::{Mutex, Once};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
