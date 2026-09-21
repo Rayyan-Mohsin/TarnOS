@@ -46,8 +46,8 @@ fn main() {
         "test-smp-sched-stress" => test_smp_sched_stress(),
         "test-smp-send-cross-core" => test_smp_send_cross_core(),
         "test-smp-forced-preempt" => test_smp_forced_preempt(),
-        // Milestone 9, in progress -- deliberately not part of `test-all`
-        // yet, see its own function doc comment.
+        // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
+        // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
         "test-all" => test_fault()
             .and_then(|_| test_fault_isolation())
@@ -144,9 +144,10 @@ fn print_usage() {
          \x20 test-smp-forced-preempt     Confirm a process making zero syscalls is still\n\
          \x20                    preempted by its own core's LAPIC timer, an ordinary process\n\
          \x20                    still runs alongside it, and SYS_KILL still evicts it (-smp 4)\n\
-         \x20 test-kitchen-sink            Milestone 9, in progress: IPC, heap growth,\n\
-         \x20                    process lifecycle, and cross-core kill running concurrently\n\
-         \x20                    (-smp 4) -- not yet reliable enough for test-all/CI\n\
+         \x20 test-kitchen-sink            IPC, heap growth, process lifecycle, and\n\
+         \x20                    cross-core kill running concurrently (-smp 4) -- reproduces\n\
+         \x20                    a known, open cross-core corruption bug (docs/adr/0012-0029),\n\
+         \x20                    so deliberately not part of test-all/CI\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -1491,14 +1492,18 @@ fn test_smp_forced_preempt() -> Result<(), String> {
 /// never-yielding target, and background `SYS_YIELD` pressure processes
 /// keeping every core genuinely busy throughout.
 ///
-/// Deliberately **not** part of `test-all`/CI yet: prototyping this
-/// scenario found and fixed two real cross-core bugs (see
-/// `docs/adr/0011`), but a further, deeper cross-core corruption issue
-/// remains under investigation (`docs/adr/0012`, once written) --
-/// intermittent kernel panics or process kills with a saved trap-frame
-/// RIP corrupted into what looks like a raw packed `Pid` value rather
-/// than a real code address. Kept as a standalone command so it can be
-/// run and iterated on directly while that's being root-caused, without
+/// Deliberately **not** part of `test-all`/CI: prototyping this scenario
+/// found and fixed two real cross-core bugs (see `docs/adr/0011`), but a
+/// further, deeper cross-core corruption issue -- intermittent kernel
+/// panics or process kills with a saved trap-frame RIP corrupted into
+/// what looks like a raw packed `Pid` value rather than a real code
+/// address -- remains open across a long investigation (`docs/adr/0012`
+/// through `docs/adr/0029` and counting). Milestone 10 treats it as a
+/// known, contained, documented risk rather than a blocker (it fails
+/// safely into a panic + halt, never silent corruption that keeps
+/// running) -- see `docs/adr/0029` for where the investigation currently
+/// stands. Kept as a standalone command so it can still be run and
+/// iterated on directly whenever that thread is picked back up, without
 /// making every `test-all`/CI run flaky in the meantime.
 fn test_kitchen_sink() -> Result<(), String> {
     let log = run_scenario(&["kitchen-sink-test"], "kitchen-sink-test.log", 20, false, 4)?;
