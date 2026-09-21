@@ -145,3 +145,6 @@ jobs:
 
       - name: xtask test-smp-forced-preempt (a zero-syscall process is still preempted per-core)
         run: cargo run -p xtask -- test-smp-forced-preempt
+
+      - name: xtask test-block-driver (virtio-blk reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-block-driver

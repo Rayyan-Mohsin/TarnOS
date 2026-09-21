@@ -132,6 +132,13 @@ impl PciAddress {
         self.write_u16(0x04, value);
     }
 
+    /// Bit 4 ("Capabilities List") tells a caller whether the
+    /// Capabilities Pointer at offset `0x34` is meaningful at all — see
+    /// [`PciDevice::capabilities`].
+    fn status(self) -> u16 {
+        self.read_u16(0x06)
+    }
+
     /// Reads BAR `index` (`0..6`, a type-0 header's own count) raw —
     /// undecoded: still tagged with its I/O-vs-memory/32-vs-64-bit/
     /// prefetchable bits in its own low bits, per PCI Local Bus spec
@@ -198,6 +205,70 @@ impl PciDevice {
         let current = self.address.command();
         self.address
             .set_command(current | MEMORY_SPACE_ENABLE | BUS_MASTER_ENABLE);
+    }
+
+    /// Reads one byte/dword of this device's own configuration space at
+    /// `offset` — exposed (unlike [`PciAddress`]'s own private
+    /// `read_u8`/`read_u16`/`read_u32`) specifically so a caller that has
+    /// already located a capability via [`capabilities`](Self::capabilities)
+    /// can read that capability's own fields without this module needing
+    /// any knowledge of what they mean. `driver::virtio_blk` is the one
+    /// real caller today, reading a `virtio_pci_cap` structure's
+    /// `cfg_type`/`bar`/`offset`/`length` fields (virtio 1.0 spec
+    /// §4.1.4) — pure PCI-generic plumbing on this side of the boundary,
+    /// virtio-specific interpretation entirely on that one. No `read_u16`
+    /// alongside these: every field that caller actually needs is either
+    /// one byte or a 32-bit little-endian dword, so there is nothing to
+    /// call a 16-bit reader for yet.
+    pub fn read_u8(self, offset: u8) -> u8 {
+        self.address.read_u8(offset)
+    }
+
+    pub fn read_u32(self, offset: u8) -> u32 {
+        self.address.read_u32(offset)
+    }
+
+    /// Walks this device's generic PCI capability list (PCI Local Bus
+    /// spec §6.7): starting from the Capabilities Pointer at offset
+    /// `0x34` (meaningful only when the Status register's bit 4 is set —
+    /// [`PciAddress::status`] — absent that bit there is no list at all,
+    /// so this yields nothing rather than reading a garbage pointer),
+    /// following each entry's own `cap_next` byte until it reaches `0`.
+    /// Yields `(cap_id, cap_offset)` for every entry — purely generic PCI
+    /// structure, no virtio-specific interpretation; matching a `cap_id`
+    /// against `0x09` (vendor-specific) and reading further fields from
+    /// `cap_offset` onward is entirely `driver::virtio_blk`'s own job.
+    pub fn capabilities(self) -> PciCapabilities {
+        const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+        let next = if self.address.status() & STATUS_CAPABILITIES_LIST != 0 {
+            self.address.read_u8(0x34)
+        } else {
+            0
+        };
+        PciCapabilities {
+            address: self.address,
+            next,
+        }
+    }
+}
+
+/// Iterator returned by [`PciDevice::capabilities`].
+pub struct PciCapabilities {
+    address: PciAddress,
+    next: u8,
+}
+
+impl Iterator for PciCapabilities {
+    type Item = (u8, u8);
+
+    fn next(&mut self) -> Option<(u8, u8)> {
+        if self.next == 0 {
+            return None;
+        }
+        let offset = self.next;
+        let cap_id = self.address.read_u8(offset);
+        self.next = self.address.read_u8(offset + 1);
+        Some((cap_id, offset))
     }
 }
 

@@ -46,6 +46,7 @@ fn main() {
         "test-smp-sched-stress" => test_smp_sched_stress(),
         "test-smp-send-cross-core" => test_smp_send_cross_core(),
         "test-smp-forced-preempt" => test_smp_forced_preempt(),
+        "test-block-driver" => test_block_driver(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -70,7 +71,8 @@ fn main() {
             .and_then(|_| test_smp_kill_cross_core())
             .and_then(|_| test_smp_sched_stress())
             .and_then(|_| test_smp_send_cross_core())
-            .and_then(|_| test_smp_forced_preempt()),
+            .and_then(|_| test_smp_forced_preempt())
+            .and_then(|_| test_block_driver()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -148,6 +150,9 @@ fn print_usage() {
          \x20                    cross-core kill running concurrently (-smp 4) -- reproduces\n\
          \x20                    a known, open cross-core corruption bug (docs/adr/0012-0029),\n\
          \x20                    so deliberately not part of test-all/CI\n\
+         \x20 test-block-driver     Attach a disk seeded with known content, boot with the\n\
+         \x20                    virtio-blk driver, and confirm a real polled sector read\n\
+         \x20                    matches exactly what was seeded (Milestone 11)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -155,8 +160,8 @@ fn print_usage() {
          \x20                    test-sbrk-boundary, test-smp-boot, test-smp-degraded,\n\
          \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
          \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
-         \x20                    test-smp-sched-stress, test-smp-send-cross-core, and\n\
-         \x20                    test-smp-forced-preempt in sequence"
+         \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
+         \x20                    test-smp-forced-preempt, and test-block-driver in sequence"
     );
 }
 
@@ -516,6 +521,24 @@ fn run_scenario(
     uefi: bool,
     smp: u32,
 ) -> Result<String, String> {
+    run_scenario_ext(kernel_features, log_name, timeout_secs, uefi, smp, &[])
+}
+
+/// Like [`run_scenario`], but with additional raw QEMU arguments appended
+/// to the invocation — for a scenario that needs to attach hardware
+/// `run_scenario`'s own fixed flag set doesn't cover (Milestone 11's
+/// `-drive`/`-device virtio-blk-pci-non-transitional` disk attachment,
+/// e.g.). Kept as a separate function rather than adding a mandatory
+/// parameter to `run_scenario` itself so every one of that function's
+/// many existing call sites stays untouched.
+fn run_scenario_ext(
+    kernel_features: &[&str],
+    log_name: &str,
+    timeout_secs: u64,
+    uefi: bool,
+    smp: u32,
+    extra_qemu_args: &[&str],
+) -> Result<String, String> {
     let root = workspace_root();
     iso(false, kernel_features)?;
 
@@ -542,6 +565,7 @@ fn run_scenario(
         "-no-reboot",
         "-no-shutdown",
     ]);
+    cmd.args(extra_qemu_args);
 
     if uefi {
         let code = find_ovmf_code()
@@ -1604,6 +1628,95 @@ fn test_smp_sched_stress() -> Result<(), String> {
     println!(
         "xtask: test-smp-sched-stress PASSED — 48 rapid spawn+kill+wait cycles completed under \
          -smp 4 with no hang and no leaked physical memory"
+    );
+    Ok(())
+}
+
+/// Sector size every block-driver test scenario assumes — this
+/// milestone's one real device (and every other block device
+/// `driver::block::BlockDevice` is ever likely to describe) is
+/// universally addressed in 512-byte sectors; see that trait's own
+/// `SECTOR_SIZE` constant.
+const TEST_SECTOR_SIZE: usize = 512;
+
+/// The sector `main.rs`'s `block-driver-test`-gated smoke test reads
+/// back and compares — kept in sync with that file's own
+/// `KNOWN_TEST_LBA` constant by convention (both are small, fixed,
+/// easy-to-grep values, not derived from any shared source of truth,
+/// since xtask and the kernel build as entirely separate crates with no
+/// shared config between them for a single test constant).
+const KNOWN_TEST_LBA: u64 = 2;
+
+/// Builds a small raw disk image at `path`: `sector_count` sectors,
+/// every byte zero except sector [`KNOWN_TEST_LBA`], which is filled
+/// with a fixed, easy-to-recognize repeating byte pattern (`0..=255`
+/// repeated). Not real filesystem content — this milestone has none,
+/// see its own Non-goals — just a deterministic fingerprint the
+/// kernel-side smoke test can read back and compare against exactly.
+fn create_test_disk_image(path: &Path, sector_count: u64) -> Result<(), String> {
+    let mut data = vec![0u8; sector_count as usize * TEST_SECTOR_SIZE];
+    let start = KNOWN_TEST_LBA as usize * TEST_SECTOR_SIZE;
+    for (i, byte) in data[start..start + TEST_SECTOR_SIZE].iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    std::fs::write(path, &data).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Milestone 11, Phase 3: builds the kernel with the `block-driver-test`
+/// feature, attaches a small disk image (seeded by
+/// [`create_test_disk_image`] with known content at a known sector) as a
+/// `virtio-blk-pci-non-transitional` device exactly the way this
+/// milestone's own Phase 1 findings confirmed, and boots it. Proves the
+/// virtio-blk driver itself works end to end — PCI enumeration, feature
+/// negotiation, virtqueue setup, and a real polled sector read — not
+/// just that the earlier PCI-enumeration-only smoke test still passes.
+fn test_block_driver() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-driver-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-driver-test"],
+        "block-driver-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLOCK_READ_FAIL") {
+        return Err(
+            "virtio-blk smoke test reported BLOCK_READ_FAIL -- see the captured log above for \
+             which stage failed"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLOCK_READ_OK") {
+        return Err(
+            "expected \"BLOCK_READ_OK\" -- the virtio-blk smoke test never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-driver PASSED — the virtio-blk driver negotiated features, set up a \
+         virtqueue, and read back a sector whose content exactly matched what this scenario \
+         seeded into the disk image"
     );
     Ok(())
 }

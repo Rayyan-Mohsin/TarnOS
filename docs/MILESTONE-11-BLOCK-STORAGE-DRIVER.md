@@ -293,6 +293,76 @@ second, hypothetical block device that doesn't exist yet.
 a sector with known content (seeded into the test disk image by
 `xtask`) and the content matches, on a real boot.
 
+#### Findings
+
+- **Implemented `driver::block`**: a minimal `BlockDevice` trait
+  (`capacity_sectors`, `read_sectors`) and a small `BlockError` enum
+  (`BufferNotSectorAligned`/`OutOfRange`/`RequestTooLarge`/`DeviceError`)
+  — designed after, and only after, writing the one real driver against
+  it, per this phase's own instruction not to speculatively generalize.
+- **Implemented `driver::virtio_blk`**: walks the device's real PCI
+  capability list (via two small, purely-generic additions to
+  `arch::x86_64::pci` — `PciDevice::capabilities`/`read_u8`/`read_u32` —
+  deliberately kept virtio-agnostic, with all virtio-specific
+  interpretation staying in `virtio_blk` itself) to locate
+  COMMON_CFG/NOTIFY_CFG/DEVICE_CFG; maps only the BAR bytes each
+  capability actually references (never a hardcoded whole-BAR size) at
+  a fixed virtual address distinct from the LAPIC's own, the same
+  "never HHDM for MMIO" reasoning `docs/adr/0009` established; negotiates
+  the one required feature bit (`VIRTIO_F_VERSION_1`) and nothing more;
+  sets up one virtqueue (queue 0, clamped to a small fixed size — a
+  single 3-descriptor request chain never needs more); and performs a
+  synchronous, polled (no interrupt handler ever registered, matching
+  this milestone's own Non-goal), single-request-at-a-time sector read
+  using three dedicated DMA bounce-buffer frames (header/data/status).
+  Every capability/BAR/feature/queue value is read from the device
+  itself at runtime — nothing from Phase 1's own observations is
+  hardcoded, per that phase's own explicit deferral.
+- **Exit condition met on the first real boot attempt**: extended the
+  `block-driver-test` feature's boot block to call `virtio_blk::init()`
+  and read back sector 2 (a fixed convention shared with `xtask`, not a
+  derived constant — the two are separate crates with no shared build-
+  time config for a single test value); the content matched the
+  `0..=255`-repeating pattern `xtask`'s new `create_test_disk_image`
+  seeds there, byte for byte, immediately, with zero debugging needed —
+  `[blk-test] BLOCK_READ_OK`. Confirmed reliable across three repeated
+  boots, not a one-off.
+- **New `xtask test-block-driver` scenario** (wired into `test-all`/CI):
+  builds a small raw disk image with `xtask`'s own new
+  `create_test_disk_image` helper, attaches it with the exact
+  `virtio-blk-pci-non-transitional` flags Phase 1 confirmed plus
+  `-nic none`, and asserts both `PCI_ENUM_OK` and `BLOCK_READ_OK`. Needed
+  a small, additive `run_scenario_ext` (extra raw QEMU args) alongside
+  the existing `run_scenario`, rather than changing that function's
+  signature and touching its ~20 existing call sites.
+- **Zero warnings in both configurations**: default build and
+  `--features block-driver-test` both build and clippy (`-D warnings`)
+  clean, after trimming a few genuinely-unneeded additions along the way
+  (an unused `PciDevice::read_u16`, two `VirtioBlk` fields that turned
+  out to never be read after construction) rather than blanket-allowing
+  them. `driver::block`/`driver::virtio_blk` both carry the same
+  temporary `#[cfg_attr(not(feature = "block-driver-test"), allow(dead_code))]`
+  pattern `arch::x86_64::pci` established in Phase 2, for the same
+  reason: Phase 4 makes this driver's `init` unconditional, at which
+  point the attribute comes back out.
+- **`test_smp_sched_concurrency` flaked again during full-suite
+  verification** — a third occurrence of the same pre-existing,
+  host-performance-variance phenomenon Phase 2's own Findings already
+  documented (and, before that, ADR 0011). Nothing in this phase touches
+  scheduling, PCI-unrelated code paths were the only thing that changed.
+  Confirmed via three isolated reruns (3/3 pass) before treating it as
+  the same known non-regression; a subsequent clean run passed the full
+  suite (23/23, including the new `test-block-driver`) with exit code 0.
+- **xtask's own clippy status left as found**: running clippy directly
+  against the `xtask` crate (never gated by CI, which only lints
+  `tarnos-kcore`/`tarnos-abi` and the cross-compiled kernel/userland
+  targets) surfaced one pre-existing lint (`manual_contains`, in
+  unrelated Milestone 6/7 SMP-boot code, likely a newer clippy version
+  than whenever that code was last touched) — confirmed, by re-running
+  with that one lint suppressed, that none of this phase's own new xtask
+  code triggers anything. Left alone as out of this phase's scope,
+  rather than fixing unrelated code a routine check happened to surface.
+
 ### Phase 4 — Capability and syscall surface
 
 `KernelObjectRef` gains its device-capability variant; `Rights` gains

@@ -364,6 +364,45 @@ extern "C" fn _start() -> ! {
                 earlyprintln!("[pci-test] PCI_ENUM_FAIL -- virtio-blk device not found");
             }
         }
+
+        // Milestone 11, Phase 3: kernel-internal smoke test (no syscall
+        // yet -- that's Phase 4) proving the virtio-blk driver itself
+        // works end to end: negotiate features, set up one virtqueue,
+        // read back a sector `xtask` seeded with known content, and
+        // confirm it matches exactly. Sector 2, matching the fixed
+        // convention `xtask::create_test_disk_image` uses.
+        const KNOWN_TEST_LBA: u64 = 2;
+        use driver::block::BlockDevice;
+        match driver::virtio_blk::init() {
+            Ok(()) => {
+                let result = driver::virtio_blk::with_device(|device| {
+                    let mut buf = [0u8; 512];
+                    device.read_sectors(KNOWN_TEST_LBA, &mut buf).map(|()| buf)
+                });
+                match result {
+                    Some(Ok(buf)) => {
+                        let matches = buf.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8);
+                        earlyprintln!(
+                            "[blk-test] {}",
+                            if matches {
+                                "BLOCK_READ_OK"
+                            } else {
+                                "BLOCK_READ_FAIL -- content mismatch"
+                            }
+                        );
+                    }
+                    Some(Err(e)) => {
+                        earlyprintln!("[blk-test] BLOCK_READ_FAIL -- read_sectors error {:?}", e);
+                    }
+                    None => {
+                        earlyprintln!("[blk-test] BLOCK_READ_FAIL -- with_device found no driver");
+                    }
+                }
+            }
+            Err(e) => {
+                earlyprintln!("[blk-test] BLOCK_READ_FAIL -- virtio_blk::init failed: {e}");
+            }
+        }
     }
 
     // Deliberately faults instead of continuing boot — see

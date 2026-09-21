@@ -11,7 +11,9 @@
 //! before process infrastructure exists), registered in the small IRQ
 //! dispatch table below rather than wired ad hoc — that table is the seed
 //! of a future out-of-process driver manager, not a one-off.
+pub mod block;
 pub mod uart;
+pub mod virtio_blk;
 
 use crate::sync::SpinLock;
 
