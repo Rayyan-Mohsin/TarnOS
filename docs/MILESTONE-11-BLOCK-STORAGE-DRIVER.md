@@ -485,6 +485,70 @@ milestone's own boundary tests already hold to.
 **Exit condition:** new scenarios pass, wired into `test-all` and CI;
 full existing regression suite still green.
 
+#### Findings
+
+- **New `userland/block-child` fixture** (`Cargo.toml` + workspace
+  membership + `xtask`'s `USER_CRATES` + `limine.conf` module entry, the
+  same three-place checklist every prior fixture went through): a real,
+  independently-linked ELF binary — unlike
+  `kernel::milestone11_tests::block_read_syscall_process` (a kernel
+  function copied into a dummy process's own pages, so constrained
+  against ordinary Rust codegen), this one has no such restriction,
+  since `Process::from_elf` loads and links it as a complete program.
+  Reads the known sector via a new `tarnos_rt::syscall::sys_block_read`
+  wrapper (mirroring `sys_sbrk`'s own shape), reports
+  `BLOCK_FIXTURE_OK`/`FAIL` on `CONSOLE_CAP`, exits.
+- **Spawned directly, not via `SYS_SPAWN`**: `main.rs`'s new
+  `block-fixture-test` boot block finds `block-child`'s own boot module
+  by `cmdline()` and calls `Process::from_elf` — the exact same path
+  `main.rs` already uses to create the real `init` process at boot —
+  with `BLOCK_CAP`/`CONSOLE_CAP` seeded directly into its table.
+  Deliberately sidesteps touching real `init`'s own boot-wiring code
+  (duplicated across roughly fifteen existing, already-verified,
+  mutually-exclusive `#[cfg(feature = ...)]` boot paths — one per prior
+  milestone's own test scenario): retrofitting all of them for a
+  capability none of them test would have been risk with no test value.
+  `tarnos_abi::BLOCK_CAP`'s own doc comment (Phase 4) already named this
+  as deferred, undecided work; wiring it into real `init`/`SYS_GRANT`
+  for a still-more-production-shaped flow remains open for whenever a
+  concrete need for it (e.g. Milestone 12's filesystem) actually arises.
+- **New `block-boundary-test` feature**: one dummy process, four
+  adversarial `SYS_BLOCK_READ` probes, each checked against the *exact*
+  expected error code (not just "some error") — an out-of-range LBA
+  (`IoOutOfRange`), a capability index nothing was ever seeded into
+  (`BadCapability`, distinct from the valid-but-wrong-rights
+  `PermissionDenied` case, which this milestone's own design doesn't
+  need to separately exercise since `sys_block_read` never reaches a
+  rights check for a slot that doesn't exist at all), a zero sector
+  count (`InvalidArgument`), and a canonical-but-unmapped buffer address
+  (`InvalidArgument`, confirming the buffer is validated *before* any
+  device I/O, not merely that a bad write happens not to crash
+  anything). Every expected error is a raw hardcoded `i64` literal, not
+  a `SyscallError::as_retval()` call — see the finding below for why
+  that distinction mattered in practice, not just in principle.
+- **A second real bug, same class as Phase 4's, caught before it ever
+  needed a debugging session**: the first draft of
+  `block_boundary_process` called `SyscallError::as_retval()` to compute
+  each check's expected value inline. Recognizing this as the identical
+  "Rust-level function call inside a dummy process's copied 2 pages"
+  hazard Phase 4's own incident already documented — before building or
+  booting it even once — it was rewritten to hardcode each expected
+  value as a raw `const i64` literal instead. Recorded here as evidence
+  the Phase 4 finding actually generalized into a real, reusable
+  awareness for this module, not a one-off patch.
+- **Every new scenario passed on its first real boot attempt**
+  (`test-block-boundary`, `test-block-fixture`), confirmed reliable
+  across three repeated runs each — a meaningfully different outcome
+  from Phase 4's own first attempt, attributable to applying that
+  phase's own lesson proactively this time rather than discovering it
+  again by faulting.
+- **Zero warnings across all four block-related kernel configurations**
+  (`block-driver-test`/`block-syscall-test`/`block-boundary-test`/
+  `block-fixture-test`) and the cross-compiled `tarnos-rt`/userland
+  targets, `block-child` included. Full `test-all` (26/26, all four new
+  scenarios plus every pre-existing one) passed cleanly with exit
+  code 0.
+
 ### Phase 6 — Documentation and sign-off
 
 Write the ADR recording this milestone's decisions and findings

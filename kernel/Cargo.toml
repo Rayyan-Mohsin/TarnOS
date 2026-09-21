@@ -154,6 +154,25 @@ block-driver-test = []
 # through the real syscall/capability surface. Exercised by
 # `cargo run -p xtask -- test-block-syscall`.
 block-syscall-test = []
+# Milestone 11, Phase 5: spawns a dummy ring-3 process (BLOCK_CAP and
+# CONSOLE_CAP seeded directly) that runs four adversarial SYS_BLOCK_READ
+# probes -- an out-of-range LBA, a capability index nothing was seeded
+# into, a zero sector_count, and an unmapped buffer address -- and
+# confirms each one fails with exactly the error code it should, not
+# just "some error." Exercised by
+# `cargo run -p xtask -- test-block-boundary`.
+block-boundary-test = []
+# Milestone 11, Phase 5: boots with a real ELF-loaded userland fixture
+# (userland/block-child, spawned directly the same way `init` itself is
+# -- not via SYS_SPAWN) holding a directly-seeded BLOCK_CAP, which
+# issues a real SYS_BLOCK_READ through tarnos-rt's own syscall wrapper
+# and reports whether the content matches -- the same check
+# block-syscall-test's raw-asm dummy process makes, now through a real
+# compiled userland binary and its own runtime, matching every other
+# milestone's "the fixture is the real thing, not a kernel-copied
+# function" bar (echo-child, heap-child, ...). Exercised by
+# `cargo run -p xtask -- test-block-fixture`.
+block-fixture-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

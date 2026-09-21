@@ -48,6 +48,8 @@ fn main() {
         "test-smp-forced-preempt" => test_smp_forced_preempt(),
         "test-block-driver" => test_block_driver(),
         "test-block-syscall" => test_block_syscall(),
+        "test-block-boundary" => test_block_boundary(),
+        "test-block-fixture" => test_block_fixture(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -74,7 +76,9 @@ fn main() {
             .and_then(|_| test_smp_send_cross_core())
             .and_then(|_| test_smp_forced_preempt())
             .and_then(|_| test_block_driver())
-            .and_then(|_| test_block_syscall()),
+            .and_then(|_| test_block_syscall())
+            .and_then(|_| test_block_boundary())
+            .and_then(|_| test_block_fixture()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -158,6 +162,12 @@ fn print_usage() {
          \x20 test-block-syscall    Same seeded disk, but read through a real ring-3\n\
          \x20                    process's own SYS_BLOCK_READ call instead of calling the\n\
          \x20                    driver directly from kernel context (Milestone 11)\n\
+         \x20 test-block-boundary   Confirm SYS_BLOCK_READ rejects an out-of-range LBA, a\n\
+         \x20                    missing capability, a zero sector count, and an unmapped\n\
+         \x20                    buffer -- each with the exact error it should (Milestone 11)\n\
+         \x20 test-block-fixture    Same seeded disk, read by a real ELF userland fixture\n\
+         \x20                    (block-child) through tarnos-rt's own syscall wrapper,\n\
+         \x20                    not a raw-asm dummy process (Milestone 11)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -166,8 +176,9 @@ fn print_usage() {
          \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
          \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
          \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
-         \x20                    test-smp-forced-preempt, test-block-driver, and\n\
-         \x20                    test-block-syscall in sequence"
+         \x20                    test-smp-forced-preempt, test-block-driver,\n\
+         \x20                    test-block-syscall, test-block-boundary, and\n\
+         \x20                    test-block-fixture in sequence"
     );
 }
 
@@ -282,7 +293,13 @@ fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), Str
 /// which kernel feature a given `xtask` command builds with — none of
 /// the existing milestone-2 test scenarios exercise spawning, but they
 /// still boot the same `limine.conf`.
-const USER_CRATES: &[&str] = &["init", "echo-child", "exit-code-child", "heap-child"];
+const USER_CRATES: &[&str] = &[
+    "init",
+    "echo-child",
+    "exit-code-child",
+    "heap-child",
+    "block-child",
+];
 
 fn build(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
@@ -1782,6 +1799,125 @@ fn test_block_syscall() -> Result<(), String> {
         "xtask: test-block-syscall PASSED — a real ring-3 process's own SYS_BLOCK_READ call, \
          gated by a directly-seeded BLOCK_CAP capability, read back content matching exactly \
          what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 5: builds the kernel with the `block-boundary-test`
+/// feature (a dummy ring-3 process that runs four adversarial
+/// `SYS_BLOCK_READ` probes — an out-of-range LBA, a capability index
+/// nothing was seeded into, a zero sector count, and an unmapped buffer
+/// address) against the same seeded disk image, and confirms every
+/// probe failed with exactly the error code it should — the same
+/// "prove the boundary is enforced, not just unexercised" bar every
+/// prior milestone's own boundary tests already hold to.
+fn test_block_boundary() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-boundary-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-boundary-test"],
+        "block-boundary-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLK_BOUNDARY_FAIL") {
+        return Err(
+            "the boundary-test process reported BLK_BOUNDARY_FAIL -- at least one adversarial \
+             SYS_BLOCK_READ probe didn't fail with the exact error code expected"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLK_BOUNDARY_OK") {
+        return Err(
+            "expected \"BLK_BOUNDARY_OK\" -- the boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-boundary PASSED — an out-of-range LBA, a missing capability, a zero \
+         sector count, and an unmapped buffer address all failed with exactly the error code \
+         each should"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 5: builds the kernel with the `block-fixture-test`
+/// feature (a real ELF-loaded userland fixture, `block-child`, spawned
+/// directly like `init` itself with `BLOCK_CAP`/`CONSOLE_CAP` seeded)
+/// against the same seeded disk image, and confirms the fixture's own
+/// `tarnos-rt`-wrapped `SYS_BLOCK_READ` call read back content matching
+/// exactly what was seeded — the same check `test_block_syscall`'s
+/// raw-asm dummy process already makes, now through a real compiled
+/// userland binary and its own runtime, matching every other
+/// milestone's "the fixture is the real thing" bar (`echo-child`,
+/// `heap-child`, ...).
+fn test_block_fixture() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-fixture-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-fixture-test"],
+        "block-fixture-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLOCK_FIXTURE_FAIL") {
+        return Err(
+            "block-child reported BLOCK_FIXTURE_FAIL -- either its own SYS_BLOCK_READ call \
+             failed or the content it read back didn't match what this scenario seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLOCK_FIXTURE_OK") {
+        return Err(
+            "expected \"BLOCK_FIXTURE_OK\" -- block-child never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-fixture PASSED — the real block-child userland fixture's own \
+         SYS_BLOCK_READ call, through tarnos-rt's syscall wrapper, read back content matching \
+         exactly what this scenario seeded into the disk image"
     );
     Ok(())
 }

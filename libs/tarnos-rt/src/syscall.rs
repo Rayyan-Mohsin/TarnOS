@@ -6,8 +6,8 @@
 use core::arch::asm;
 
 use tarnos_abi::{
-    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_EXIT, SYS_GRANT, SYS_KILL,
-    SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_BLOCK_READ, SYS_EXIT, SYS_GRANT,
+    SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 
 pub fn sys_yield() {
@@ -224,6 +224,42 @@ pub fn sys_sbrk(increment: i64) -> Result<u64, SyscallError> {
         Err(SyscallError::from_retval(retval))
     } else {
         Ok(retval as u64)
+    }
+}
+
+/// Reads `sector_count` whole 512-byte sectors starting at `lba` from
+/// the block device named by `cap` (must hold [`Rights::READ`]) into
+/// `buf`. `buf.len()` must equal `sector_count * 512` exactly — this
+/// wrapper does not itself validate that (the kernel does, returning
+/// [`SyscallError::InvalidArgument`] for a mismatched or misshapen
+/// request); it exists to spare a caller the raw register-packing
+/// `asm!` block, not to duplicate the kernel's own checks.
+pub fn sys_block_read(
+    cap: CapIndex,
+    lba: u64,
+    buf: &mut [u8],
+    sector_count: u64,
+) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_BLOCK_READ => retval,
+            in("rdi") cap.0 as u64,
+            in("rsi") lba,
+            in("rdx") buf.as_mut_ptr() as u64,
+            in("r10") sector_count,
+            in("r8") 0u64,
+            in("r9") 0u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
     }
 }
 

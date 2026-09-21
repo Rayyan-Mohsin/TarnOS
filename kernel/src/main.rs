@@ -429,6 +429,90 @@ extern "C" fn _start() -> ! {
         task::scheduler::spawn(process).expect("spawn failed");
     }
 
+    // Milestone 11, Phase 5: spawns one dummy ring-3 process (`BLOCK_CAP`
+    // and `CONSOLE_CAP` seeded directly, same pattern as
+    // `block-syscall-test` above) that runs four adversarial
+    // `SYS_BLOCK_READ` probes -- an out-of-range LBA, a capability index
+    // nothing was seeded into, a zero sector count, and an unmapped
+    // buffer address -- confirming each fails with exactly the error it
+    // should, the same "prove the boundary is enforced" bar every prior
+    // milestone's own boundary tests hold to. Never enabled for a normal
+    // build.
+    #[cfg(feature = "block-boundary-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let pid = task::scheduler::allocate_pid();
+        let mut process = task::process::Process::new_dummy(
+            pid,
+            milestone11_tests::block_boundary_process,
+            None,
+        )
+        .expect("failed to create the block-boundary-test process");
+        process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        process.cap_table.insert(
+            tarnos_abi::BLOCK_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::BlockDevice,
+                rights: ipc::Rights::READ,
+            },
+        );
+        task::scheduler::spawn(process).expect("spawn failed");
+    }
+
+    // Milestone 11, Phase 5: spawns a real ELF-loaded userland fixture
+    // (`userland/block-child`) directly -- the same `Process::from_elf`
+    // path `init` itself takes at the bottom of this function, not
+    // `SYS_SPAWN` -- with `BLOCK_CAP`/`CONSOLE_CAP` seeded directly into
+    // its own table. Proves the same read `block-syscall-test`'s raw-asm
+    // dummy process already confirmed is also reachable through a real
+    // compiled userland binary and `tarnos-rt`'s own syscall wrapper,
+    // matching every other milestone's "the fixture is the real thing"
+    // bar (`echo-child`, `heap-child`, ...). Never enabled for a normal
+    // build.
+    #[cfg(feature = "block-fixture-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let fixture_module = boot_modules
+            .iter()
+            .find(|module| module.cmdline() == "block-child")
+            .expect(
+                "no boot module with cmdline \"block-child\" (check limine.conf's module_string)",
+            );
+
+        let pid = task::scheduler::allocate_pid();
+        let mut process = task::process::Process::from_elf(pid, fixture_module.data(), None)
+            .expect("failed to load block-child's ELF image");
+        process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        process.cap_table.insert(
+            tarnos_abi::BLOCK_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::BlockDevice,
+                rights: ipc::Rights::READ,
+            },
+        );
+        task::scheduler::spawn(process).expect("spawn failed");
+    }
+
     // Deliberately faults instead of continuing boot — see
     // `cargo run -p xtask -- test-fault`, which builds with this feature
     // specifically to confirm the page-fault/double-fault handling

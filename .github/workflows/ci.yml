@@ -67,7 +67,7 @@ jobs:
       - name: Clippy (tarnos-rt + every userland crate, custom x86_64-tarnos-user target)
         run: |
           RUSTFLAGS="-C relocation-model=static" cargo clippy \
-            -p tarnos-rt -p init -p echo-child -p exit-code-child -p heap-child \
+            -p tarnos-rt -p init -p echo-child -p exit-code-child -p heap-child -p block-child \
             --target targets/x86_64-tarnos-user.json -Zjson-target-spec \
             -Zbuild-std=core,alloc,compiler_builtins \
             -Zbuild-std-features=compiler-builtins-mem -- -D warnings
@@ -151,3 +151,9 @@ jobs:
 
       - name: xtask test-block-syscall (SYS_BLOCK_READ works end to end from ring 3)
         run: cargo run -p xtask -- test-block-syscall
+
+      - name: xtask test-block-boundary (out-of-range/missing-cap/invalid SYS_BLOCK_READ rejected)
+        run: cargo run -p xtask -- test-block-boundary
+
+      - name: xtask test-block-fixture (real userland fixture reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-block-fixture
