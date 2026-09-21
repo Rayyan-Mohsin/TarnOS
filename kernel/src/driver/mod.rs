@@ -17,6 +17,14 @@ use crate::sync::SpinLock;
 
 /// Lifecycle every driver implements.
 pub trait Driver {
+    /// Implemented by `Uart16550` today, but no registry or diagnostic
+    /// calls it yet — this milestone has exactly one driver, always known
+    /// by name at every call site that matters. Kept (rather than
+    /// deleted) as the obvious, minimal piece of any future multi-driver
+    /// registry or `#[driver] not responding` diagnostic; a genuinely
+    /// dead method would have no implementation to warn about in the
+    /// first place.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 }
 
@@ -56,7 +64,9 @@ const MAX_IRQ: usize = 16;
 /// is an invariant of the *caller*, not something this table enforces —
 /// using the interrupt-disabling lock here makes the safety structural
 /// instead of dependent on every future driver getting init order right.
-static IRQ_TABLE: SpinLock<[Option<fn()>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
+type IrqTable = SpinLock<[Option<fn()>; MAX_IRQ]>;
+
+static IRQ_TABLE: IrqTable = SpinLock::new([None; MAX_IRQ]);
 
 /// Registers `handler` to run when IRQ `irq` is dispatched. Does not touch
 /// the PIC mask — a driver unmasks its own line only once it is actually

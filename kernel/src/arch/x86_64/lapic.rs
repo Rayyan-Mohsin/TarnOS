@@ -76,7 +76,6 @@ pub const LAPIC_TIMER_VECTOR: u8 = 0x43;
 /// included -- see [`broadcast_panic_halt`]'s doc comment).
 pub const PANIC_HALT_VECTOR: u8 = 0x44;
 
-const REG_ID: usize = 0x20;
 const REG_EOI: usize = 0xB0;
 const REG_SVR: usize = 0xF0;
 const REG_ICR_LOW: usize = 0x300;
@@ -277,14 +276,6 @@ pub unsafe fn arm_timer_this_core() {
 /// BSP's existing legacy-PIC-based `interrupts::send_timer_eoi()` path.
 pub fn eoi() {
     unsafe { write_reg(REG_EOI, 0) };
-}
-
-/// This core's own LAPIC ID, read directly from the LAPIC's ID register.
-/// Kept independent of `percpu::core_index()`'s `CPUID`-based read (used
-/// only for `smp`'s own landing-state diagnostic, to cross-check the two
-/// sources rather than assume they agree).
-pub fn this_lapic_id() -> u32 {
-    unsafe { read_reg(REG_ID) >> 24 }
 }
 
 /// Sends a fixed-vector, physically-addressed IPI to exactly the core

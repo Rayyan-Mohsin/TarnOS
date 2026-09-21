@@ -107,6 +107,24 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[link_section = ".requests"]
 static MP_REQUEST: MpRequest = MpRequest::new(0);
 
+// Every `#[cfg(feature = "...-test")]` block below that spawns its own
+// dummy process(es) ends by calling `task::scheduler::start()` (`-> !`,
+// never returns) instead of falling through to the real boot sequence —
+// exactly one test feature is ever enabled in any real build (each
+// `xtask test-*` scenario builds with its own single, fixed feature; the
+// default/CI `build` enables none of them), so whichever one block is
+// actually compiled in genuinely never falls through to anything after
+// it. Rustc has no way to know only one of ~14 mutually-exclusive
+// `#[cfg]` blocks is ever live in a given build, so it (correctly, for
+// what it can see) flags the code textually following each one's own
+// diverging call as unreachable. Restructuring this into a single
+// if/else chain would fix that at the cost of a much larger diff for a
+// purely cosmetic warning; `#[allow(unreachable_code)]` says so
+// directly instead. Only ever silences *this* fully-understood,
+// structural warning -- everything below still gets a real compile
+// error for an actual type/borrow/logic mistake, since none of those
+// are `unreachable_code` lints.
+#[allow(unreachable_code)]
 #[no_mangle]
 extern "C" fn _start() -> ! {
     assert!(

@@ -99,7 +99,7 @@ pub(super) fn on_timer_tick_bookkeeping() {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     // One line roughly once a second, just enough to prove ticks keep
     // arriving without flooding the serial console at 100 Hz.
-    if n % (PIT_FREQUENCY_HZ as u64) == 0 {
+    if n.is_multiple_of(PIT_FREQUENCY_HZ as u64) {
         earlyprintln!("[timer] {} ticks", n);
     }
 }

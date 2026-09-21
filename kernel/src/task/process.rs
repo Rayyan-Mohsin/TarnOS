@@ -331,6 +331,13 @@ impl Process {
     /// linker happened to place it at, never guaranteed to be
     /// page-aligned, so its tail can spill into the following page for
     /// any function longer than the room remaining from that offset.
+    ///
+    /// Every real caller lives behind one of the dummy-process test
+    /// features (`kernel/src/milestone*_tests.rs`,
+    /// `kernel/src/kitchen_sink_tests.rs`), so a default build never
+    /// calls this at all — `#[allow(dead_code)]` reflects that reality
+    /// rather than papering over a genuinely dead function.
+    #[allow(dead_code)]
     pub fn new_dummy(
         pid: Pid,
         entry_fn: unsafe extern "C" fn() -> !,

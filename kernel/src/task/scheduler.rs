@@ -498,6 +498,11 @@ fn record_dispatch_trace(core: usize, pid: Option<Pid>) {
 /// torn slot is far more likely to show a stale-but-self-consistent
 /// older entry than a mismatched `(seq, pid)` pair.
 fn dump_dispatch_trace_for_panic() {
+    // `core` is printed directly in the diagnostic below and passed to
+    // `percpu::is_booted`, not just used to index `DISPATCH_TRACE` --
+    // clippy's suggested `.iter().enumerate()` rewrite would need `core`
+    // back out of the tuple for both of those anyway, for no real gain.
+    #[allow(clippy::needless_range_loop)]
     for core in 0..MAX_CORES {
         if !percpu::is_booted(core) {
             continue;
@@ -601,6 +606,10 @@ pub fn dump_cores_for_panic() {
             );
         }
     }
+    // `index` is printed directly in the diagnostic below, not just used
+    // to index `STACK_BUSY` -- see `dump_dispatch_trace_for_panic`'s
+    // identical reasoning for keeping a plain range loop here.
+    #[allow(clippy::needless_range_loop)]
     for index in 0..MAX_PROCESSES {
         if STACK_BUSY[index].load(Ordering::Acquire) {
             crate::panic_earlyprintln!("[panic-dump] STACK_BUSY[{index}] = true");
@@ -785,6 +794,12 @@ fn switch_to(sched: &mut Inner, pid: Pid) -> (*mut TrapFrame, u64, u64) {
     // landing back in kernel-stack memory rather than `.text`. Checked
     // before `set_current` below claims this core, so a genuine
     // violation is caught here rather than overwritten by it.
+    //
+    // `other_core` is compared against `this_core` and printed in the
+    // assert message below, not just used to index `sched.current` --
+    // same reasoning as `dump_dispatch_trace_for_panic`'s identical
+    // `#[allow]`.
+    #[allow(clippy::needless_range_loop)]
     for other_core in 0..MAX_CORES {
         if other_core != this_core {
             assert_ne!(

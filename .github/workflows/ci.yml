@@ -49,6 +49,29 @@ jobs:
       - name: Clippy (host-buildable crates)
         run: cargo clippy -p tarnos-kcore -p tarnos-abi --all-targets -- -D warnings
 
+      # The kernel and every no_std, custom-target crate below were never
+      # linted at all until Milestone 10 Phase 2 (see
+      # docs/MILESTONE-10-LAST-BASE-LEVEL-CHECK.md) -- `--all-targets`
+      # is deliberately omitted here (unlike the host-buildable crates
+      # above): none of these are host-testable, so `--all-targets`
+      # would try to build a `test` target these no_std/custom-target
+      # builds can't produce (`can't find crate for `test``), not lint
+      # anything real.
+      - name: Clippy (kernel, no_std, custom x86_64-unknown-none target)
+        run: |
+          RUSTFLAGS="-C relocation-model=static" cargo clippy -p tarnos-kernel \
+            --target x86_64-unknown-none \
+            -Zbuild-std=core,alloc,compiler_builtins \
+            -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+
+      - name: Clippy (tarnos-rt + every userland crate, custom x86_64-tarnos-user target)
+        run: |
+          RUSTFLAGS="-C relocation-model=static" cargo clippy \
+            -p tarnos-rt -p init -p echo-child -p exit-code-child -p heap-child \
+            --target targets/x86_64-tarnos-user.json -Zjson-target-spec \
+            -Zbuild-std=core,alloc,compiler_builtins \
+            -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+
       - name: Build kernel + init (cross-compiled, custom no_std targets)
         run: cargo run -p xtask -- build
 

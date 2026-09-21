@@ -2,11 +2,9 @@
 //!
 //! Everything above this module (the ELF loader, process creation, the
 //! heap) works through the safe, typed functions here — [`map`]/
-//! [`map_in`] today, plus [`unmap`]/[`translate`] for whichever future
-//! caller needs to remove a mapping or look one up (neither has a real
-//! caller yet at this milestone) — never by walking or dereferencing a
-//! page table entry directly. That boundary is what "zero-trust memory"
-//! means in practice: the unsafety of raw paging is audited once, here,
+//! [`map_in`]/[`translate`] — never by walking or dereferencing a page
+//! table entry directly. That boundary is what "zero-trust memory" means
+//! in practice: the unsafety of raw paging is audited once, here,
 //! instead of trusted ad hoc at every call site that needs a mapping.
 use spin::{Mutex, Once};
 use x86_64::registers::control::{Cr3, Cr3Flags};
@@ -54,7 +52,7 @@ pub unsafe fn init(hhdm_offset: VirtAddr) {
 fn with_mapper<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) -> R {
     let mapper = MAPPER
         .get()
-        .expect("memory::virt::init() must run before map()/unmap()/translate()");
+        .expect("memory::virt::init() must run before map()/translate()");
     f(&mut mapper.lock())
 }
 
@@ -115,18 +113,15 @@ pub unsafe fn map_in(
         .map_err(map_error_from)
 }
 
-/// Removes the mapping for `page`, returning the frame it was mapped to.
-/// Does not free the frame — callers that own the frame decide whether to
-/// return it to the allocator.
-pub fn unmap(page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
-    with_mapper(|mapper| mapper.unmap(page).ok().map(|(frame, flush)| {
-        flush.flush();
-        frame
-    }))
-}
-
 /// Looks up the physical address a virtual address currently maps to, or
-/// `None` if it is unmapped.
+/// `None` if it is unmapped. Only ever called today from
+/// `task::process::Process::new_dummy` (itself only reachable under the
+/// `kitchen-sink-test`/dummy-process-style test features, hence
+/// `#[allow(dead_code)]` for a default build), to find the physical
+/// frame backing a kernel-compiled dummy entry function so it can be
+/// copied into a fresh process's own pages — see that function's own
+/// doc comment.
+#[allow(dead_code)]
 pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     with_mapper(|mapper| mapper.translate_addr(addr))
 }

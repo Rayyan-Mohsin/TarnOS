@@ -35,7 +35,12 @@ pub struct PerCpuSlot {
     /// Bumped in a free-running loop only under the `smp-boot-test`
     /// feature, as evidence this core is genuinely executing
     /// concurrently with every other one rather than being secretly
-    /// serialized — see `xtask test-smp-boot`.
+    /// serialized — see `xtask test-smp-boot`. Both the write
+    /// (`smp::ap_entry_on_own_stack`) and the read (`main.rs`'s
+    /// `smp-boot-test` boot block) are gated behind that same feature, so
+    /// a default build genuinely never touches this field past its
+    /// zero-initialization — expected, not an oversight.
+    #[cfg_attr(not(feature = "smp-boot-test"), allow(dead_code))]
     pub spin_count: AtomicU64,
     /// Lock-free mirror of `task::scheduler::Inner.current[this core]` —
     /// `0` for "no process," else a `Pid`'s raw `u64`. `Pid(0)` can never

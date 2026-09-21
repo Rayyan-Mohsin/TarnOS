@@ -77,7 +77,7 @@ unsafe impl GlobalAlloc for UserHeap {
             .lock()
             .allocate_first_fit(layout)
             .map(|ptr| ptr.as_ptr())
-            .unwrap_or(core::ptr::null_mut())
+            .unwrap_or_default()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
