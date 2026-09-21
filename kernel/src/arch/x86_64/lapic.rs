@@ -151,10 +151,12 @@ fn mmio_base() -> *mut u32 {
 
 /// # Safety
 /// `offset` must be a valid LAPIC register offset (one of the `REG_*`
-/// constants above), and the LAPIC must already be mapped into this
-/// address space's HHDM region — true for every core, since the HHDM
-/// covers all usable/reserved physical memory and every core shares the
-/// same kernel half of its page tables.
+/// constants above), and [`init_mmio_mapping`] must have already run —
+/// true for every core, since it maps the LAPIC once, into the shared
+/// kernel half of every core's page tables, before any core calls
+/// [`init_this_core`]. Deliberately *not* an HHDM requirement — see
+/// [`LAPIC_MMIO_VBASE`]'s own doc comment for why reaching the LAPIC via
+/// HHDM is actually wrong, not just unnecessary.
 unsafe fn read_reg(offset: usize) -> u32 {
     unsafe { core::ptr::read_volatile(mmio_base().byte_add(offset)) }
 }
