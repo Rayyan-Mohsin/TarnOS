@@ -435,6 +435,31 @@ uncertain — the actual input the next milestone's own planning needs.
 **Exit condition:** task list has no orphaned items whose relevance
 hasn't been explicitly re-confirmed or retired.
 
+#### Findings
+
+Task #100 was already closed (before this milestone's own Phase 1
+began, per its own recorded description) as superseded rather than
+literally performed — the single-step capture was never done, honestly
+recorded as such, with the reasoning this section would have reached
+independently: ADR 0017 onward generalized the bug far past ADR 0016's
+own narrow PIC/PIT lead (multiple cores required but no specific
+workload; reproducible with no interrupts at all; corruption later
+observed landing on scheduler state, `trap_frame`, `ProcessBox`, a
+`SpinLockGuard`, and a stack-spilled local — never tied back to
+`ChainedPics` again in any later ADR, confirmed by grepping 0017-0029
+for it directly). Nothing further needed here.
+
+Spot-checked the other Milestone 9 investigation tasks (#92, #98, #99)
+for the same "marked completed but is the description honest about
+what was actually achieved" question, given the underlying bug is
+still open: all three accurately describe finishing *that round's*
+investigative work (a real fix, a ruled-out hypothesis, new diagnostic
+capability) while explicitly stating the corruption itself remained
+un-root-caused — not misleadingly framed as the bug being fixed. No
+correction needed.
+
+No other orphaned or stale items found in the task list.
+
 ### Phase 9 — Final sign-off
 
 - Full regression: `cargo run -p xtask -- test-all`, green, from a
