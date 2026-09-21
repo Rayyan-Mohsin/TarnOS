@@ -343,6 +343,83 @@ yet:
 what's confirmed ready, what's confirmed missing, and what's genuinely
 uncertain — the actual input the next milestone's own planning needs.
 
+#### Findings
+
+**Confirmed ready:**
+
+- `elf.rs`'s loader is already fully data-source-agnostic: `load(data:
+  &[u8], ...)` never assumes its input came from a Limine boot module —
+  it copies everything it needs out of `data` before returning, holding
+  no reference to it afterward. A filesystem-backed `SYS_SPAWN` reading
+  a file into a heap-allocated buffer first, then calling this exact
+  same function, needs zero changes here. `ElfError`'s existing variant
+  set (bad magic, wrong class, segment-bounds violations, OOM, map
+  failure) already covers everything a real file's malformed contents
+  could produce, independent of where the bytes came from.
+- `ipc::CapTable`/`CapabilitySlot`/`Rights`'s existing grant mechanism
+  (`SYS_GRANT`, narrowing rights, parent-to-`Suspended`-child only) is
+  sound and directly reusable for propagating a future filesystem-
+  server capability down the process tree — matching, not fighting,
+  this project's own established no-ambient-authority model
+  (`docs/adr/0001`/`0006`): a client process reaches the filesystem
+  server because *whoever spawned it* held and passed down that
+  capability, the same way `init` already grants `echo-child` its own
+  `CHILD_LINK_CAP` today. This requires every future spawner to know
+  which service capabilities a program needs and to hold them itself —
+  a real constraint, but the deliberate one this capability model
+  already commits to, not a gap.
+
+**Confirmed missing:**
+
+- `KernelObjectRef` has exactly one variant (`Endpoint`) — a capability
+  naming a device or an open file needs its own new variant, exactly
+  the extension point `docs/adr/0001` designed it to have but never
+  built. `Rights` likewise has exactly two bits (`SEND`, `RECV`); a
+  device/file capability will need its own rights vocabulary (read,
+  write, whatever "admin" a block device needs), not a reuse of IPC's.
+- `driver::Driver`/`CharDevice` are UART-shaped, confirming the
+  suspicion Phase 2 already flagged: byte-oriented
+  (`write_byte`/`try_read_byte`), no block/sector addressing, no
+  notion of an in-flight request or completion, no I/O error type. None
+  of this is reusable for a block device as-is; a `BlockDevice`-shaped
+  trait (addressed reads/writes, some async-or-callback completion
+  model, its own error type) needs designing from scratch, not
+  extending from `CharDevice`. `Driver::name()` — the one method the
+  base trait actually has — is the only part that would carry over
+  unchanged.
+- `tarnos_abi::SyscallError`'s 9 variants have no I/O-error shape (a
+  file genuinely not existing, distinct from `NoSuchProgram`'s
+  boot-module-specific meaning; permission denied opening a file; a
+  read/write I/O failure). Cheap to add when needed — this is exactly
+  the kind of extensible, negative-`i64`-per-variant enum `docs/adr/0004`
+  designed for exactly this — but not present today; sizing this gap
+  now (rather than discovering it mid-filesystem-milestone) is the
+  point of naming it here.
+
+**Genuinely uncertain — needs a decision, not more auditing:**
+
+- Whether the near-term plan keeps drivers kernel-resident (only the
+  filesystem *logic* becomes a service on top of an in-kernel block
+  driver) or moves drivers out-of-process too changes the size of the
+  gap enormously. If drivers stay in-kernel, the missing pieces above
+  are the whole story. If they move out-of-process, there is currently
+  **no mechanism at all** for a process to receive MMIO/port-I/O access
+  or hardware IRQ delivery via IPC — `driver/mod.rs`'s own module doc
+  comment already anticipates this ("the seed of a future out-of-process
+  driver manager"), but nothing beyond the in-kernel IRQ dispatch table
+  itself exists toward it. This is a materially bigger primitive than a
+  new `KernelObjectRef` variant, and the next milestone's own planning
+  should decide which shape it's actually building before estimating
+  scope.
+- Whether a filesystem server needs to hand a capability to an
+  already-running, unrelated client process (per-request, e.g. "here is
+  a capability naming this one open file") — which the current
+  parent-to-`Suspended`-child-only `SYS_GRANT` genuinely cannot express
+  — or whether the existing spawn-time propagation model (above) is
+  judged sufficient for the whole milestone's scope, is a concrete
+  design question for that milestone's own planning, not something
+  this audit can resolve by itself.
+
 ### Phase 8 — Housekeeping
 
 - Task #100 ("single-step capture the SpinLock<ChainedPics> null-write")
