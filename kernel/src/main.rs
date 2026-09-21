@@ -82,8 +82,12 @@ static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressR
 #[link_section = ".requests"]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
-/// Captured now, unused, so a future migration to LAPIC/IOAPIC/SMP (which
-/// needs ACPI tables) doesn't require a boot-protocol change.
+/// Captured but still unused: SMP bring-up ended up going through
+/// Limine's own `MP_REQUEST` instead (see `arch::x86_64::smp`), which
+/// hands over each core's LAPIC ID directly with no ACPI/MADT parsing
+/// needed. Left in place in case a future need for the ACPI tables
+/// themselves (not just per-core LAPIC IDs) comes up, so that wouldn't
+/// require a boot-protocol change either.
 #[used]
 #[link_section = ".requests"]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
@@ -365,10 +369,10 @@ extern "C" fn _start() -> ! {
     earlyprintln!("[boot] async executor started (UART RX echo task spawned)");
 
     // IPC smoke test: capability table rights-checking, plus the
-    // rendezvous endpoint exercised in both wait orderings — the
-    // scenario the real init -> console_server handoff (a later
-    // milestone task) relies on, and its mirror image, both covered here
-    // with two kernel tasks standing in for the eventual process.
+    // rendezvous endpoint exercised in both wait orderings — the same
+    // scenario the real init -> console_server handoff (below, in the
+    // real boot sequence) relies on, and its mirror image, both covered
+    // here with two kernel tasks standing in for the eventual process.
     {
         use alloc::sync::Arc;
         use ipc::{CapTable, CapabilitySlot, Endpoint, KernelObjectRef, Rights};
@@ -1217,12 +1221,13 @@ extern "C" fn _start() -> ! {
     // scheduler::start() never returns: once a real process exists, the
     // machine is its (and the scheduler's) from here on, driven by the
     // timer's forced preemption — the kernel's own idle loop above never
-    // runs again after this point. That's a real, if simplified,
-    // limitation of this milestone (kernel tasks and processes aren't
-    // yet time-sliced against each other) rather than a bug; a later
-    // milestone task integrates them. init calling `sys_exit` with
-    // nothing else scheduled falls back to `scheduler::on_syscall_exit`'s
-    // halt, which is this milestone's clean terminal state.
+    // runs again after this point. Kernel tasks (the UART echo task, the
+    // console server) still keep making progress from here on too, not
+    // via that idle loop but because `task::scheduler::on_timer_tick`
+    // itself drains the executor's ready queue on every tick — see that
+    // function's own doc comment. init calling `sys_exit` with nothing
+    // else scheduled falls back to `scheduler::on_syscall_exit`'s halt,
+    // which is this milestone's clean terminal state.
     earlyprintln!("[boot] spawning init...");
     task::scheduler::start();
 }
