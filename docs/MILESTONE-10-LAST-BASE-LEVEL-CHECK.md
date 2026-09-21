@@ -480,6 +480,30 @@ No other orphaned or stale items found in the task list.
 actual commit this milestone ends on — the base this milestone
 certifies is exactly the base the filesystem milestone starts from.
 
+#### Findings
+
+All green, in one sitting, immediately before this commit:
+
+- `rm -rf build target`, then `cargo run -p xtask -- build`: clean,
+  zero warnings (only the unrelated, pre-existing toolchain
+  future-incompatibility notice for `core` itself, not something this
+  project's own code can fix).
+- `cargo run -p xtask -- test-all` from that fresh build: 22/22 PASSED,
+  zero failures.
+- Both boot paths confirmed within that same run: every scenario but
+  one boots BIOS (the default path); `test-uefi-boot` passed,
+  confirming the full boot sequence also completes end to end via
+  UEFI/OVMF.
+- `cargo test -p tarnos-kcore -p tarnos-abi`: 45/45 passed (12 +
+  33 across the two crates' unit and property-test suites).
+- `cargo clippy -- -D warnings` clean across the entire workspace from
+  this same fresh build: `tarnos-kcore`/`tarnos-abi` (host), the
+  kernel (`x86_64-unknown-none`), and `tarnos-rt` plus every userland
+  crate (`x86_64-tarnos-user.json`) — the exact commands CI now runs.
+- Closing ADR written: `docs/adr/0030-milestone-10-last-base-level-check.md`.
+
+Milestone 10 is done.
+
 ## Definition of Done
 
 Milestone 10 is complete when every phase's own exit condition is met.
