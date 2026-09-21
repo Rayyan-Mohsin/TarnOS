@@ -53,9 +53,12 @@ fn main() -> ! {
     syscall::sys_exit(0);
 }
 
-/// Builds `"child replied: <text>"` in a fixed, no-alloc buffer — this
-/// process has no heap (see `tarnos-rt`'s doc comments), so a `format!`
-/// isn't available.
+/// Builds `"child replied: <text>"` in a fixed, no-alloc buffer. `init`
+/// doesn't pull in `extern crate alloc` at all (unlike `heap-child`,
+/// which exists specifically to exercise `tarnos-rt`'s heap) — a
+/// `format!` call needs `alloc::string::String`, so it isn't available
+/// here without that import, even though `tarnos-rt` itself always
+/// wires up a working global allocator for any binary that links it.
 fn format_child_reply<'a>(text: &str, buf: &'a mut [u8; 32]) -> &'a str {
     const PREFIX: &[u8] = b"child replied: ";
     let mut len = PREFIX.len();
