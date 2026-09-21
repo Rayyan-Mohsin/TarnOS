@@ -149,6 +149,70 @@ general virtio/PCI knowledge:
 confirming each of the above against a real, booted QEMU instance —
 not copied from a spec — before Phase 2 starts.
 
+#### Findings
+
+Confirmed against this environment's actual QEMU (8.2.2), not assumed:
+
+- **The exact device to use: `virtio-blk-pci-non-transitional`**, not
+  plain `virtio-blk-pci`. QEMU's `-device help` lists three PCI
+  variants; the plain one defaults to "transitional" (presents a
+  legacy I/O-port-BAR interface *and* the modern capability-based one,
+  switched via a feature bit, so a driver would need to handle both
+  shapes or explicitly negotiate modern-only). The
+  `-non-transitional` variant presents *only* the modern interface —
+  confirmed via `info pci` on a running instance (see below): no
+  I/O-port BAR at all, only two MMIO BARs. This is the right choice for
+  a driver that only ever wants to speak one, simpler protocol shape.
+- **Enumeration identity, read back live via QEMU's monitor
+  (`info pci`) with the device attached**: vendor `0x1AF4`, device
+  `0x1042` — exactly the "modern-only" block-device ID the virtio 1.x
+  spec defines (`0x1040 + device-type 2`), not the legacy transitional
+  range (`0x1000`-`0x103F`). Two BARs: BAR1 (32-bit MMIO, 4 KiB) and
+  BAR4 (64-bit prefetchable MMIO, 16 KiB) — confirming this driver only
+  ever needs to map ordinary MMIO, the exact same "explicit fixed
+  virtual address, never HHDM" pattern already established for the
+  LAPIC (`docs/adr/0009`), not a fixed layout assumption: **which PCI
+  capability (common/notify/ISR/device config) lives in which BAR at
+  which offset is not fixed by the spec and must be read from the
+  device's own PCI capability list at Phase 2/3 runtime**, not
+  hardcoded from this one observation.
+- **IRQ 11, pin A (legacy INTx) is available**, confirming this
+  milestone's own Non-goal (no interrupt-driven I/O) is a free choice,
+  not a forced one — the device works with legacy interrupts if a
+  future milestone wants them; this one simply never unmasks or
+  registers a handler for it, matching the synchronous-polling scope.
+- **`xtask` needs exactly two new flags**, confirmed by booting the
+  existing kernel image with them attached and observing a normal,
+  unperturbed boot (identical log output to every other scenario,
+  through init spawning `echo-child` and a clean halt):
+  `-drive file=<path>,if=none,format=raw,id=blk0` plus `-device
+  virtio-blk-pci-non-transitional,drive=blk0`. A plain, small (a few
+  MiB) raw disk image is sufficient — `format=raw` needs no special
+  tooling to create (`dd if=/dev/zero of=... bs=1M count=N`) or to seed
+  with known test data at known offsets, which Phase 5 needs.
+- **Recommend also adding `-nic none`** to scenarios that attach the
+  disk (and, separately, worth considering for every other scenario
+  too, since this kernel has no network stack at all): confirmed it
+  removes an Ethernet controller from the PCI bus with no effect on
+  anything else, simplifying what the new enumeration code sees during
+  its own testing. Not required, just lower-noise.
+- **Legacy PCI configuration access (ports `0xCF8`/`0xCFC`) needs no
+  further environment confirmation beyond what's already established**:
+  this is a mandatory, unconditional part of the PC-compatible platform
+  standard (unlike the LAPIC/HHDM assumption `docs/adr/0009` had to
+  correct, which was a Limine-specific promise, not a hardware
+  guarantee) — supported by every PCI/PCIe chipset ever built,
+  Q35/ICH9 included, with no ACPI dependency. The actually meaningful
+  verification is Phase 2's own guest-side code reading it back
+  successfully on a real boot, which is that phase's own exit
+  condition, not something further host-side probing can usefully add.
+- **Deferred to Phase 2/3, not resolved here**: the exact virtio
+  capability→BAR→offset mapping and the minimum feature bits to
+  negotiate. Guessing these from the spec alone risks exactly the kind
+  of unverified assumption this project's own standing discipline
+  warns against; the guest driver will read the real capability list
+  directly once it can, per Phase 2/3's own exit conditions.
+
 ### Phase 2 — PCI enumeration
 
 Raw config-space reads (port I/O to 0xCF8/0xCFC, per Phase 1's
