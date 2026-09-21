@@ -162,3 +162,6 @@ so a stale reference can't alias a reused slot.
   pre-existing gap since Milestone 1, unrelated to and unchanged by
   this milestone, but worth naming again now that processes are created
   and destroyed more than once per boot.
+  **Update (milestone 4):** closed. See
+  `docs/adr/0007-process-lifecycle-and-termination.md` — `AddressSpace`
+  now frees every frame it owns via its own `Drop` impl.

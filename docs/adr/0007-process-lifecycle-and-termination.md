@@ -224,3 +224,7 @@ Fixed by hardcoding the correctly-packed value instead; the new
   reaches it. A future multi-core milestone must re-examine this: on
   multiple cores, a second core could observe the now-`Empty`/`Zombie`
   slot before the first core's frame-freeing walk actually finishes.
+  **Update (milestone 9):** this predicted hazard was real. See
+  `docs/adr/0018-address-space-use-after-free-root-cause-and-partial-fix.md`
+  for the root cause once multi-core scheduling actually made it
+  reachable, and the fix.

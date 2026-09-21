@@ -132,6 +132,12 @@ one vCPU thread is present.
   than relying on its default all-stop handling of a multi-vCPU
   target) — repeating the same approach will reproduce the same
   silent, uncapturable crash rather than new evidence.
+  **Update:** resolved. See
+  `docs/adr/0028-live-debugging-partially-unblocked-lapic-eoi-address-recurs-as-a-corrupted-code-pointer.md` —
+  `-accel tcg,thread=single` (single-threaded TCG, apparently dropped
+  from this exact session's own setup somewhere between ADR 0015 and
+  here) restores reliable watchpoint attach/continue against this same
+  multi-vCPU target.
 - The search is still narrowed to `syscall.rs`'s entry stub and the
   `switch_to`/`on_timer_tick` dispatch logic (per ADR 0021), both
   already audited clean twice over. With CMC now also closed, the

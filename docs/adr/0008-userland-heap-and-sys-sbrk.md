@@ -96,6 +96,24 @@ this same audit** (does anything reachable from the nested lock ever
 call back into `task::scheduler`?), not assume it's now generally safe
 because `sys_sbrk` already does it.
 
+**Update (milestone 9):** this exact nesting was reverted. Once SMP
+made it possible for heap growth to run concurrently with other cores
+under constant forced preemption, holding `SCHEDULER` across the whole
+frame-allocation-and-mapping loop was safe but not *live* — every other
+core's own `on_timer_tick`/`on_syscall_yield`/`wake_blocked_process`
+(all needing that same lock) stalled behind it for however long the
+loop took, a real, reproduced bug severe enough to look like a hang.
+See `docs/adr/0011-hardening-lapic-timer-and-forced-preemption.md`'s
+"`sys_sbrk`: two short critical sections instead of one long one" —
+`sys_sbrk` now validates and reserves under one short
+`with_current_process` acquisition, releases it, does the actual
+frame-allocation loop with no scheduler lock held at all (using a raw
+`pml4_frame` carried across the gap instead), then re-acquires briefly
+to commit `heap_end`. The lock-ordering precedent this section
+describes (safe to nest a second lock, audited case by case) still
+holds for whichever future syscall needs it; `sys_sbrk` itself just no
+longer relies on it.
+
 ### `libs/tarnos-rt/src/heap.rs`: a lazily-growing userland allocator
 
 Mirrors `kernel/src/memory/heap.rs`'s use of
@@ -159,6 +177,11 @@ Milestone 4. It needs no capabilities at all, since it never does IPC.
   every call path the nested lock can reach; any future syscall wanting
   to do the same must repeat that audit rather than treat this as
   precedent that it's now unconditionally safe.
+  **Update (milestone 9):** `sys_sbrk` itself no longer does this — see
+  the "Update" note on the Decision section above; the lock-ordering
+  precedent survives for other syscalls, but `sys_sbrk`'s own nesting
+  was replaced with two short, separate acquisitions for liveness
+  reasons, not safety ones.
 - `ExitStatus`/process-lifecycle machinery from `docs/adr/0007` is
   unchanged by this milestone — `heap-child` is a completely ordinary
   process from the scheduler's point of view.

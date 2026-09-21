@@ -290,9 +290,18 @@ New `xtask` scenarios, each following the established feature-gated-
   own careful lock-ordering audit; left for a follow-up milestone (or
   immediate hardening pass) with its own dedicated cross-core blocking-
   IPC adversarial test, rather than guessed at here.
+  **Update (milestone 8):** closed. See
+  `docs/adr/0011-hardening-lapic-timer-and-forced-preemption.md`'s
+  "`SYS_SEND`/`SYS_RECV`'s cross-core race: deferred-wake" —
+  `Process` gained `pending_wake`, and `test-smp-send-cross-core`
+  directly exercises the race this tripwire named.
 - **Still no per-core timer.** A process on another core can only be
   interrupted by its own choice (yield, block, exit), a fairness limit
   rather than a safety one. Forced cross-core preemption stays deferred.
+  **Update (milestone 8):** closed. See
+  `docs/adr/0011-hardening-lapic-timer-and-forced-preemption.md` — every
+  core now gets its own calibrated periodic LAPIC timer, tested by
+  `test-smp-forced-preempt` against a process making zero syscalls.
 - **Still no TLB shootdown / per-core ready queues / work-stealing** —
   none needed yet, per the milestone's own scope decisions; the
   idle-CR3 fix's "every CR3 write flushes everything" assumption is a
