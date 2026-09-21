@@ -194,6 +194,71 @@ a follow-up commit) mapping each syscall to the scenario(s) that
 exercise it, with any real gap either filled or explicitly deferred
 with a reason.
 
+#### Findings
+
+Every one of the 22 non-kitchen-sink scenarios in `xtask/src/main.rs`
+is wired into both `test-all` and `.github/workflows/ci.yml`'s own
+step list, confirmed by direct comparison — no orphaned scenario
+exists in either direction. `test-kitchen-sink` is correctly excluded
+from both, still runs cleanly as its own manual entry point (confirmed
+via a direct `cargo run -p xtask -- test-kitchen-sink` this pass —
+`KS_IPC__OK`/`KS_HEAP_OK`/`KS_LIFE_OK`/`KS_KILL_OK`, clean halt), and
+both the BIOS (every scenario's own default) and UEFI
+(`test-uefi-boot`) boot paths are exercised.
+
+Syscall coverage checklist — success path / boundary-or-error path per
+syscall, checked against the actual scenario code rather than assumed:
+
+| Syscall | Success path | Boundary/error path |
+|---|---|---|
+| `SYS_YIELD` | Nearly every scenario (every dummy process's own loop) | N/A — `SYS_YIELD` has no `SyscallError` variant; it cannot fail |
+| `SYS_SEND` | `test-blocking-ipc`, `test-double-send`, `test-spawn-ipc`, `test-smp-send-cross-core`, `test-kitchen-sink` | **Gap** — no scenario drives `BadCapability` or `ResourceExhausted` (`QueueFull`) through an actual `sys_send` call |
+| `SYS_RECV` | `test-blocking-ipc`, `test-spawn-ipc`, `test-smp-send-cross-core` | **Gap** — same two `SyscallError` variants as `SYS_SEND`, same gap |
+| `SYS_EXIT` | Every scenario (every process's own clean exit) | N/A — `SYS_EXIT` has no `SyscallError` variant; it cannot fail |
+| `SYS_SPAWN` | `test-spawn-ipc`, `test-spawn-boundary`, `test-process-lifecycle`, `test-wait-exit-code`, most others | **Gap** — no scenario spawns an unknown program name to drive `NoSuchProgram` |
+| `SYS_GRANT` | `test-spawn-ipc`, `test-spawn-boundary` (check 4a) | Covered — `test-spawn-boundary` checks 1/3 drive `InvalidTarget` (non-child target) and `PermissionDenied` (rights amplification) |
+| `SYS_PROCESS_START` | `test-spawn-ipc`, `test-spawn-boundary` (check 4b), most others | **Gap** — `test-spawn-boundary` only exercises the success path for this syscall; nothing drives its own `InvalidTarget` rejection (a non-child, or a child no longer `Suspended`) |
+| `SYS_WAIT` | `test-wait-exit-code`, `test-smp-wait-cross-core`, `test-kitchen-sink` | **Gap** — nothing calls `SYS_WAIT` on a non-child to drive its `InvalidTarget` rejection |
+| `SYS_KILL` | `test-process-lifecycle`, `test-kill-boundary`, `test-smp-kill-cross-core`, `test-smp-forced-preempt`, `test-kitchen-sink` | Covered — `test-kill-boundary` check 1 drives `InvalidTarget` (non-child target) |
+| `SYS_SBRK` | `test-heap-growth`, `test-sbrk-boundary` (checks 2/4) | Covered — `test-sbrk-boundary` checks 1/3 drive `InvalidArgument` (absurd increment, negative increment) |
+
+Five real gaps, all deliberately **deferred rather than filled this
+pass**, for the same reason in each case: closing them means hand-
+editing more of the delicate, register-exact raw-`asm!` dummy-process
+bodies this project's own test infrastructure is built from (see
+`milestone3_tests.rs`/`milestone4_tests.rs`'s own doc comments on how
+easy a subtle mistake there is to introduce and how hard to debug), and
+every one of the five is lower-risk than it looks, not a silent hole:
+
+- `SYS_SEND`/`SYS_RECV`'s `BadCapability`/`QueueFull` paths run through
+  exactly the same `ipc::Endpoint`/`CapTable` logic already covered
+  end-to-end by `tarnos-kcore`'s own proptest suite (`libs/tarnos-kcore/
+  src/endpoint.rs`'s `matches_vecdeque_model`-style tests directly
+  exercise `SendOutcome::QueueFull`/`RecvOutcome::QueueFull`; `captable.rs`'s
+  own proptests cover lookup-miss/wrong-rights). The syscall layer
+  (`arch::x86_64::syscall::resolve_endpoint`/`sys_send`/`sys_recv`) is a
+  thin, direct pass-through with no extra logic of its own to miss.
+- `SYS_SPAWN`'s `NoSuchProgram` is a single `Option::ok_or` one line
+  into `sys_spawn` (`crate::task::process::lookup_spawnable_module(name)
+  .ok_or(SyscallError::NoSuchProgram)`) — about as low-risk a line as
+  exists in this file.
+- `SYS_PROCESS_START`/`SYS_WAIT`'s own `InvalidTarget` checks
+  (`start_child`/`wait_for_child` in `task/scheduler.rs`) are the exact
+  same ownership-check *shape* `SYS_GRANT`/`SYS_KILL` already prove
+  works via `test-spawn-boundary`/`test-kill-boundary` — same
+  `process.parent != Some(caller)` pattern, same bystander-`Pid` test
+  trick already established by both those scenarios.
+
+Recommendation for whoever picks this up (explicitly not required
+before filesystem/driver work starts): extend `test-spawn-boundary`'s
+`boundary_test_process` with one more check (`SYS_PROCESS_START` against
+the same bystander `Pid` check 1 already sets up) and `test-wait-exit-code`'s
+`wait_test_process` similarly, mirroring `test-kill-boundary`'s existing
+bystander trick exactly — both are additive, few-line changes to
+already-well-understood test bodies, not new scenarios. The
+`BadCapability`/`QueueFull`/`NoSuchProgram` gaps are lowest priority of
+the five, given the unit-level coverage already in place.
+
 ### Phase 5 — Documentation consistency pass
 
 - Read all 29 ADRs once, end to end, checking each one's own claims
