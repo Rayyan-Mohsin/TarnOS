@@ -1,0 +1,241 @@
+# Milestone 11: PCI Enumeration and a Read-Only virtio-blk Driver
+
+## Why this milestone exists
+
+Milestone 10 certified the process/scheduler/IPC/memory core as a
+stable base and used its own Phase 7 to check what a filesystem and
+real drivers would actually need. Three concrete findings from that
+check shape this milestone directly:
+
+- `driver::Driver`/`CharDevice` are genuinely UART-shaped (byte at a
+  time, no addressing, no async completion) — nothing there is reusable
+  for a block device. A `BlockDevice`-shaped trait needs designing from
+  scratch.
+- `KernelObjectRef` has exactly one variant (`Endpoint`) and `Rights`
+  exactly two bits (`SEND`/`RECV`) — a device capability needs both
+  extended, exactly the extension point `docs/adr/0001` designed
+  `KernelObjectRef` to have but never used.
+- Whether drivers stay kernel-resident or move out-of-process, and
+  whether a filesystem server needs to grant capabilities to arbitrary
+  already-running clients, were left as open decisions for whichever
+  milestone actually builds this. This milestone makes both decisions
+  explicitly rather than deferring them again — see Decisions below.
+
+A fourth thing, not mentioned in Milestone 10's own findings because it
+falls outside "does the existing interface generalize": **this kernel
+has no PCI bus support at all today** (confirmed directly this round —
+`grep -rli pci kernel/src/` matches nothing real; the RSDP is captured
+at boot per `docs/adr/0001` but never parsed beyond a log line). A
+virtual disk on QEMU's default `q35` machine model is a PCI device.
+Getting the kernel talking to it needs PCI configuration-space access
+and enumeration built first — a real prerequisite this milestone must
+size and build, not assume away.
+
+Filesystem and driver work were named together as "what comes after
+Milestone 10," but combining them into one milestone repeats a mistake
+this project already corrected once: Milestone 6 split SMP bring-up
+(boot every core, minimal per-core infrastructure) from Milestone 7
+(actually scheduling processes across those cores) specifically
+because of how much full SMP touched at once. Storage is the same
+shape — a working, tested block driver is a large, self-contained piece
+on its own; a filesystem format, path resolution, and
+filesystem-backed process loading are a second large piece that should
+be built *on top of* a driver already proven correct, not alongside it
+while the driver itself is still unproven. This milestone is the first
+half only: **get the kernel reading raw sectors off a virtual disk,
+proven end to end through a real syscall and a real userland process,
+under the same adversarial-testing bar every prior milestone has held
+itself to.** No filesystem, no on-disk format, no writes.
+
+## Decisions
+
+Two open questions from Milestone 10's Phase 7 are resolved here,
+explicitly, rather than carried forward again:
+
+**Drivers stay kernel-resident.** Moving a driver out to its own
+isolated process needs a currently-unbuilt primitive — some way for a
+process to safely receive MMIO access and hardware interrupt delivery
+via IPC — and building that primitive well is itself a milestone-sized
+effort with no second driver yet to justify the design cost. The UART
+driver already established the precedent of starting kernel-resident
+(`driver/mod.rs`'s own doc comment: "the seed of a future out-of-process
+driver manager, not a one-off") and this milestone follows the same
+path for exactly the same reason. Revisit once there are enough
+drivers, or a strong enough isolation requirement, to justify the
+MMIO/IRQ-via-IPC design work on its own.
+
+**A future filesystem stays kernel-resident too, when it's built** (not
+decided in detail this milestone, since no filesystem code is written
+here — recorded now so the next milestone doesn't have to re-litigate
+it). The alternative — a filesystem-as-a-userspace-server model — needs
+a process to grant a capability to an *already-running, unrelated*
+client, which the current `SYS_GRANT` (parent-to-`Suspended`-child
+only) cannot express. Building that mechanism is a real, separate
+piece of design work with no proven need yet; starting with an
+in-kernel filesystem (reusing exactly the same capability-propagation
+pattern this milestone's own block-device capability uses) defers that
+question until it's actually blocking something.
+
+## Scope
+
+- PCI configuration-space access and enumeration (new
+  `kernel/src/arch/x86_64/pci.rs` or similar) — enough to find one
+  specific device by vendor/device ID and read its resources. Not a
+  general-purpose PCI subsystem; scoped to what finding a virtio-blk
+  device needs.
+- A new `driver::block` module: a `BlockDevice` trait shaped for
+  addressed, whole-sector I/O (not `CharDevice`'s byte-at-a-time
+  shape), designed from scratch per Phase 7's own finding.
+- A virtio-blk driver implementing that trait: feature negotiation, one
+  virtqueue, synchronous (polled, not interrupt-driven) single-request
+  reads. No writes.
+- `KernelObjectRef` gains a device-capability variant; `Rights` gains
+  whatever bit(s) a block-read capability needs; `tarnos_abi::SyscallError`
+  gains I/O-error variant(s) — the exact extensions Phase 7 named as
+  missing.
+- One new syscall (name TBD during Phase 3 — e.g. `SYS_BLOCK_READ`)
+  reading N sectors at a given LBA into a process-supplied buffer,
+  gated by a capability boot code seeds the same way `CONSOLE_CAP` is
+  seeded today.
+- A new userland test fixture exercising it, plus `xtask`/CI changes:
+  attaching a disk image to the QEMU invocation, seeding it with known
+  test data at known sectors, and new adversarial `test-*` scenarios.
+
+## Non-goals
+
+- **No filesystem, no on-disk format of any kind.** Reading is by raw
+  LBA sector number. Milestone 12's own job, once this driver is
+  proven.
+- **No writes to the block device.** Read-only — smaller surface,
+  smaller blast radius if something's wrong, and nothing built so far
+  needs write support yet.
+- **No out-of-process driver.** See Decisions above.
+- **No interrupt-driven I/O.** The driver polls for virtqueue
+  completion synchronously, the same "simplest correct thing first"
+  choice the original UART driver made before this project ever built
+  anything async. Revisit once something actually needs non-blocking
+  storage I/O.
+- **No general PCI driver framework.** Enough enumeration to find one
+  device by ID, not a registry other future drivers are assumed to use
+  — that generalization can happen once a second PCI device actually
+  needs it.
+
+## Phases
+
+### Phase 1 — Research and confirm the actual environment
+
+Before writing driver code, confirm directly (this project's own
+standing discipline — "confirmed directly, not assumed," per
+`docs/adr/0009`'s own LAPIC-via-HHDM lesson) rather than assume from
+general virtio/PCI knowledge:
+
+- Whether QEMU's `-M q35` (already `xtask`'s own machine model) exposes
+  PCI configuration space via the legacy 0xCF8/0xCFC port-I/O mechanism
+  without needing any ACPI table lookup first — this is the expected
+  case (legacy mechanism access doesn't need ACPI/MCFG), but confirm it
+  boots and enumerates before committing to it over the MCFG/ECAM
+  alternative.
+- Exactly what `xtask`'s QEMU invocation needs to add — a `-drive
+  file=...,if=none` plus `-device virtio-blk-pci` (or equivalent) — to
+  attach a disk image at all, and how large/what format that image
+  needs to be for the simplest working setup.
+- The virtio-blk device's exact PCI capability layout (common config,
+  notify, ISR, device-specific config regions) for the "modern"
+  (virtio 1.0+) interface QEMU presents by default, and the minimum
+  feature bits this driver actually needs to negotiate for a working
+  single-queue synchronous read.
+
+**Exit condition:** a short written note (this doc or the eventual ADR)
+confirming each of the above against a real, booted QEMU instance —
+not copied from a spec — before Phase 2 starts.
+
+### Phase 2 — PCI enumeration
+
+Raw config-space reads (port I/O to 0xCF8/0xCFC, per Phase 1's
+confirmation), enumerating bus/device/function far enough to find the
+virtio-blk device by its vendor ID (`0x1AF4`) and appropriate device
+ID, and read back its BARs. Logged, empirically, the same "prove it
+found what it claims to have found" discipline `arch::x86_64::smp`
+already established for AP bring-up — not assumed correct because it
+compiled.
+
+**Exit condition:** a boot log line naming the discovered device's
+bus/device/function and BAR addresses, on a real QEMU boot with the
+disk device attached.
+
+### Phase 3 — virtio-blk driver
+
+Map the discovered device's capability list, negotiate the minimum
+feature set Phase 1 identified, set up one virtqueue, and implement a
+synchronous (poll-until-complete) single-sector (or small, fixed
+multi-sector) read into a kernel-owned buffer. `BlockDevice`'s trait
+shape (methods, error type) designed here, informed by what this one
+real driver actually needs — not speculatively generalized for a
+second, hypothetical block device that doesn't exist yet.
+
+**Exit condition:** a kernel-internal (no syscall yet) smoke test reads
+a sector with known content (seeded into the test disk image by
+`xtask`) and the content matches, on a real boot.
+
+### Phase 4 — Capability and syscall surface
+
+`KernelObjectRef` gains its device-capability variant; `Rights` gains
+its new bit(s); `SyscallError` gains I/O-error variant(s). The new
+syscall (block-read) is gated by a capability seeded into a boot
+process's table exactly the way `CONSOLE_CAP` is today, and validates
+its inputs (LBA range, buffer bounds) with the same rigor `sys_sbrk`'s
+own boundary checks already establish as this codebase's bar.
+
+**Exit condition:** the same content-matches smoke test as Phase 3, now
+reached through a real syscall from a real (dummy or ELF) process
+instead of a kernel-internal call.
+
+### Phase 5 — Userland fixture and adversarial testing
+
+A new userland test fixture (matching the one-purpose-per-fixture
+convention — `echo-child` does IPC, `heap-child` does heap growth; this
+one reads a known sector and reports pass/fail), plus `xtask` changes:
+build and attach a disk image with known test data at known sectors,
+and new `test-*` scenarios covering the happy path and at least: a
+read past the end of the device, a read without holding the
+capability, and a misaligned or otherwise invalid request — the same
+"prove the boundary is enforced, not just unexercised" bar every prior
+milestone's own boundary tests already hold to.
+
+**Exit condition:** new scenarios pass, wired into `test-all` and CI;
+full existing regression suite still green.
+
+### Phase 6 — Documentation and sign-off
+
+Write the ADR recording this milestone's decisions and findings
+(matching every prior milestone's closing pattern), update
+`docs/KNOWN-ISSUES.md` if anything new surfaces, and confirm this
+milestone's own scope didn't disturb the still-open cross-core
+corruption bug's own containment (`test-kitchen-sink` still excluded,
+still runnable standalone).
+
+**Exit condition:** ADR written; full regression green from a clean
+build; both boot paths (BIOS/UEFI) still verified now that a disk
+device is attached to the QEMU invocation for every scenario, not just
+the new ones.
+
+## Definition of Done
+
+A process can issue a syscall naming a capability-gated block device,
+request N sectors by LBA, and receive their real, correct contents
+back — proven by an adversarial test suite covering the happy path and
+real boundary violations, with the driver itself found via genuine PCI
+enumeration rather than a hardcoded address, all on top of the
+unmodified Milestone 10 base.
+
+## What happens after
+
+Milestone 12 builds a minimal, read-only filesystem on top of this
+driver (a concrete on-disk format still to be chosen — most likely
+FAT, for the same reason most hobby kernels reach for it: it's
+simple, extremely well documented, and every existing OS can already
+write one for building the test disk image), adds file open/read
+syscalls, and wires `SYS_SPAWN` to load a program from the filesystem
+instead of only from Limine's boot modules. That milestone's own plan
+should be written once this one's driver is real and tested, not
+before.
