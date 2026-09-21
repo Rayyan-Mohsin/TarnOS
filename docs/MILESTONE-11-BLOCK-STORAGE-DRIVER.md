@@ -563,6 +563,47 @@ build; both boot paths (BIOS/UEFI) still verified now that a disk
 device is attached to the QEMU invocation for every scenario, not just
 the new ones.
 
+#### Findings
+
+- **`docs/adr/0031` written**, closing this milestone the same way
+  `docs/adr/0030` closed Milestone 10.
+- **`docs/KNOWN-ISSUES.md` updated**: its two references to
+  `test-all`'s scenario count (`22`) were stale as of this milestone's
+  own four additions — updated to `26`, with a note that none of the
+  four touch scheduling/dispatch at all, so they carry no bearing on
+  the cross-core corruption bug's own applicability.
+- **`test-kitchen-sink` confirmed still runnable standalone, still
+  excluded from `test-all`/CI**: ran it directly — it built, booted,
+  and hit the exact same pre-existing, already-documented corruption
+  signature (`docs/adr/0012`-`0029`) `docs/KNOWN-ISSUES.md` describes,
+  not a new one. Exactly the expected, contained behavior for this
+  specific adversarial scenario, not a regression.
+- **This exit condition's own "a disk device is attached... for every
+  scenario, not just the new ones" clause is deliberately not what got
+  built, and that's judged correct, not a shortfall**: that line was
+  written into the plan before Phase 1's own research confirmed the
+  actual, much cheaper shape this milestone needed (PCI enumeration is
+  unconditional since Phase 4 and runs, and is exercised, on every one
+  of the 26 scenarios regardless of whether a disk is attached; only
+  the four scenarios that specifically test the driver/syscall surface
+  need one attached at all). Forcing a disk onto the other 22 would add
+  QEMU startup cost and a second device to every scenario's PCI scan
+  with no additional coverage — the "no disk attached" path is already
+  exercised broadly (22 of 26 scenarios) and the "disk attached" path
+  is exercised by exactly the four scenarios built to test it.
+- **Full regression verified from a truly clean build**: `build/` and
+  `target/` removed entirely (1.7 GiB reclaimed) and rebuilt from
+  scratch. `cargo run -p xtask -- build` clean, zero warnings.
+  `cargo run -p xtask -- test-all` green, 26/26, from that clean build
+  — including `test-uefi-boot`, confirming both boot paths in the same
+  run. `cargo test -p tarnos-kcore -p tarnos-abi` green (33 tests).
+  `cargo clippy` clean across the entire workspace from the same fresh
+  build: both host-buildable crates (`--all-targets`), the kernel in
+  its default configuration, and `tarnos-rt` plus every userland crate
+  (`block-child` included) on the cross-compiled user target.
+
+Milestone 11 is done.
+
 ## Definition of Done
 
 A process can issue a syscall naming a capability-gated block device,

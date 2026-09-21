@@ -45,7 +45,9 @@ with direct evidence, and what each round's own captures showed.
   `context_switch::resume`).
   **This is not something that fires with the same certainty on
   ordinary, light multi-core use** (a couple of cooperating processes,
-  the normal boot sequence, any of the 22 scenarios in `test-all`) —
+  the normal boot sequence, any of the 26 scenarios in `test-all`
+  — 22 as of Milestone 10, joined by Milestone 11's four virtio-blk
+  scenarios, none of which touch scheduling/dispatch at all) —
   every one of those passes reliably and is run in CI on every push.
   The failure rate scales with how much concurrent scheduling pressure
   is actually applied.
@@ -107,8 +109,9 @@ further individual data structure.
 
 - Building the filesystem, a real driver, or anything else on top of
   the process/scheduler/IPC core does not need to wait for this to be
-  fixed — every normal code path (`test-all`'s 22 scenarios, the whole
-  of Milestone 10's own audit) is unaffected. This bug requires
+  fixed — every normal code path (`test-all`'s 26 scenarios, the whole
+  of Milestone 10's own audit, and Milestone 11's virtio-blk driver and
+  its own four scenarios) is unaffected. This bug requires
   `test-kitchen-sink`'s own specific, deliberately adversarial stress
   shape to reproduce at any practical rate.
 - If a future scenario or real workload starts hitting this under
