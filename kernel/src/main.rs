@@ -336,6 +336,36 @@ extern "C" fn _start() -> ! {
         earlyprintln!("[smp-test] {}", if result { "IPI_OK" } else { "IPI_FAIL" });
     }
 
+    // Milestone 11, Phase 2: enumerates PCI configuration space looking
+    // for the virtio-blk device xtask attaches when this feature is
+    // enabled, logging its bus/device/function and (once found) its BAR
+    // addresses -- the empirical "enumeration actually found the real
+    // device, not a hardcoded assumption" proof this phase's own exit
+    // condition calls for. Never enabled for a normal build.
+    #[cfg(feature = "block-driver-test")]
+    {
+        const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
+        const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
+        match arch::x86_64::pci::find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_ID) {
+            Some(device) => {
+                earlyprintln!(
+                    "[pci-test] found virtio-blk at {:?} (vendor={:#06x} device={:#06x})",
+                    device.address,
+                    device.vendor_id,
+                    device.device_id
+                );
+                device.enable_mmio_and_bus_master();
+                let bar1 = device.mmio_bar_address(1);
+                let bar4 = device.mmio_bar_address(4);
+                earlyprintln!("[pci-test] BAR1={:#x} BAR4={:#x}", bar1, bar4);
+                earlyprintln!("[pci-test] PCI_ENUM_OK");
+            }
+            None => {
+                earlyprintln!("[pci-test] PCI_ENUM_FAIL -- virtio-blk device not found");
+            }
+        }
+    }
+
     // Deliberately faults instead of continuing boot — see
     // `cargo run -p xtask -- test-fault`, which builds with this feature
     // specifically to confirm the page-fault/double-fault handling

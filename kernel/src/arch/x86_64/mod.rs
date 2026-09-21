@@ -3,6 +3,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod lapic;
+pub mod pci;
 pub mod percpu;
 pub mod smp;
 pub mod syscall;

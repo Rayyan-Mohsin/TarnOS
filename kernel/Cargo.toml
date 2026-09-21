@@ -138,6 +138,12 @@ forced-preempt-test = []
 # Milestone 9, in progress -- not yet reliable enough to be wired into
 # `test-all`/CI (see docs/adr/0011's Consequences).
 kitchen-sink-test = []
+# Milestone 11, Phase 2: enumerates PCI configuration space for a
+# virtio-blk device xtask attaches when this feature is enabled, logging
+# its bus/device/function and BAR addresses -- proves PCI enumeration
+# actually finds the real device rather than assuming a fixed layout.
+# See docs/MILESTONE-11-BLOCK-STORAGE-DRIVER.md.
+block-driver-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

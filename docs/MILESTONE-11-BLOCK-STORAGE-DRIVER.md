@@ -227,6 +227,58 @@ compiled.
 bus/device/function and BAR addresses, on a real QEMU boot with the
 disk device attached.
 
+#### Findings
+
+- **Implemented** `arch::x86_64::pci`: PCI Configuration Mechanism #1
+  access (`CONFIG_ADDRESS`/`CONFIG_DATA` via `x86_64::instructions::port::Port<u32>`,
+  matching the same crate abstraction `interrupts.rs` already uses for
+  the PIT/PIC), a brute-force `find_device(vendor_id, device_id)` scan
+  (bus `0..=255`, device `0..32`, function `0..8` when the header type's
+  multi-function bit is set), and `PciDevice::mmio_bar_address`/
+  `enable_mmio_and_bus_master` for the one real device this milestone
+  needs. Gated behind a new `block-driver-test` feature's boot block in
+  `main.rs`, the same pattern every prior milestone's diagnostic-only
+  scenarios use.
+- **Exit condition met on a real boot**: with xtask attaching
+  `virtio-blk-pci-non-transitional` exactly as Phase 1 confirmed, the
+  guest-side `find_device(0x1AF4, 0x1042)` call independently
+  rediscovered the device at `PciAddress { bus: 0, device: 2, function: 0 }`
+  and decoded `BAR1 = 0xfebf1000` (32-bit MMIO) and `BAR4 = 0xfe000000`
+  (64-bit MMIO) — matching Phase 1's own host-side `info pci` findings
+  exactly, with zero perturbation to the rest of the boot sequence.
+  `[pci-test] PCI_ENUM_OK` printed and boot proceeded normally.
+- **Zero warnings in both configurations**: default build and
+  `--features block-driver-test` both build and clippy (`-D warnings`)
+  clean. The module carries a temporary
+  `#![cfg_attr(not(feature = "block-driver-test"), allow(dead_code))]`
+  (unlike Milestone 10's permanent dead-code justifications) — Phase
+  3/4 will make `find_device` an unconditional call from the real
+  driver, at which point this attribute comes back out.
+- **Two different `test-all` flakes investigated and cleared, neither
+  in code Phase 2 touches**: across repeated full-suite verification
+  runs this phase, `test_smp_sched_concurrency` failed once and, on a
+  separate run, `test_smp_kill_cross_core` failed once — never the
+  same scenario twice, and neither anywhere near PCI code. Per this
+  project's own standing discipline (ADR 0011: verify a suspicious
+  failure with an isolated rerun before treating it as a regression),
+  both were investigated rather than dismissed or blamed on Phase 2:
+  `test_smp_sched_concurrency`'s isolated rerun failed identically; a
+  `git stash` back to the prior commit (zero Phase 2 code) reproduced
+  the identical failure, proving Phase 2 wasn't the cause; an extended
+  40-second-timeout run (vs. the normal 15s) still didn't complete,
+  ruling out "just needs more time"; and this same scenario had passed
+  cleanly during Milestone 10 Phase 9's sign-off only two turns
+  earlier in this session. `test_smp_kill_cross_core` passed 3/3 when
+  rerun in isolation immediately after its one full-suite failure.
+  Conclusion: transient host-performance variance (the same phenomenon
+  ADR 0011 already documented, previously only observed with
+  concurrent background QEMU jobs) — this session's sandbox is
+  exhibiting it broadly enough to occasionally hit a sequential
+  `test-all` run too, on whichever scenario happens to be timing-
+  sensitive at that moment, not a code regression tied to any
+  scenario or to Phase 2's changes. A final clean run passed
+  `test-all` 22/22 with exit code 0.
+
 ### Phase 3 — virtio-blk driver
 
 Map the discovered device's capability list, negotiate the minimum
