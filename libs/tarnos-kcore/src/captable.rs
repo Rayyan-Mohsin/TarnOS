@@ -184,7 +184,7 @@ mod proptests {
     use tarnos_abi::CapIndex;
 
     fn rights_strategy() -> impl Strategy<Value = Rights> {
-        (0u8..4).prop_map(Rights::from_bits_truncate)
+        (0u8..8).prop_map(Rights::from_bits_truncate)
     }
 
     #[derive(Clone, Debug)]

@@ -47,6 +47,7 @@ fn main() {
         "test-smp-send-cross-core" => test_smp_send_cross_core(),
         "test-smp-forced-preempt" => test_smp_forced_preempt(),
         "test-block-driver" => test_block_driver(),
+        "test-block-syscall" => test_block_syscall(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -72,7 +73,8 @@ fn main() {
             .and_then(|_| test_smp_sched_stress())
             .and_then(|_| test_smp_send_cross_core())
             .and_then(|_| test_smp_forced_preempt())
-            .and_then(|_| test_block_driver()),
+            .and_then(|_| test_block_driver())
+            .and_then(|_| test_block_syscall()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -153,6 +155,9 @@ fn print_usage() {
          \x20 test-block-driver     Attach a disk seeded with known content, boot with the\n\
          \x20                    virtio-blk driver, and confirm a real polled sector read\n\
          \x20                    matches exactly what was seeded (Milestone 11)\n\
+         \x20 test-block-syscall    Same seeded disk, but read through a real ring-3\n\
+         \x20                    process's own SYS_BLOCK_READ call instead of calling the\n\
+         \x20                    driver directly from kernel context (Milestone 11)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -161,7 +166,8 @@ fn print_usage() {
          \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
          \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
          \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
-         \x20                    test-smp-forced-preempt, and test-block-driver in sequence"
+         \x20                    test-smp-forced-preempt, test-block-driver, and\n\
+         \x20                    test-block-syscall in sequence"
     );
 }
 
@@ -1717,6 +1723,65 @@ fn test_block_driver() -> Result<(), String> {
         "xtask: test-block-driver PASSED — the virtio-blk driver negotiated features, set up a \
          virtqueue, and read back a sector whose content exactly matched what this scenario \
          seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 4: builds the kernel with the `block-syscall-test`
+/// feature (a dummy ring-3 process with `BLOCK_CAP`/`CONSOLE_CAP` seeded
+/// directly into its own table) against the same seeded disk image
+/// [`test_block_driver`] uses, and confirms the process's own real
+/// `SYS_BLOCK_READ` call read back content matching exactly what was
+/// seeded — proving the syscall/capability surface works end to end
+/// from genuine ring-3 code, not just `driver::virtio_blk` called
+/// directly from kernel context (Phase 3's own check).
+fn test_block_syscall() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-syscall-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-syscall-test"],
+        "block-syscall-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLK_SYSCALL_FAIL") {
+        return Err(
+            "the dummy process's own SYS_BLOCK_READ reported BLK_SYSCALL_FAIL -- either the \
+             syscall itself failed or the content it read back didn't match what this scenario \
+             seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLK_SYSCALL_OK") {
+        return Err(
+            "expected \"BLK_SYSCALL_OK\" -- the dummy process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-syscall PASSED — a real ring-3 process's own SYS_BLOCK_READ call, \
+         gated by a directly-seeded BLOCK_CAP capability, read back content matching exactly \
+         what this scenario seeded into the disk image"
     );
     Ok(())
 }

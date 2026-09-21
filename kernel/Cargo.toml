@@ -138,12 +138,22 @@ forced-preempt-test = []
 # Milestone 9, in progress -- not yet reliable enough to be wired into
 # `test-all`/CI (see docs/adr/0011's Consequences).
 kitchen-sink-test = []
-# Milestone 11, Phase 2: enumerates PCI configuration space for a
-# virtio-blk device xtask attaches when this feature is enabled, logging
-# its bus/device/function and BAR addresses -- proves PCI enumeration
-# actually finds the real device rather than assuming a fixed layout.
-# See docs/MILESTONE-11-BLOCK-STORAGE-DRIVER.md.
+# Milestone 11, Phase 3: runs a kernel-internal (no syscall) smoke test
+# against the virtio-blk device xtask attaches when this feature is
+# enabled -- reads back a sector xtask seeded with known content and
+# confirms it matches exactly, proving the driver itself (feature
+# negotiation, virtqueue setup, a real polled read) works end to end.
+# PCI enumeration itself (Phase 2) is unconditional since Phase 4 and no
+# longer needs its own feature. See docs/MILESTONE-11-BLOCK-STORAGE-DRIVER.md.
 block-driver-test = []
+# Milestone 11, Phase 4: spawns a dummy ring-3 process with BLOCK_CAP and
+# CONSOLE_CAP seeded directly into its own capability table (bypassing
+# init/SYS_GRANT), which issues a real SYS_BLOCK_READ via raw inline asm
+# and reports whether the content it read back matches -- proves the
+# same read Phase 3 already confirmed kernel-side is also reachable
+# through the real syscall/capability surface. Exercised by
+# `cargo run -p xtask -- test-block-syscall`.
+block-syscall-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

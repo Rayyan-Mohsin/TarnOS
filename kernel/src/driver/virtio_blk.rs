@@ -16,14 +16,11 @@
 //! end, the same "simplest correct thing first" choice the original
 //! UART driver made before this project ever built anything async.
 //!
-//! `#[allow(dead_code)]` below is temporary, matching
-//! `arch::x86_64::pci`'s own: Phase 4 makes this driver's `init` an
-//! unconditional part of boot (a real, capability-gated syscall needs it
-//! seeded whether or not a disk happens to be attached), at which point
-//! this whole module is permanently live and the attribute comes back
-//! out. Right now its only caller is `main.rs`'s
-//! `block-driver-test`-gated boot block.
-#![cfg_attr(not(feature = "block-driver-test"), allow(dead_code))]
+//! [`init`] is an unconditional part of boot (Milestone 11 Phase 4) —
+//! called once regardless of which, if any, test feature is active, the
+//! same way `driver::uart::init()` always runs. `Err` just means no
+//! matching PCI device this boot (every scenario except the ones that
+//! attach a disk); it is never itself a bug.
 use core::sync::atomic::{fence, Ordering};
 
 use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame, Size4KiB};
@@ -519,10 +516,34 @@ static VIRTIO_BLK: SpinLock<Option<VirtioBlk>> = SpinLock::new(None);
 /// exists — a normal build/run with no disk attached — never a panic;
 /// see [`VirtioBlk::new`]'s own doc comment for what *does* panic and
 /// why.
+///
+/// Logs its own outcome the same "prove it found what it claims to have
+/// found" way `arch::x86_64::smp` logs AP bring-up — moved here from
+/// `main.rs`'s own Phase 2/3 test-only boot block once this call became
+/// unconditional (Phase 4), so every boot gets exactly one PCI scan
+/// (`find_device`'s own cost), not this plus a second, separate
+/// diagnostic-only one. Marker text (`PCI_ENUM_OK`/`PCI_ENUM_FAIL`)
+/// unchanged from those earlier phases, so `xtask test-block-driver`'s
+/// existing assertions still match.
 pub fn init() -> Result<(), &'static str> {
-    let device = pci::find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_ID)
-        .ok_or("no virtio-blk PCI device found")?;
+    let device = match pci::find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_ID) {
+        Some(device) => device,
+        None => {
+            crate::earlyprintln!("[pci-test] PCI_ENUM_FAIL -- virtio-blk device not found");
+            return Err("no virtio-blk PCI device found");
+        }
+    };
+    crate::earlyprintln!(
+        "[pci-test] found virtio-blk at {:?} (vendor={:#06x} device={:#06x})",
+        device.address,
+        device.vendor_id,
+        device.device_id
+    );
     device.enable_mmio_and_bus_master();
+    let bar1 = device.mmio_bar_address(1);
+    let bar4 = device.mmio_bar_address(4);
+    crate::earlyprintln!("[pci-test] BAR1={:#x} BAR4={:#x}", bar1, bar4);
+    crate::earlyprintln!("[pci-test] PCI_ENUM_OK");
     *VIRTIO_BLK.lock() = Some(VirtioBlk::new(device));
     Ok(())
 }

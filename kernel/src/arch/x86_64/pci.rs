@@ -14,14 +14,9 @@
 //! assumed to register against can be built once a second PCI device
 //! actually needs one.
 //!
-//! `#[allow(dead_code)]` below is temporary, not a Phase 2/3-boundary
-//! permanent justification the way Milestone 10's own
-//! `percpu::spin_count`/`memory::virt::translate` ones are: this
-//! milestone's own Phase 3/4 will make the virtio-blk driver call
-//! `find_device` unconditionally, at which point this module is
-//! permanently live and this attribute should come back out. Right now
-//! its only caller is `main.rs`'s `block-driver-test`-gated boot block.
-#![cfg_attr(not(feature = "block-driver-test"), allow(dead_code))]
+//! `find_device` is called unconditionally by `driver::virtio_blk::init`
+//! since Milestone 11 Phase 4, so this module is permanently live in
+//! every build — no dead-code allowance needed.
 use x86_64::instructions::port::Port;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;

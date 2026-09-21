@@ -8,6 +8,7 @@
 //! instead of trusted ad hoc at every call site that needs a mapping.
 use spin::{Mutex, Once};
 use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::mapper::TranslateResult;
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper as X86Mapper, OffsetPageTable, Page, PageTable,
     PageTableFlags, PhysFrame, Size4KiB, Translate,
@@ -124,6 +125,54 @@ pub unsafe fn map_in(
 #[allow(dead_code)]
 pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     with_mapper(|mapper| mapper.translate_addr(addr))
+}
+
+/// Translates `addr` within an arbitrary address space (named by
+/// `pml4_frame`, not necessarily the currently-active one), returning
+/// its physical address and the flags on its own leaf page-table entry —
+/// `None` if `addr` has no mapping at all. Reaches that address space's
+/// own page tables the same way [`map_in`] does (a temporary
+/// `OffsetPageTable` bound to `pml4_frame`, never the global kernel-only
+/// [`with_mapper`]/[`translate`] above, which only ever reflects the
+/// boot-time page tables the shared kernel half was built from — a
+/// process's own *user* half isn't in there at all).
+///
+/// The one real caller, `arch::x86_64::syscall::sys_block_read`, needs
+/// exactly this: validating a user-supplied buffer lies in real,
+/// present, writable, user-accessible memory in the *calling* process's
+/// own address space before ever writing to it — this kernel's first
+/// syscall that touches a user pointer at all (`docs/adr/0003` notes "no
+/// user-pointer validation anywhere in this kernel yet," true until this
+/// one). Checking only the returned leaf flags (not also walking every
+/// intermediate table's own flags, which can independently narrow the
+/// effective permission on real x86 paging) is sound here specifically
+/// because every user page this kernel ever creates goes through
+/// `map`/`map_in`/`AddressSpace::map`, which is the same call path
+/// already relied on, end to end, for every already-working ring-3
+/// process's own ELF segments, stack, and `sys_sbrk` heap — if
+/// intermediate flags ever failed to actually permit what a leaf entry
+/// claims, none of those would work today.
+///
+/// # Safety
+/// `pml4_frame` must be a live `AddressSpace`'s own PML4 frame, and that
+/// `AddressSpace` must not be dropped while this call is in progress —
+/// identical to [`map_in`]'s own contract.
+pub unsafe fn translate_in(
+    pml4_frame: PhysFrame<Size4KiB>,
+    addr: VirtAddr,
+) -> Option<(PhysAddr, PageTableFlags)> {
+    let hhdm_offset = *HHDM_OFFSET
+        .get()
+        .expect("memory::virt::init() must run before translate_in()");
+    // SAFETY: forwarded from this function's own safety contract --
+    // `pml4_frame` names a live, exclusively-owned PML4 table.
+    let table: &'static mut PageTable =
+        unsafe { &mut *phys_to_virt(pml4_frame.start_address()).as_mut_ptr() };
+    let mapper = unsafe { OffsetPageTable::new(table, hhdm_offset) };
+    match mapper.translate(addr) {
+        TranslateResult::Mapped { frame, offset, flags } => Some((frame.start_address() + offset, flags)),
+        TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
+    }
 }
 
 fn map_error_from(e: x86_64::structures::paging::mapper::MapToError<Size4KiB>) -> MapError {

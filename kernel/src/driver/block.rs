@@ -6,14 +6,10 @@
 //! (`super::virtio_blk`), not speculatively generalized for a second,
 //! hypothetical device that doesn't exist yet.
 //!
-//! `#[allow(dead_code)]` below is temporary, matching
-//! `arch::x86_64::pci`/`driver::virtio_blk`'s own: this trait's only
-//! caller today is `main.rs`'s `block-driver-test`-gated smoke test, so
-//! a default build never actually calls `read_sectors`/
-//! `capacity_sectors`. Phase 4 makes the driver (and this trait's real
-//! use) an unconditional part of boot, at which point this comes back
-//! out.
-#![cfg_attr(not(feature = "block-driver-test"), allow(dead_code))]
+//! `read_sectors` is called unconditionally since Milestone 11 Phase 4
+//! (`arch::x86_64::syscall::sys_block_read`) — no dead-code allowance
+//! needed for the trait itself. `capacity_sectors` still carries its own
+//! (see that method's doc comment for why).
 use super::Driver;
 
 /// Every sector this milestone's one real device (and, in practice,

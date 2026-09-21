@@ -1806,7 +1806,16 @@ fn wake_orphaned_receivers(dying: &[ProcessBox]) {
                 if !slot.rights.contains(Rights::SEND) {
                     continue;
                 }
-                let KernelObjectRef::Endpoint(endpoint) = &slot.object;
+                let KernelObjectRef::Endpoint(endpoint) = &slot.object else {
+                    // `Rights::SEND` on a non-`Endpoint` slot never
+                    // happens in practice (nothing ever grants `SEND`
+                    // alongside a `BlockDevice` capability), but this
+                    // walk is over every process's every slot -- match
+                    // structurally rather than assuming, the same
+                    // discipline this sweep already applies to
+                    // `Slot::Occupied` below.
+                    continue;
+                };
                 let still_has_a_live_sender = sched.processes.iter().any(|table_slot| {
                     let Slot::Occupied(other) = table_slot else {
                         return false;

@@ -148,3 +148,6 @@ jobs:
 
       - name: xtask test-block-driver (virtio-blk reads back exactly what was seeded)
         run: cargo run -p xtask -- test-block-driver
+
+      - name: xtask test-block-syscall (SYS_BLOCK_READ works end to end from ring 3)
+        run: cargo run -p xtask -- test-block-syscall

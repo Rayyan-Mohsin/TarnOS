@@ -376,6 +376,100 @@ own boundary checks already establish as this codebase's bar.
 reached through a real syscall from a real (dummy or ELF) process
 instead of a kernel-internal call.
 
+#### Findings
+
+- **`KernelObjectRef` gains `BlockDevice`** — a pure marker variant (no
+  embedded state: there is exactly one virtio-blk device, reached
+  through `driver::virtio_blk::with_device`'s own singleton). `Rights`
+  gains `READ` (bit `0b100`). `SyscallError` gains `IoOutOfRange` and
+  `IoError`. `tarnos_abi::BLOCK_CAP` (`CapIndex(2)`) is the fixed,
+  well-known index this milestone reserves, analogous to
+  `CONSOLE_CAP`/`CHILD_LINK_CAP` — wiring it into the real `init`
+  process (for Phase 5's userland fixture to receive via `SYS_GRANT`)
+  is deliberately left to that phase, not done here: Phase 4's own exit
+  condition explicitly allows a dummy process, and retrofitting all
+  ~15 existing feature-gated boot paths that each spawn `init`
+  separately for a capability nothing yet uses would have been risk
+  with no test value this phase.
+- **`SYS_BLOCK_READ` implemented** as `arch::x86_64::syscall::sys_block_read`:
+  resolves the capability and validates the caller-supplied buffer in
+  one short critical section (never holding `SCHEDULER` across the
+  driver's own polling loop, mirroring `sys_sbrk`'s own documented
+  reasoning), then performs the device read and copies into the
+  caller's buffer entirely outside that lock. This is the kernel's
+  first syscall that writes through a caller-supplied pointer rather
+  than only register-passed words or a kernel-chosen address
+  (`docs/adr/0003` notes "no user-pointer validation anywhere in this
+  kernel yet" — true until this one) — every page the destination
+  range touches is validated present/writable/user-accessible in the
+  *caller's own* address space (a new `memory::virt::translate_in`,
+  walking an arbitrary `pml4_frame`'s own page tables rather than the
+  global kernel-only mapper every other memory helper uses) before the
+  device is ever touched, and the actual copy goes through each page's
+  own physical/HHDM alias rather than a raw write through the caller's
+  virtual pointer — deliberately not leaning on "`SYSCALL` never
+  switches `CR3`" (true on this kernel today, not a fact this function
+  needs to depend on).
+- **PCI enumeration + driver bring-up made unconditional**: `driver::virtio_blk::init()`
+  now runs on every boot (previously only under the `block-driver-test`
+  feature), the same way `driver::uart::init()` always has — `Err` just
+  means no disk is attached, never a failure. The `PCI_ENUM_OK`/`FAIL`
+  diagnostic lines moved from `main.rs`'s own test-only boot block into
+  `virtio_blk::init()` itself (same marker text, so `test-block-driver`'s
+  existing assertions needed no change) — this also removed a redundant
+  second `find_device` scan Phase 2/3's own separate diagnostic block
+  had been doing. `arch::x86_64::pci` and `driver::block`/`driver::virtio_blk`'s
+  temporary `#[allow(dead_code)]` attributes all came out, exactly as
+  each one's own Phase 2/3 doc comment said they would once this
+  happened. Empirically confirmed this unconditional scan (up to 8192
+  device-slot checks, worst case) doesn't meaningfully affect boot
+  timing: the full `test-all` suite's existing timeouts (as tight as
+  5s) all still pass reliably with every scenario now paying this cost.
+- **New `block-syscall-test` feature + `xtask test-block-syscall`
+  scenario** (wired into `test-all`/CI): a dummy ring-3 process with
+  `BLOCK_CAP`/`CONSOLE_CAP` seeded directly into its own (otherwise
+  empty) capability table — bypassing `init`/`SYS_GRANT` entirely, the
+  same "throwaway dummy process, capabilities seeded directly" pattern
+  every other kernel-feature-only test here already uses — issues a
+  real `SYS_BLOCK_READ` via raw inline asm and reports whether the
+  content matches. Passed on the first real boot attempt after fixing
+  the finding below; confirmed reliable across three repeated runs.
+- **A real, adversarial-testing-relevant bug found and fixed while
+  writing that dummy process**: the first version declared its 512-byte
+  read buffer as `let mut buf = [0u8; 512]` and used a byte-string
+  literal inside a runtime `if`/`else` to pick the report message. Both
+  faulted the process (`page fault ... USER_MODE`) on the very first
+  boot attempt — in this codebase's own default *unoptimized* debug
+  build (what every `xtask` scenario actually builds), a stack-array
+  zero-initialization this size lowers to a real `memset` call, and a
+  byte-string literal evaluated only inside a runtime branch isn't
+  guaranteed constant-folded into an immediate the way a top-level
+  `const` is. Both are calls/data-references that jump outside the
+  two pages `Process::new_dummy` copies this function's own compiled
+  code into — into whatever kernel code or data happens to sit next to
+  it in memory, exactly the "no Rust-level function calls" constraint
+  `milestone8_tests.rs`'s own doc comment already warns about, just not
+  previously triggered by any *existing* dummy process (none of them
+  needed a stack-local buffer this size before). Fixed by using
+  `MaybeUninit<[u8; 512]>` (no zero-init codegen at all — nothing here
+  needs the buffer's initial content, since `SYS_BLOCK_READ` overwrites
+  it before it's ever read) and by making both possible report messages
+  top-level `const`s selected by a runtime `if` between two
+  already-fully-evaluated immediates, rather than evaluating either
+  literal itself at runtime. Worth recording here since it's a genuine,
+  previously-latent gap in how safely this project's own
+  dummy-process-testing technique composes with a *real* local buffer,
+  not just a fix local to this one test.
+- **Zero warnings in all three configurations**: default,
+  `--features block-driver-test`, and `--features block-syscall-test`
+  all build and clippy (`-D warnings`) clean, as does `tarnos-abi`/
+  `tarnos-kcore` (`--all-targets`, all 33 host tests plus proptests
+  still passing after `Rights`/`SyscallError` grew new
+  variants — `captable`'s own `rights_strategy` proptest generator
+  widened from 2 bits to 3 accordingly) and the cross-compiled
+  `tarnos-rt`/userland targets. Full `test-all` (24/24, including both
+  new scenarios) passed cleanly with exit code 0.
+
 ### Phase 5 — Userland fixture and adversarial testing
 
 A new userland test fixture (matching the one-purpose-per-fixture

@@ -53,6 +53,18 @@ pub const SYS_KILL: u64 = 8;
 /// and returns the *previous* break address. `increment == 0` is a
 /// side-effect-free query of the current break.
 pub const SYS_SBRK: u64 = 9;
+/// `sys_block_read(cap, lba, buf_ptr, sector_count)` — reads
+/// `sector_count` whole 512-byte sectors starting at `lba` from the
+/// block device named by `cap` into the caller's own buffer at
+/// `buf_ptr..buf_ptr + sector_count * 512`. `cap` must hold
+/// [`Rights::READ`]. This kernel's first syscall that writes through a
+/// caller-supplied pointer rather than only register-passed words or a
+/// kernel-chosen address (see [`Rights::READ`]'s own doc comment) —
+/// every byte of the destination range is validated as present,
+/// writable, user-accessible memory in the caller's own address space
+/// before anything is read from the device; an invalid range fails with
+/// [`SyscallError::InvalidArgument`] without touching the device at all.
+pub const SYS_BLOCK_READ: u64 = 10;
 
 /// An index into the *calling process's own* capability table.
 ///
@@ -77,6 +89,18 @@ pub const CONSOLE_CAP: CapIndex = CapIndex(0);
 /// *empty* capability table; it receives whatever its parent grants it
 /// at whatever index the parent chooses, which need not be this one.
 pub const CHILD_LINK_CAP: CapIndex = CapIndex(1);
+
+/// The fixed, well-known capability index for [`Rights::READ`] on the
+/// one virtio-blk device this milestone builds — analogous to
+/// [`CONSOLE_CAP`]/[`CHILD_LINK_CAP`] (a process is meant to find it at
+/// this index, never discover it dynamically), though which process(es)
+/// boot code actually seeds it into is still settling: Phase 4's own
+/// dummy-process syscall test seeds it directly into its own throwaway
+/// process's table; wiring it into the real `init` process (for Phase
+/// 5's userland fixture to receive via `SYS_GRANT`, the same path
+/// [`CHILD_LINK_CAP`] enables for `echo-child`) is that phase's own
+/// work, not done yet.
+pub const BLOCK_CAP: CapIndex = CapIndex(2);
 
 /// Maximum number of inline `u64` payload words carried by a `Message`.
 ///
@@ -183,8 +207,17 @@ bitflags::bitflags! {
     /// re-exports this rather than defining its own copy.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Rights: u8 {
-        const SEND = 0b01;
-        const RECV = 0b10;
+        const SEND = 0b001;
+        const RECV = 0b010;
+        /// Permits `sys_block_read` against a `KernelObjectRef::BlockDevice`
+        /// capability slot — the first right guarding something other than
+        /// IPC. Named `READ`, not e.g. `BLOCK_READ`: this crate's own
+        /// `Rights` type is generic authority a capability slot carries,
+        /// not tied to one kernel object kind (`SEND`/`RECV` aren't named
+        /// `ENDPOINT_SEND`/`ENDPOINT_RECV` either), and "read" is the
+        /// obviously-right word for what it permits regardless of which
+        /// future object kind might also want to reuse it.
+        const READ = 0b100;
     }
 }
 
@@ -259,6 +292,12 @@ pub enum SyscallError {
     /// forever: nothing else was ever going to send or receive on this
     /// endpoint again. See `docs/adr/0013`.
     PeerClosed = 9,
+    /// `sys_block_read`'s `lba..lba + sector_count` range extends at or
+    /// past the device's own reported capacity.
+    IoOutOfRange = 10,
+    /// `sys_block_read`'s underlying device reported failure completing
+    /// an otherwise well-formed, in-range request.
+    IoError = 11,
 }
 
 impl SyscallError {
@@ -290,6 +329,8 @@ impl SyscallError {
             7 => SyscallError::SpawnFailed,
             8 => SyscallError::InvalidArgument,
             9 => SyscallError::PeerClosed,
+            10 => SyscallError::IoOutOfRange,
+            11 => SyscallError::IoError,
             _ => SyscallError::NoSuchSyscall,
         }
     }
@@ -416,6 +457,8 @@ mod proptests {
             SyscallError::SpawnFailed,
             SyscallError::InvalidArgument,
             SyscallError::PeerClosed,
+            SyscallError::IoOutOfRange,
+            SyscallError::IoError,
         ];
         for err in variants {
             assert_eq!(SyscallError::from_retval(err.as_retval()), err);

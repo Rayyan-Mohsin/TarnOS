@@ -22,6 +22,7 @@ mod milestone4_tests;
 mod milestone5_tests;
 mod milestone7_tests;
 mod milestone8_tests;
+mod milestone11_tests;
 mod kitchen_sink_tests;
 mod sync;
 mod task;
@@ -336,73 +337,96 @@ extern "C" fn _start() -> ! {
         earlyprintln!("[smp-test] {}", if result { "IPI_OK" } else { "IPI_FAIL" });
     }
 
-    // Milestone 11, Phase 2: enumerates PCI configuration space looking
-    // for the virtio-blk device xtask attaches when this feature is
-    // enabled, logging its bus/device/function and (once found) its BAR
-    // addresses -- the empirical "enumeration actually found the real
-    // device, not a hardcoded assumption" proof this phase's own exit
-    // condition calls for. Never enabled for a normal build.
+    // Milestone 11, Phase 4: PCI enumeration + virtio-blk driver bring-up
+    // is unconditional starting here -- a real capability-gated syscall
+    // (`SYS_BLOCK_READ`) needs the driver ready, or confirmed absent, on
+    // every boot, disk attached or not, the same way `driver::uart::init`
+    // below always runs regardless of which test feature (if any) is
+    // active. `Err` just means no disk is attached this boot (every
+    // scenario except the ones that explicitly attach one) -- never
+    // itself a failure. See `driver::virtio_blk::init`'s own doc comment
+    // for the PCI_ENUM_OK/FAIL log lines this produces (moved here from
+    // this milestone's earlier Phase 2/3 test-only boot block, which
+    // called `find_device` a second, redundant time just to print them).
+    let _ = driver::virtio_blk::init();
+
+    // Milestone 11, Phase 3: kernel-internal smoke test (no syscall yet
+    // -- that's Phase 4, see `block-syscall-test` below) proving the
+    // virtio-blk driver itself works end to end: read back a sector
+    // `xtask` seeded with known content and confirm it matches exactly.
+    // Sector 2, matching the fixed convention
+    // `xtask::create_test_disk_image` uses. Never enabled for a normal
+    // build.
     #[cfg(feature = "block-driver-test")]
     {
-        const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
-        const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
-        match arch::x86_64::pci::find_device(VIRTIO_VENDOR_ID, VIRTIO_BLK_DEVICE_ID) {
-            Some(device) => {
-                earlyprintln!(
-                    "[pci-test] found virtio-blk at {:?} (vendor={:#06x} device={:#06x})",
-                    device.address,
-                    device.vendor_id,
-                    device.device_id
-                );
-                device.enable_mmio_and_bus_master();
-                let bar1 = device.mmio_bar_address(1);
-                let bar4 = device.mmio_bar_address(4);
-                earlyprintln!("[pci-test] BAR1={:#x} BAR4={:#x}", bar1, bar4);
-                earlyprintln!("[pci-test] PCI_ENUM_OK");
-            }
-            None => {
-                earlyprintln!("[pci-test] PCI_ENUM_FAIL -- virtio-blk device not found");
-            }
-        }
-
-        // Milestone 11, Phase 3: kernel-internal smoke test (no syscall
-        // yet -- that's Phase 4) proving the virtio-blk driver itself
-        // works end to end: negotiate features, set up one virtqueue,
-        // read back a sector `xtask` seeded with known content, and
-        // confirm it matches exactly. Sector 2, matching the fixed
-        // convention `xtask::create_test_disk_image` uses.
         const KNOWN_TEST_LBA: u64 = 2;
         use driver::block::BlockDevice;
-        match driver::virtio_blk::init() {
-            Ok(()) => {
-                let result = driver::virtio_blk::with_device(|device| {
-                    let mut buf = [0u8; 512];
-                    device.read_sectors(KNOWN_TEST_LBA, &mut buf).map(|()| buf)
-                });
-                match result {
-                    Some(Ok(buf)) => {
-                        let matches = buf.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8);
-                        earlyprintln!(
-                            "[blk-test] {}",
-                            if matches {
-                                "BLOCK_READ_OK"
-                            } else {
-                                "BLOCK_READ_FAIL -- content mismatch"
-                            }
-                        );
+        let result = driver::virtio_blk::with_device(|device| {
+            let mut buf = [0u8; 512];
+            device.read_sectors(KNOWN_TEST_LBA, &mut buf).map(|()| buf)
+        });
+        match result {
+            Some(Ok(buf)) => {
+                let matches = buf.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8);
+                earlyprintln!(
+                    "[blk-test] {}",
+                    if matches {
+                        "BLOCK_READ_OK"
+                    } else {
+                        "BLOCK_READ_FAIL -- content mismatch"
                     }
-                    Some(Err(e)) => {
-                        earlyprintln!("[blk-test] BLOCK_READ_FAIL -- read_sectors error {:?}", e);
-                    }
-                    None => {
-                        earlyprintln!("[blk-test] BLOCK_READ_FAIL -- with_device found no driver");
-                    }
-                }
+                );
             }
-            Err(e) => {
-                earlyprintln!("[blk-test] BLOCK_READ_FAIL -- virtio_blk::init failed: {e}");
+            Some(Err(e)) => {
+                earlyprintln!("[blk-test] BLOCK_READ_FAIL -- read_sectors error {:?}", e);
+            }
+            None => {
+                earlyprintln!("[blk-test] BLOCK_READ_FAIL -- with_device found no driver");
             }
         }
+    }
+
+    // Milestone 11, Phase 4: spawns one dummy ring-3 process, seeds its
+    // own (otherwise empty) capability table directly with `BLOCK_CAP`
+    // (`Rights::READ` on a `KernelObjectRef::BlockDevice`) and
+    // `CONSOLE_CAP` -- bypassing `init`/`SYS_GRANT` entirely, the same
+    // "throwaway dummy process, capabilities seeded directly" pattern
+    // every other kernel-feature-only test here uses (e.g.
+    // `forced-preempt-test`'s own `ordinary_process`) -- then lets it
+    // issue a real `SYS_BLOCK_READ` via raw inline asm and report
+    // whether the content it read back matches. Proves the same content
+    // this milestone's Phase 3 check already confirmed kernel-side is
+    // *also* reachable through the real syscall/capability surface, from
+    // genuine ring-3 code. Never enabled for a normal build.
+    #[cfg(feature = "block-syscall-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        let pid = task::scheduler::allocate_pid();
+        let mut process = task::process::Process::new_dummy(
+            pid,
+            milestone11_tests::block_read_syscall_process,
+            None,
+        )
+        .expect("failed to create the block-syscall-test process");
+        process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        process.cap_table.insert(
+            tarnos_abi::BLOCK_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::BlockDevice,
+                rights: ipc::Rights::READ,
+            },
+        );
+        task::scheduler::spawn(process).expect("spawn failed");
     }
 
     // Deliberately faults instead of continuing boot — see

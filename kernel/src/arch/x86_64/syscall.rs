@@ -24,8 +24,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tarnos_abi::{
-    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_EXIT, SYS_GRANT, SYS_KILL,
-    SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_BLOCK_READ, SYS_EXIT, SYS_GRANT,
+    SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
 };
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -35,9 +35,12 @@ use x86_64::VirtAddr;
 use super::context_switch::TrapFrame;
 use super::percpu;
 use super::gdt;
+use crate::driver::block::{BlockDevice, BlockError, SECTOR_SIZE};
+use crate::driver::virtio_blk::{self, MAX_SECTORS_PER_REQUEST};
 use crate::ipc::endpoint::{RecvResult, SendResult};
 use crate::ipc::{CapabilitySlot, Endpoint, KernelObjectRef, Rights};
 use crate::memory::phys::GlobalFrameAllocator;
+use crate::memory::virt;
 use crate::task::process::{ProcessState, USER_HEAP_START};
 use crate::task::scheduler;
 use crate::task::Pid;
@@ -246,6 +249,7 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_WAIT => sys_wait(frame),
         SYS_KILL => sys_kill(frame),
         SYS_SBRK => sys_sbrk(frame),
+        SYS_BLOCK_READ => sys_block_read(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -272,7 +276,9 @@ fn resolve_endpoint(
 ) -> Result<(alloc::sync::Arc<Endpoint>, Pid), SyscallError> {
     scheduler::with_current_process(|process| {
         let slot = process.cap_table.lookup(cap_index, required)?;
-        let KernelObjectRef::Endpoint(endpoint) = &slot.object;
+        let KernelObjectRef::Endpoint(endpoint) = &slot.object else {
+            return Err(SyscallError::BadCapability);
+        };
         Ok((endpoint.clone(), process.pid))
     })
     .unwrap_or(Err(SyscallError::BadCapability))
@@ -583,6 +589,124 @@ fn sys_sbrk(frame: *mut TrapFrame) -> *mut TrapFrame {
 
     regs.rax = match outcome {
         Ok(old_end) => old_end,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_BLOCK_READ`: reads `sector_count` (`r10`) whole sectors starting
+/// at `lba` (`rsi`) from the block device named by `cap_index` (`rdi`)
+/// into the caller's own buffer at `buf_ptr` (`rdx`). Never blocks (the
+/// driver polls synchronously to completion internally) — always
+/// returns `frame` directly.
+///
+/// This kernel's first syscall that writes through a caller-supplied
+/// pointer — see `memory::virt::translate_in`'s own doc comment for why
+/// that needs a dedicated page-table walk in the *caller's* own address
+/// space, not the global kernel-only mapper every other memory helper
+/// here uses. Every page the destination range touches is validated
+/// (present, writable, user-accessible) *before* the device is ever
+/// touched — an invalid range costs nothing but the walk itself.
+///
+/// Resolves the capability and validates the buffer in one short
+/// critical section (mirroring `resolve_endpoint`/`sys_sbrk`'s own
+/// reasoning: never hold `SCHEDULER` across the driver's own polling
+/// loop, however brief in practice), then performs the actual device
+/// I/O and the copy into the caller's buffer entirely outside that lock.
+fn sys_block_read(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let cap_index = CapIndex(regs.rdi as u32);
+    let lba = regs.rsi;
+    let buf_ptr = regs.rdx;
+    let sector_count = regs.r10;
+
+    let outcome: Result<(), SyscallError> = (|| {
+        if sector_count == 0 || sector_count as usize > MAX_SECTORS_PER_REQUEST {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let len = sector_count * SECTOR_SIZE as u64;
+        let end = buf_ptr.checked_add(len).ok_or(SyscallError::InvalidArgument)?;
+
+        let pml4_frame = scheduler::with_current_process(|process| {
+            let slot = process.cap_table.lookup(cap_index, Rights::READ)?;
+            match &slot.object {
+                KernelObjectRef::BlockDevice => Ok(process.address_space.pml4_frame()),
+                KernelObjectRef::Endpoint(_) => Err(SyscallError::BadCapability),
+            }
+        })
+        .unwrap_or(Err(SyscallError::BadCapability))?;
+
+        let required =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let mut page_addr = buf_ptr & !0xFFF;
+        while page_addr < end {
+            // SAFETY: `pml4_frame` names this same, still-live calling
+            // process's own PML4 -- this syscall handler is the only
+            // thing acting on it meanwhile (same reasoning `sys_sbrk`'s
+            // own doc comment gives for its own gap between
+            // `with_current_process` calls).
+            let (_, flags) = unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
+                .ok_or(SyscallError::InvalidArgument)?;
+            if !flags.contains(required) {
+                return Err(SyscallError::InvalidArgument);
+            }
+            page_addr = page_addr.saturating_add(4096);
+        }
+
+        let mut kernel_buf = [0u8; MAX_SECTORS_PER_REQUEST * SECTOR_SIZE];
+        match virtio_blk::with_device(|device| device.read_sectors(lba, &mut kernel_buf[..len as usize]))
+        {
+            Some(Ok(())) => {}
+            Some(Err(BlockError::OutOfRange)) => return Err(SyscallError::IoOutOfRange),
+            Some(Err(_)) => return Err(SyscallError::IoError),
+            None => return Err(SyscallError::IoError),
+        }
+
+        // Copy into the caller's buffer one physical page at a time,
+        // through each page's own HHDM alias -- never a raw write
+        // through `buf_ptr` itself. That virtual address is only
+        // meaningful under the *caller's* own page tables; going
+        // through the physical alias instead means this doesn't
+        // silently depend on "SYSCALL never switches CR3" (true on this
+        // kernel today, but not a fact this function needs to lean on).
+        let mut page_addr = buf_ptr & !0xFFF;
+        while page_addr < end {
+            // SAFETY: re-translated, not reused from the validation pass
+            // above -- cheap (a page-table walk, not I/O), and nothing
+            // in between could have changed this process's own mappings
+            // anyway. Expect, not `?`: this exact address was already
+            // confirmed mapped above; a failure here would mean this
+            // process's own page tables changed underneath this single
+            // syscall, which nothing does.
+            let (phys_page_base, _) =
+                unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
+                    .expect("page was already validated as mapped above");
+            let copy_start = buf_ptr.max(page_addr);
+            let copy_end = end.min(page_addr.saturating_add(4096));
+            let offset_in_page = copy_start - page_addr;
+            let offset_in_kernel_buf = copy_start - buf_ptr;
+            let copy_len = (copy_end - copy_start) as usize;
+            let dest = virt::phys_to_virt(phys_page_base + offset_in_page);
+            // SAFETY: `dest` is this exact page's own HHDM alias
+            // (ordinary RAM, not device MMIO), `copy_len` bytes of which
+            // were just confirmed present/writable/user-accessible
+            // above; `kernel_buf` is this function's own local array,
+            // read-only from this point on.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    kernel_buf.as_ptr().add(offset_in_kernel_buf as usize),
+                    dest.as_mut_ptr::<u8>(),
+                    copy_len,
+                );
+            }
+            page_addr = page_addr.saturating_add(4096);
+        }
+
+        Ok(())
+    })();
+
+    regs.rax = match outcome {
+        Ok(()) => 0,
         Err(e) => e.as_retval() as u64,
     };
     frame
