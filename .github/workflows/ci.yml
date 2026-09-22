@@ -23,10 +23,10 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      - name: Install system dependencies (xorriso, QEMU, OVMF)
+      - name: Install system dependencies (xorriso, QEMU, OVMF, mtools)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xorriso qemu-system-x86 ovmf
+          sudo apt-get install -y xorriso qemu-system-x86 ovmf mtools
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
@@ -157,3 +157,6 @@ jobs:
 
       - name: xtask test-block-fixture (real userland fixture reads back exactly what was seeded)
         run: cargo run -p xtask -- test-block-fixture
+
+      - name: xtask test-fat-parsing (fs::fat parses a real FAT12 image and reads a known file)
+        run: cargo run -p xtask -- test-fat-parsing

@@ -13,6 +13,7 @@ mod driver;
 #[macro_use]
 mod earlycon;
 mod elf;
+mod fs;
 mod ipc;
 mod lang_items;
 mod memory;
@@ -511,6 +512,63 @@ extern "C" fn _start() -> ! {
             },
         );
         task::scheduler::spawn(process).expect("spawn failed");
+    }
+
+    // Milestone 12, Phase 2: kernel-internal smoke test (no syscall yet
+    // -- that's Phase 3, see `fs::fat`'s own module doc comment) proving
+    // `fs::fat` parses a real FAT12 image end to end against whatever
+    // real `mformat`/`mcopy`-built FAT12 disk `xtask test-fat-parsing`
+    // attaches. Two files, deliberately: `HELLO.TXT` fits in a single
+    // cluster (proves boot-sector/BPB parsing and root-directory 8.3
+    // lookup), `BIGFILE.TXT` spans several (proves the FAT12
+    // cluster-chain walk itself, not just an immediate end-of-chain
+    // marker) -- the same two-file shape this milestone's own Phase 1
+    // findings used to confirm the format by hand. Never enabled for a
+    // normal build.
+    #[cfg(feature = "fat-fs-test")]
+    {
+        const HELLO_EXPECTED: &[u8] = b"TarnOS Milestone 12 FAT12 smoke test payload.\n";
+        const BIGFILE_LEN: usize = 3000;
+
+        fn check(label: &str, result: Option<Result<alloc::vec::Vec<u8>, fs::fat::FatError>>, matches: impl FnOnce(&[u8]) -> bool) -> bool {
+            match result {
+                Some(Ok(data)) => {
+                    if matches(&data) {
+                        true
+                    } else {
+                        earlyprintln!("[fat-test] FAT_READ_FAIL -- {label} content mismatch");
+                        false
+                    }
+                }
+                Some(Err(e)) => {
+                    earlyprintln!("[fat-test] FAT_READ_FAIL -- {label}: {:?}", e);
+                    false
+                }
+                None => {
+                    earlyprintln!("[fat-test] FAT_READ_FAIL -- with_device found no driver");
+                    false
+                }
+            }
+        }
+
+        let hello_result = driver::virtio_blk::with_device(|device| {
+            let volume = fs::fat::Fat12Volume::mount(device)?;
+            volume.read_file(device, "HELLO.TXT")
+        });
+        let hello_ok = check("HELLO.TXT", hello_result, |data| data == HELLO_EXPECTED);
+
+        let bigfile_result = driver::virtio_blk::with_device(|device| {
+            let volume = fs::fat::Fat12Volume::mount(device)?;
+            volume.read_file(device, "BIGFILE.TXT")
+        });
+        let bigfile_ok = check("BIGFILE.TXT", bigfile_result, |data| {
+            data.len() == BIGFILE_LEN
+                && data.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8)
+        });
+
+        if hello_ok && bigfile_ok {
+            earlyprintln!("[fat-test] FAT_READ_OK");
+        }
     }
 
     // Deliberately faults instead of continuing boot — see

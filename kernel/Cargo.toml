@@ -173,6 +173,14 @@ block-boundary-test = []
 # function" bar (echo-child, heap-child, ...). Exercised by
 # `cargo run -p xtask -- test-block-fixture`.
 block-fixture-test = []
+# Milestone 12, Phase 2: runs a kernel-internal (no syscall) smoke test
+# against a real FAT12-formatted disk xtask attaches when this feature is
+# enabled -- mounts it via fs::fat::Fat12Volume::mount, reads a known
+# file by 8.3 name, and confirms its content matches exactly, proving
+# boot-sector/BPB parsing, FAT12 cluster-chain traversal, and
+# root-directory lookup all work end to end against a real
+# mformat/mcopy-built image. See docs/MILESTONE-12-FILESYSTEM.md.
+fat-fs-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

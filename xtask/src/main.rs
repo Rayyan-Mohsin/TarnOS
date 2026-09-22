@@ -50,6 +50,7 @@ fn main() {
         "test-block-syscall" => test_block_syscall(),
         "test-block-boundary" => test_block_boundary(),
         "test-block-fixture" => test_block_fixture(),
+        "test-fat-parsing" => test_fat_parsing(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -78,7 +79,8 @@ fn main() {
             .and_then(|_| test_block_driver())
             .and_then(|_| test_block_syscall())
             .and_then(|_| test_block_boundary())
-            .and_then(|_| test_block_fixture()),
+            .and_then(|_| test_block_fixture())
+            .and_then(|_| test_fat_parsing()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -168,6 +170,9 @@ fn print_usage() {
          \x20 test-block-fixture    Same seeded disk, read by a real ELF userland fixture\n\
          \x20                    (block-child) through tarnos-rt's own syscall wrapper,\n\
          \x20                    not a raw-asm dummy process (Milestone 11)\n\
+         \x20 test-fat-parsing      Attach a real mformat/mcopy-built FAT12 disk and confirm\n\
+         \x20                    fs::fat mounts it, walks a real cluster chain, and reads a\n\
+         \x20                    known file's exact content -- no syscall yet (Milestone 12)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -177,8 +182,8 @@ fn print_usage() {
          \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
          \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
          \x20                    test-smp-forced-preempt, test-block-driver,\n\
-         \x20                    test-block-syscall, test-block-boundary, and\n\
-         \x20                    test-block-fixture in sequence"
+         \x20                    test-block-syscall, test-block-boundary,\n\
+         \x20                    test-block-fixture, and test-fat-parsing in sequence"
     );
 }
 
@@ -1685,6 +1690,60 @@ fn create_test_disk_image(path: &Path, sector_count: u64) -> Result<(), String> 
     std::fs::write(path, &data).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// The exact known content `main.rs`'s `fat-fs-test`-gated smoke test
+/// expects back from `HELLO.TXT` -- kept in sync with that file's own
+/// `HELLO_EXPECTED` constant by convention, the same way
+/// [`KNOWN_TEST_LBA`] is kept in sync with `block-driver-test`'s own
+/// constant.
+const FAT_TEST_HELLO_CONTENT: &[u8] = b"TarnOS Milestone 12 FAT12 smoke test payload.\n";
+
+/// Length of `BIGFILE.TXT`'s content -- kept in sync with `main.rs`'s
+/// own `BIGFILE_LEN` constant. Deliberately larger than one 512-byte
+/// FAT12 cluster (this milestone's own test image geometry has
+/// `SecPerClus = 1`, confirmed in Phase 1's own findings), so reading
+/// it back correctly requires walking a real multi-cluster FAT12 chain,
+/// not just following a single entry straight to its own end-of-chain
+/// marker the way `HELLO.TXT` alone would.
+const FAT_TEST_BIGFILE_LEN: usize = 3000;
+
+/// The same `(i % 256) as u8` repeating byte pattern
+/// [`create_test_disk_image`] already uses for its own raw-sector
+/// fixture -- reused here rather than inventing a second pattern, and
+/// kept in sync with `main.rs`'s own matching check.
+fn fat_test_bigfile_content() -> Vec<u8> {
+    (0..FAT_TEST_BIGFILE_LEN).map(|i| (i % 256) as u8).collect()
+}
+
+/// Builds a real, standards-compliant 1.44 MiB FAT12 disk image at
+/// `path` via `mformat`/`mcopy` -- confirmed installed in this
+/// environment and sufficient for this purpose in this milestone's own
+/// Phase 1 findings -- and copies each `(host_path, dos_name)` pair in
+/// `files` into its root directory. Real on-disk FAT12 content, not a
+/// synthetic byte pattern: `fs::fat` parses the real format, so its own
+/// test fixture has to be the real format too.
+fn create_fat_test_disk_image(path: &Path, files: &[(&Path, &str)]) -> Result<(), String> {
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("removing stale {}: {e}", path.display()))?;
+    }
+    let path_str = path.to_str().ok_or_else(|| {
+        format!("disk image path {} is not valid UTF-8", path.display())
+    })?;
+    run_cmd(Command::new("mformat").args(["-f", "1440", "-C", "-i", path_str, "::"]))?;
+    for (host_path, dos_name) in files {
+        let host_path_str = host_path.to_str().ok_or_else(|| {
+            format!("test file path {} is not valid UTF-8", host_path.display())
+        })?;
+        run_cmd(Command::new("mcopy").args([
+            "-i",
+            path_str,
+            host_path_str,
+            &format!("::{dos_name}"),
+        ]))?;
+    }
+    Ok(())
+}
+
 /// Milestone 11, Phase 3: builds the kernel with the `block-driver-test`
 /// feature, attaches a small disk image (seeded by
 /// [`create_test_disk_image`] with known content at a known sector) as a
@@ -1918,6 +1977,75 @@ fn test_block_fixture() -> Result<(), String> {
         "xtask: test-block-fixture PASSED — the real block-child userland fixture's own \
          SYS_BLOCK_READ call, through tarnos-rt's syscall wrapper, read back content matching \
          exactly what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 2: builds the kernel with the `fat-fs-test`
+/// feature, attaches a real FAT12-formatted disk image (built via
+/// `mformat`/`mcopy`, not a synthetic byte pattern -- see
+/// [`create_fat_test_disk_image`] and this milestone's own Phase 1
+/// findings) seeded with two known files -- `HELLO.TXT` (single
+/// cluster) and `BIGFILE.TXT` (several clusters, so the smoke test
+/// actually exercises a real FAT12 chain walk, not just an immediate
+/// end-of-chain marker) -- and boots it. Proves `fs::fat` parses a real
+/// boot sector, walks a real multi-cluster FAT12 chain, finds a
+/// root-directory entry by 8.3 name, and reads back exact file content
+/// -- entirely inside the kernel, no syscall yet (that's Phase 3).
+fn test_fat_parsing() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-parsing-test-disk.img");
+    let hello_path = root.join("build").join("fat-parsing-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-parsing-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-fs-test"],
+        "fat-parsing-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FAT_READ_FAIL") {
+        return Err(
+            "the fs::fat smoke test reported FAT_READ_FAIL -- see the captured log above for \
+             which stage failed"
+                .to_string(),
+        );
+    }
+    if !log.contains("FAT_READ_OK") {
+        return Err(
+            "expected \"FAT_READ_OK\" -- the fs::fat smoke test never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-parsing PASSED — fs::fat parsed a real FAT12 boot sector, walked a \
+         real cluster chain, and read back a known file's exact content"
     );
     Ok(())
 }

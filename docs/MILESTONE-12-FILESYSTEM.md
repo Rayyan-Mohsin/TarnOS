@@ -208,6 +208,56 @@ kernel-owned buffer, sector by sector through `driver::block::BlockDevice`.
 a known test file's known content off a real FAT image and confirms it
 matches exactly, on a real boot.
 
+#### Findings
+
+Implemented `fs::fat::Fat12Volume` (`mount`/`read_file`) exactly as
+scoped: BPB parsing and the same authoritative cluster-count FAT-type
+check Phase 1 confirmed by hand, `fat12_entry`/`cluster_chain` decoding
+FAT12's packed 12-bit entries (bounded by the volume's own total
+cluster count, so a cyclic or corrupt chain can never loop forever),
+flat root-directory 8.3 lookup, and a full-file read. `#[allow(dead_code)]`
+gated on `not(feature = "fat-fs-test")` at the module level, matching
+`driver::block`/`driver::virtio_blk`'s own Milestone 11 Phase 3
+precedent exactly — this module has no caller at all until Phase 3
+wires a real syscall to it.
+
+One real bug, caught immediately by the very first real boot attempt:
+`read_fat_table`'s first draft read the whole FAT table (`fat_size_sectors`
+= 9 sectors on this milestone's own test image) in a single
+`BlockDevice::read_sectors` call, which `virtio_blk`'s own
+`MAX_SECTORS_PER_REQUEST` (8) correctly rejected as `RequestTooLarge`.
+Fixed by reading one sector at a time instead — `fs::fat` was written
+to depend only on the `BlockDevice` trait's own contract (a
+single-sector read is always the minimum any implementation must
+support), deliberately never reaching past that trait to see a
+specific driver's own internal per-request limit, so the fix is a
+property of `fs::fat` itself, not a constant borrowed from
+`virtio_blk`.
+
+The kernel-internal smoke test (`fat-fs-test`) checks two files, not
+one: `HELLO.TXT` (single cluster) and a 3000-byte `BIGFILE.TXT`
+(6 clusters at this image's `SecPerClus = 1`), so the check actually
+exercises a real multi-cluster FAT12 chain walk rather than only ever
+following one entry straight to its own end-of-chain marker. Passed on
+the first real boot attempt once the request-size fix above landed.
+
+**Environment note, not a regression:** `test-smp-sched-concurrency`
+(a Milestone 7 scenario, untouched by this phase) failed consistently
+in this session's sandbox — every attempt observed, on both this
+phase's own changes and, via a direct `git stash` comparison, on the
+unmodified prior commit. Every failure showed the same shape: the two
+spinning test processes hadn't finished their fixed iteration count
+within the scenario's fixed 15s timeout (consistently still running
+around "1300 ticks" when killed). `docs/adr/0011` already documents
+this scenario as sensitive to host performance; this sandbox's own TCG
+(no `/dev/kvm` here) emulation speed today is evidently slow enough to
+make it fail deterministically rather than occasionally. Every other
+scenario in `test-all` (all 26 pre-existing plus this phase's new
+`test-fat-parsing`) was individually confirmed green in this same
+session. Not otherwise investigated further -- this phase's own scope
+never touches scheduling/dispatch, and the baseline comparison already
+rules out a regression.
+
 ### Phase 3 — Capability and syscall surface
 
 `KernelObjectRef`/`Rights`/`SyscallError` extended as scoped above. The
