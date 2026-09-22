@@ -20,10 +20,20 @@
 //! `FS_CAP` reads back as `SyscallError::BadCapability`, which is
 //! treated as "no filesystem this boot" and silently skipped, not an
 //! error to report.
+//!
+//! Then (Milestone 12 Phase 4) tries `SYS_SPAWN("FSCHILD.ELF")` — a
+//! name that never appears in `limine.conf`'s own boot-module list, so
+//! any success at all can only have come from `SYS_SPAWN`'s new
+//! filesystem fallback. Equally tolerant of absence: `SyscallError`
+//! doesn't even need inspecting here, since no ordinary scenario (no
+//! disk, or a disk without this exact file) ever has a program by this
+//! name to find either way.
 #![no_std]
 #![no_main]
 
-use tarnos_abi::{CapIndex, Message, Rights, SyscallError, CHILD_LINK_CAP, CONSOLE_CAP, FS_CAP};
+use tarnos_abi::{
+    CapIndex, ExitStatus, Message, Rights, SyscallError, CHILD_LINK_CAP, CONSOLE_CAP, FS_CAP,
+};
 use tarnos_rt::syscall;
 
 tarnos_rt::entry_point!(main);
@@ -60,6 +70,7 @@ fn main() -> ! {
     let _ = syscall::sys_send(CONSOLE_CAP, Message::from_str_lossy(report));
 
     probe_filesystem();
+    probe_filesystem_spawn();
 
     syscall::sys_exit(0);
 }
@@ -102,6 +113,38 @@ fn probe_filesystem() {
         "FS_SYSCALL_OK"
     } else {
         "FS_SYSCALL_FAIL"
+    };
+    let _ = syscall::sys_send(CONSOLE_CAP, Message::from_str_lossy(report));
+}
+
+/// Spawns `FSCHILD.ELF` -- on `xtask test-fat-spawn`'s own disk image,
+/// a copy of the already-proven `exit-code-child` binary (Milestone 4),
+/// placed there specifically so this milestone's own spawn-fallback
+/// test doesn't need a brand new userland crate just to prove the
+/// mechanism -- through `SYS_SPAWN`'s new filesystem fallback (no boot
+/// module by this name exists at all, so any success can only have come
+/// from that fallback), and confirms it runs to completion by waiting
+/// for the exact exit code (`42`) `exit-code-child` always reports. No
+/// capability grant needed: `exit-code-child` never touches one.
+/// Reports `FS_SPAWN_OK`/`FS_SPAWN_FAIL`, or does nothing at all if the
+/// spawn itself failed -- ordinary on every scenario that has no
+/// filesystem, or a filesystem without this exact file.
+fn probe_filesystem_spawn() {
+    let Ok(child_pid) = syscall::sys_spawn("FSCHILD.ELF") else {
+        return;
+    };
+    // A failed `sys_process_start` here would leave the child forever
+    // `Suspended` -- `sys_wait` blocks until its target actually exits,
+    // so calling it anyway would hang this process (and, with nothing
+    // else left to run, the whole machine) rather than ever reporting
+    // `FS_SPAWN_FAIL`.
+    let report = if syscall::sys_process_start(child_pid).is_err() {
+        "FS_SPAWN_FAIL"
+    } else {
+        match syscall::sys_wait(child_pid) {
+            Ok(ExitStatus::Exited(42)) => "FS_SPAWN_OK",
+            _ => "FS_SPAWN_FAIL",
+        }
     };
     let _ = syscall::sys_send(CONSOLE_CAP, Message::from_str_lossy(report));
 }

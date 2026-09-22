@@ -51,6 +51,7 @@ fn main() {
         "test-block-boundary" => test_block_boundary(),
         "test-block-fixture" => test_block_fixture(),
         "test-fat-parsing" => test_fat_parsing(),
+        "test-fat-spawn" => test_fat_spawn(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -80,7 +81,8 @@ fn main() {
             .and_then(|_| test_block_syscall())
             .and_then(|_| test_block_boundary())
             .and_then(|_| test_block_fixture())
-            .and_then(|_| test_fat_parsing()),
+            .and_then(|_| test_fat_parsing())
+            .and_then(|_| test_fat_spawn()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -173,6 +175,10 @@ fn print_usage() {
          \x20 test-fat-parsing      Attach a real mformat/mcopy-built FAT12 disk and confirm\n\
          \x20                    fs::fat mounts it, walks a real cluster chain, and reads a\n\
          \x20                    known file's exact content -- no syscall yet (Milestone 12)\n\
+         \x20 test-fat-spawn        Attach a FAT12 disk holding a program that exists nowhere\n\
+         \x20                    in limine.conf and confirm a real, ordinary boot's own init\n\
+         \x20                    process can SYS_SPAWN it via the filesystem fallback and run\n\
+         \x20                    it to completion (Milestone 12)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -183,7 +189,8 @@ fn print_usage() {
          \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
          \x20                    test-smp-forced-preempt, test-block-driver,\n\
          \x20                    test-block-syscall, test-block-boundary,\n\
-         \x20                    test-block-fixture, and test-fat-parsing in sequence"
+         \x20                    test-block-fixture, test-fat-parsing, and test-fat-spawn in\n\
+         \x20                    sequence"
     );
 }
 
@@ -2062,6 +2069,94 @@ fn test_fat_parsing() -> Result<(), String> {
         "xtask: test-fat-parsing PASSED — fs::fat parsed a real FAT12 boot sector, walked a \
          real cluster chain, and read back a known file's exact content, both directly and \
          through a real SYS_FILE_READ syscall from the real init process"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 4: builds a real FAT12 disk image seeded with
+/// `HELLO.TXT`/`BIGFILE.TXT` (so Phase 3's own `FS_CAP` probe still
+/// passes) plus a copy of the already-proven `exit-code-child` binary
+/// (Milestone 4) under the name `FSCHILD.ELF` -- a name that never
+/// appears in `limine.conf`'s own boot-module list, so `init`'s own
+/// `SYS_SPAWN("FSCHILD.ELF")` can only succeed through the new
+/// filesystem fallback. Boots with **no** kernel test feature at all --
+/// this is the ordinary, unconditional real boot sequence, proving the
+/// fallback works on a completely normal boot, not a special test path.
+fn test_fat_spawn() -> Result<(), String> {
+    let root = workspace_root();
+    // `create_fat_test_disk_image` copies straight from this path, so it
+    // must already exist -- `run_scenario_ext`'s own `iso()` call would
+    // build it too, but only *after* the disk image below is created.
+    build_user_crate(&root, false, "exit-code-child")?;
+    let fschild_elf = user_elf_path(&root, false, "exit-code-child");
+    // A debug build carries several MiB of DWARF debug sections, none
+    // of them `SHF_ALLOC` (so `Process::from_elf`'s own PT_LOAD-segment
+    // loader never reads any of it) -- but comfortably too large for a
+    // 1.44 MiB floppy image regardless. `strip` removes exactly that
+    // non-loaded debug information, never anything `from_elf` actually
+    // maps, so this changes nothing about how the program runs.
+    let fschild_stripped = root.join("build").join("fschild-stripped.elf");
+    std::fs::copy(&fschild_elf, &fschild_stripped).map_err(|e| {
+        format!(
+            "copying {} -> {}: {e}",
+            fschild_elf.display(),
+            fschild_stripped.display()
+        )
+    })?;
+    run_cmd(Command::new("strip").arg(&fschild_stripped))?;
+
+    let disk_path = root.join("build").join("fat-spawn-test-disk.img");
+    let hello_path = root.join("build").join("fat-spawn-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-spawn-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[
+            (&hello_path, "HELLO.TXT"),
+            (&bigfile_path, "BIGFILE.TXT"),
+            (&fschild_stripped, "FSCHILD.ELF"),
+        ],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(&[], "fat-spawn-test.log", 10, false, 1, &extra_args)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FS_SPAWN_FAIL") {
+        return Err(
+            "init's own SYS_SPAWN(\"FSCHILD.ELF\") probe reported FS_SPAWN_FAIL -- either the \
+             spawn itself failed or the spawned process's own exit code didn't match \
+             (Milestone 12 Phase 4)"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_SPAWN_OK") {
+        return Err(
+            "expected \"FS_SPAWN_OK\" -- init's own SYS_SPAWN(\"FSCHILD.ELF\") probe never \
+             reported a result at all (Milestone 12 Phase 4)"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-spawn PASSED — SYS_SPAWN's new filesystem fallback found and loaded a \
+         program that exists only on the FAT image (not in limine.conf's boot-module list), and \
+         it ran to completion with exactly the exit code expected"
     );
     Ok(())
 }

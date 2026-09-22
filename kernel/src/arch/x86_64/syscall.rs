@@ -345,15 +345,26 @@ fn sys_recv(frame: *mut TrapFrame) -> *mut TrapFrame {
     }
 }
 
-/// `SYS_SPAWN`: creates a new, `Suspended` process from a boot-shipped
-/// program named by `rdi`/`rsi`/`rdx` (packed via
-/// `tarnos_abi::pack_short_name`), recording the caller as its parent.
-/// Never blocks — always returns `frame` directly. On success, `rax`
-/// holds the new process's raw `Pid`; there is no capability wrapping it
-/// (a `Pid` alone confers no authority — only `SYS_GRANT`/
-/// `SYS_PROCESS_START`'s parent-of-a-Suspended-child check does), so
-/// there is nothing to guard against a forged value here beyond what
-/// those two syscalls already check.
+/// `SYS_SPAWN`: creates a new, `Suspended` process from a program named
+/// by `rdi`/`rsi`/`rdx` (packed via `tarnos_abi::pack_short_name`),
+/// recording the caller as its parent. Never blocks — always returns
+/// `frame` directly. On success, `rax` holds the new process's raw
+/// `Pid`; there is no capability wrapping it (a `Pid` alone confers no
+/// authority — only `SYS_GRANT`/`SYS_PROCESS_START`'s
+/// parent-of-a-Suspended-child check does), so there is nothing to
+/// guard against a forged value here beyond what those two syscalls
+/// already check.
+///
+/// Looks the name up in the fixed boot-module registry first (Limine's
+/// own `MODULES_REQUEST`, unchanged since Milestone 3) — cheap, a linear
+/// scan over a small static `Vec` — and only falls back to the mounted
+/// FAT12 volume (Milestone 12) if that fails, so every existing
+/// boot-module program's spawn path is untouched. The filesystem lookup
+/// itself can fail for several distinct reasons (`fs::fat::FatError`'s
+/// own variants: no volume mounted this boot, the name doesn't exist,
+/// a corrupt chain, ...) — all collapsed to the one `NoSuchProgram` a
+/// caller already has to handle for the boot-module case, since none of
+/// that distinction is actionable from `SYS_SPAWN`'s own caller.
 fn sys_spawn(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
     let mut name_buf = [0u8; SHORT_NAME_MAX];
@@ -362,8 +373,20 @@ fn sys_spawn(frame: *mut TrapFrame) -> *mut TrapFrame {
     let result: Result<u64, SyscallError> = (|| {
         let caller_pid = scheduler::with_current_process(|p| p.pid)
             .ok_or(SyscallError::InvalidTarget)?;
-        let elf_bytes =
-            crate::task::process::lookup_spawnable_module(name).ok_or(SyscallError::NoSuchProgram)?;
+
+        let owned_elf_bytes;
+        let elf_bytes: &[u8] =
+            if let Some(bytes) = crate::task::process::lookup_spawnable_module(name) {
+                bytes
+            } else {
+                owned_elf_bytes = crate::fs::fat::with_root(|volume, device| {
+                    volume.read_file(device, name)
+                })
+                .and_then(Result::ok)
+                .ok_or(SyscallError::NoSuchProgram)?;
+                &owned_elf_bytes
+            };
+
         let child_pid = scheduler::allocate_pid();
         let mut child =
             match crate::task::process::Process::from_elf(child_pid, elf_bytes, Some(caller_pid)) {

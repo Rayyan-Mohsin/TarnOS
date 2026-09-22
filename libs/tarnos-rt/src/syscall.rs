@@ -161,6 +161,18 @@ pub fn sys_process_start(target_pid: u64) -> Result<(), SyscallError> {
 /// Blocks until `target_pid` (a child of the caller, in any state)
 /// terminates, then returns how. Non-blocking if `target_pid` already
 /// terminated before this call.
+///
+/// `rdi`/`rsi` on return, not `rsi`/`rdx`: the kernel side
+/// (`arch::x86_64::syscall::sys_wait`'s doc comment, and both places
+/// that actually write these -- `task::scheduler::wait_for_child`'s
+/// `AlreadyDone` branch and `apply_wake_result`'s `WaitCompleted` arm)
+/// always writes `kind` into `rdi` and `code` into `rsi`; `rdx` is never
+/// touched at all. A real, previously-latent bug here (this exact
+/// wrapper read `kind`/`code` from `rsi`/`rdx` instead) went unnoticed
+/// since Milestone 4: no compiled userland binary ever called this safe
+/// wrapper before Milestone 12's own `userland/init` did -- every
+/// existing `SYS_WAIT` test used a raw-`asm!` dummy process reading the
+/// registers directly, correctly, bypassing this function entirely.
 pub fn sys_wait(target_pid: u64) -> Result<ExitStatus, SyscallError> {
     let retval: i64;
     let (kind, code): (u64, u64);
@@ -168,9 +180,9 @@ pub fn sys_wait(target_pid: u64) -> Result<ExitStatus, SyscallError> {
         asm!(
             "syscall",
             inout("rax") SYS_WAIT => retval,
-            in("rdi") target_pid,
-            out("rsi") kind,
-            out("rdx") code,
+            inout("rdi") target_pid => kind,
+            out("rsi") code,
+            out("rdx") _,
             out("rcx") _,
             out("r11") _,
             options(nostack, preserves_flags)

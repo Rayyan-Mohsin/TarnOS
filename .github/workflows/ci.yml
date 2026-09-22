@@ -160,3 +160,6 @@ jobs:
 
       - name: xtask test-fat-parsing (fs::fat parses a real FAT12 image and reads a known file)
         run: cargo run -p xtask -- test-fat-parsing
+
+      - name: xtask test-fat-spawn (SYS_SPAWN's filesystem fallback loads a program off the FAT image)
+        run: cargo run -p xtask -- test-fat-spawn

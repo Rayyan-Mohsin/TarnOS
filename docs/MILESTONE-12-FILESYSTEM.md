@@ -364,6 +364,78 @@ filesystem when the boot-module registry doesn't have a match.
 the FAT image, not in `limine.conf`'s own boot-module list, and it runs
 to completion normally.
 
+#### Findings
+
+**Implementation.** `sys_spawn` tries `lookup_spawnable_module` first
+(unchanged, cheap), then falls back to `fs::fat::with_root`'s own
+`read_file` only on a miss -- an owned `Vec<u8>` referenced through a
+plain `let owned; let elf_bytes: &[u8] = if ... { bytes } else {
+owned = ...; &owned };`, since `Process::from_elf` only ever borrows its
+input for the duration of one call, needing no `'static` lifetime the
+boot-module case happens to have. Every distinct `fs::fat::FatError`
+(no volume mounted, no such file, a corrupt chain, ...) collapses to
+the one `SyscallError::NoSuchProgram` a caller already handles for the
+boot-module-miss case -- none of that distinction is actionable from
+`SYS_SPAWN`'s own caller. Needed no new kernel feature or capability at
+all: `userland/init`'s own `probe_filesystem_spawn` runs unconditionally
+in the real boot sequence (same tolerant-of-absence shape as Phase 3's
+`probe_filesystem`), and `xtask test-fat-spawn` boots with **zero**
+kernel test features -- the ordinary, unconditional real boot path,
+proving the fallback on a completely normal boot.
+
+**Test fixture reuse, and a real disk-image-size lesson.** Rather than
+write a new userland crate just to prove the fallback mechanism, the
+test copies the already-proven `exit-code-child` binary (Milestone 4,
+`sys_exit(42)` and nothing else) onto the FAT image under the name
+`FSCHILD.ELF` -- a name that appears nowhere in `limine.conf`, so any
+successful spawn can only have come through the new fallback. Its
+*debug* build (~2.9 MiB, almost entirely DWARF debug sections with no
+`SHF_ALLOC` flag -- confirmed via `readelf -S`, none of it read by
+`Process::from_elf`'s own PT_LOAD-segment loader) didn't fit a 1.44 MiB
+floppy at all (`mcopy` failed with "Disk full"); `strip` (removing only
+that non-loaded debug information) brought it down to 784 bytes.
+`xtask`'s own `test_fat_spawn` now copies and strips it into
+`build/fschild-stripped.elf` before building the disk image, rather
+than switching to a release build (a second full `core`/`alloc`
+compilation, more moving parts than one `strip` invocation).
+
+**A second real, previously-latent bug, found by the exact same kind of
+"first real exercise of an existing safe wrapper" pattern Phase 3's SSE
+finding was**: the very first attempt reported `wait_killed` --
+`ExitStatus::Killed`, not the `Exited(42)` the spawned child obviously
+returned. Kernel-side tracing (temporary `earlyprintln!`s, removed once
+diagnosed) showed `wait_for_child` correctly resolving `Exited(42)` and
+writing it into the trap frame -- the kernel side was never wrong. The
+bug was in `tarnos_rt::syscall::sys_wait` itself: it read `kind` from
+`rsi` and `code` from `rdx`, but the kernel (`wait_for_child`'s
+`AlreadyDone` branch and `apply_wake_result`'s `WaitCompleted` arm,
+both checked directly) always writes `kind` into `rdi` and `code` into
+`rsi`, never touching `rdx` at all. Misreading `code` (`42`, sitting in
+`rsi`) as `kind` sent `ExitStatus::from_regs` down its `_ => Killed`
+fallback arm every time. This exact wrapper has existed since Milestone
+4 and was never once exercised: every existing `SYS_WAIT` test
+(`test-wait-exit-code`, and every other scenario that waits on a child)
+uses a raw-`asm!` dummy process reading the registers directly and
+correctly, bypassing this function entirely -- `userland/init`'s own
+`probe_filesystem_spawn` is the first *real, compiled* userland code in
+the whole project ever to call `sys_wait` through its own safe wrapper.
+Fixed by reading `kind` back out of `rdi` (`inout("rdi") target_pid =>
+kind`) and `code` out of `rsi`, matching the kernel's actual, verified
+convention exactly; confirmed by isolating the bug first with a
+boot-module target (`exit-code-child` directly, no filesystem fallback
+involved at all) to rule out anything Phase 4-specific before touching
+`tarnos-rt`.
+
+Full regression (clean rebuild): `test-smp-sched-concurrency` hit the
+same pre-existing, environment-specific timing failure Phases 2/3
+already root-caused; every other scenario in `test-all` (26
+pre-existing plus `test-fat-parsing`/`test-fat-spawn`) individually
+green, including `test-wait-exit-code` itself (confirming the
+`sys_wait` fix changes nothing for the raw-`asm!` path that was already
+correct). `cargo test -p tarnos-kcore -p tarnos-abi` green (45 tests).
+`cargo clippy` clean across the kernel, `tarnos-rt`, every userland
+crate, and `xtask`.
+
 ### Phase 5 — Userland fixture and adversarial testing
 
 A new userland fixture (reads a known file, reports pass/fail) plus
