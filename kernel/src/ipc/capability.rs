@@ -35,12 +35,25 @@ pub enum KernelObjectRef {
     /// what says *which object*).
     ///
     /// `#[allow(dead_code)]`: only constructed today by `main.rs`'s
-    /// `block-syscall-test`-gated boot block (Phase 5 wires it into the
-    /// real `init`/`SYS_GRANT` path a normal build actually takes) — a
+    /// `block-syscall-test`/`block-boundary-test`-gated boot blocks — a
     /// default build never builds one, only matches against the
-    /// possibility in `arch::x86_64::syscall::sys_block_read`.
+    /// possibility in `arch::x86_64::syscall::sys_block_read`. Wiring
+    /// `BLOCK_CAP` into the real `init` process remains deliberately
+    /// undone (`docs/adr/0031`'s own Consequences) — Milestone 12 wires
+    /// `FsRoot` into real `init` instead, since a filesystem, not raw
+    /// block access, is the actual real need that arose.
     #[allow(dead_code)]
     BlockDevice,
+    /// The one FAT12 volume this kernel can mount — a pure marker, same
+    /// reasoning as [`KernelObjectRef::BlockDevice`]: there is exactly
+    /// one, reached through `fs::fat::with_root`'s own singleton, so a
+    /// slot naming it needs nothing beyond "this slot may read from the
+    /// mounted filesystem." Seeded into the real `init` process's own
+    /// capability table at boot (`main.rs`, right before spawning it)
+    /// whenever `fs::fat::mount_root` actually finds a valid FAT12
+    /// volume this boot — closing Milestone 11's own deferred loose end
+    /// for real, not through a throwaway test fixture.
+    FsRoot,
 }
 
 pub type CapabilitySlot = tarnos_kcore::captable::CapabilitySlot<KernelObjectRef>;

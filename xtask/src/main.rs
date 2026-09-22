@@ -2043,9 +2043,25 @@ fn test_fat_parsing() -> Result<(), String> {
                 .to_string(),
         );
     }
+    if log.contains("FS_SYSCALL_FAIL") {
+        return Err(
+            "the real init process's own SYS_FILE_READ probe reported FS_SYSCALL_FAIL -- either \
+             the syscall itself failed or the content it read back didn't match (Milestone 12 \
+             Phase 3)"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_SYSCALL_OK") {
+        return Err(
+            "expected \"FS_SYSCALL_OK\" -- the real init process's own SYS_FILE_READ probe never \
+             reported a result at all (Milestone 12 Phase 3)"
+                .to_string(),
+        );
+    }
     println!(
         "xtask: test-fat-parsing PASSED — fs::fat parsed a real FAT12 boot sector, walked a \
-         real cluster chain, and read back a known file's exact content"
+         real cluster chain, and read back a known file's exact content, both directly and \
+         through a real SYS_FILE_READ syscall from the real init process"
     );
     Ok(())
 }

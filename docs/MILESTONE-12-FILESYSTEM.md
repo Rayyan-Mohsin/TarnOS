@@ -270,6 +270,91 @@ Milestone 11's own deferred loose end for real.
 **Exit condition:** the same content-matches smoke test as Phase 2, now
 reached through a real syscall from `init` itself.
 
+#### Findings
+
+**ABI.** `SYS_FILE_READ(cap, name_lo, name_hi, name_len, buf_ptr, buf_len)`
+fills all six argument registers exactly (`rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`)
+-- the file name is packed the same fixed-width, pointer-free way
+`SYS_SPAWN` already packs a program name, so the two now share one
+renamed, generic helper (`tarnos_abi::pack_short_name`/`unpack_short_name`/
+`SHORT_NAME_MAX`, was `pack_program_name`/etc.) instead of a second
+scheme. Returns the number of bytes actually copied
+(`min(file_size, buf_len)`) -- a length-bounded prefix read, not a
+general `pread` with an arbitrary offset, since `fs::fat::read_file`
+itself has no partial-file read yet; a real future need for one is a
+natural, separable extension.
+
+**Capability shape.** `KernelObjectRef::FsRoot` is a pure marker (one
+mounted volume, reached through `fs::fat::with_root`), reusing
+`Rights::READ` rather than adding a new bit -- the object variant match
+in `sys_file_read` already distinguishes it from `BlockDevice`, so a
+second "read" bit would say nothing a new bit doesn't already.
+`tarnos_abi::FS_CAP = CapIndex(3)`. `sys_block_read`'s own object match
+gained an explicit `FsRoot => BadCapability` arm (it was previously
+non-exhaustive only over `BlockDevice`/`Endpoint`); the page-range
+validate/copy logic both syscalls need was extracted into
+`validate_write_range`/`copy_into_user_range` once `sys_file_read`
+became a second real caller, rather than duplicated.
+
+**Real wiring, not a test fixture.** `fs::fat::mount_root` is called
+once, unconditionally, in the real boot sequence right before `init` is
+spawned (`main.rs`) -- not behind any test feature. `FS_CAP` is seeded
+into `init`'s own capability table only when it succeeds; most
+scenarios (no disk, or Milestone 11's own raw-pattern block-test disks)
+fail it harmlessly and simply don't get the capability. `init` itself
+(`userland/init`) unconditionally probes it after its existing
+echo-child round trip, treating `SyscallError::BadCapability` as "no
+filesystem this boot" and silently continuing -- never a failure to
+report. This closes `BLOCK_CAP`'s own long-deferred loose end for real
+(`docs/adr/0031`'s Consequences), corrected a stale doc comment on
+`KernelObjectRef::BlockDevice` that had claimed this already happened
+for it, and needed no new `xtask` scenario or kernel test feature at
+all: `test-fat-parsing` (Phase 2) already boots with a real FAT12 disk
+and reaches real `init`, so it was simply extended to also assert
+`FS_SYSCALL_OK` from `init`'s own probe.
+
+**A second, more consequential bug: SSE was never disabled for
+userland.** The first real boot attempt hit `[fault] pid ... killed:
+invalid opcode`, in genuine ring-3 `init` code -- not the dummy-process
+codegen landmine Milestone 11 hit twice (`Process::new_dummy`'s
+copied-pages constraint doesn't apply to a real, fully-linked ELF
+process). Disassembling the faulting address showed a `movups`/`movaps`
+pair: LLVM had auto-vectorized `probe_filesystem`'s own array
+zero-init/equality-comparison code (the first userland code, across
+every milestone so far, large or slice-comparing enough to trigger it)
+into SSE instructions. The kernel's own target
+(`x86_64-unknown-none`, built in) explicitly disables
+`sse`/`sse2`/`avx`/etc. and sets `soft-float` for exactly this reason --
+this kernel never sets up `FXSAVE`/`XSAVE` state or enables
+`CR4.OSFXSR`, so *any* SSE instruction in ring 0 or ring 3 is
+undefined -- but `targets/x86_64-tarnos-user.json` (the custom JSON
+target every userland crate builds against) never carried the matching
+`features`/`rustc-abi: "softfloat"` settings, silently relying on no
+userland code ever happening to need them. Fixed by copying both
+fields from the kernel target's own spec exactly (confirmed via
+`rustc -Z unstable-options --print target-spec-json`, not guessed);
+`objdump` confirmed zero `movups`/`movaps`/`xmm` references in the
+rebuilt `init` binary afterward. This is a real, previously-latent gap
+that could have silently corrupted process state on a context switch
+even without ever raising a fault, had a scheduling tick landed
+mid-SSE-sequence on real hardware with different luck -- worth exactly
+the same prominence as Milestone 11's own dummy-process bug class, and
+now closed for every userland crate at once, not worked around in this
+one caller.
+
+Full regression re-run from a clean rebuild after the target-spec
+fix: `test-smp-sched-concurrency` failed deterministically in this
+session's own sandbox again (same shape as Phase 2's own finding,
+already confirmed there via `git stash` to be pre-existing and
+environment-specific, not a regression); every other scenario in
+`test-all` (26 pre-existing plus `test-fat-parsing`) individually
+confirmed green, including every block-test scenario -- proving the
+SSE fix didn't perturb any already-working userland crate's behavior.
+`cargo test -p tarnos-kcore -p tarnos-abi` green (45 tests, including
+the renamed `pack_short_name`/`unpack_short_name` proptests). `cargo
+clippy` clean across the kernel (both with and without `fat-fs-test`),
+`tarnos-rt`, and every userland crate.
+
 ### Phase 4 — `SYS_SPAWN` filesystem fallback
 
 Extends the existing spawn-by-name lookup to fall back to the

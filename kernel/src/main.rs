@@ -1469,6 +1469,24 @@ extern "C" fn _start() -> ! {
             rights: ipc::Rights::SEND | ipc::Rights::RECV,
         },
     );
+    // Milestone 12 Phase 3: closes Milestone 11's own deferred loose end
+    // (`tarnos_abi::BLOCK_CAP`'s own doc comment) for real -- the real
+    // `init` process, not a throwaway test fixture, is what actually
+    // receives filesystem authority on a real boot. Best-effort: most
+    // scenarios attach no disk at all, or (Milestone 11's own block-*
+    // scenarios) a raw pattern disk that isn't a valid FAT12 volume --
+    // both fail `mount_root` harmlessly, and `init`'s own SYS_FILE_READ
+    // probe treats a missing FS_CAP as "no filesystem this boot," not an
+    // error (see `userland/init`).
+    if fs::fat::mount_root().is_ok() {
+        init_process.cap_table.insert(
+            tarnos_abi::FS_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::FsRoot,
+                rights: ipc::Rights::READ,
+            },
+        );
+    }
     task::scheduler::spawn(init_process).expect("process table exhausted spawning the very first process");
 
     // scheduler::start() never returns: once a real process exists, the

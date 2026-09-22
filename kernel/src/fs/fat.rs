@@ -18,19 +18,20 @@
 //! caching -- every [`Fat12Volume::read_file`] call re-reads the FAT
 //! table and every data cluster fresh from `device`.
 //!
-//! `#[allow(dead_code)]` below is temporary, matching
-//! `driver::block`/`driver::virtio_blk`'s own precedent from Milestone
-//! 11 Phase 3: this module's only caller today is `main.rs`'s
-//! `fat-fs-test`-gated smoke test, so a default build never actually
-//! calls anything here. Milestone 12 Phase 3 makes a real syscall call
-//! this unconditionally, at which point this comes back out.
-#![cfg_attr(not(feature = "fat-fs-test"), allow(dead_code))]
+//! [`mount_root`]/[`with_root`] are this module's own singleton, one
+//! mounted volume at most, reached the same way
+//! `driver::virtio_blk::{init, with_device}` reach their own one real
+//! device -- unconditional, real boot-sequence code as of Milestone 12
+//! Phase 3 (`main.rs` calls `mount_root` right before spawning `init`),
+//! not gated behind any test feature.
 extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::driver::block::{BlockDevice, BlockError, SECTOR_SIZE};
+use crate::driver::virtio_blk::{self, VirtioBlk};
+use crate::sync::SpinLock;
 
 /// Boot sector signature bytes' own fixed offset and required value
 /// (every FAT boot sector, of any variant, ends this way).
@@ -114,6 +115,9 @@ pub enum FatError {
     /// The requested name doesn't fit the 8.3 shape this milestone
     /// supports (see the module doc comment: no long filenames).
     NameTooLong,
+    /// [`mount_root`] found no block device at all this boot -- an
+    /// ordinary outcome (most scenarios attach no disk), never a bug.
+    NoDevice,
 }
 
 /// A mounted FAT12 volume's own parsed geometry -- everything
@@ -361,4 +365,30 @@ impl Fat12Volume {
         data.truncate(file_size as usize);
         Ok(data)
     }
+}
+
+static ROOT_VOLUME: SpinLock<Option<Fat12Volume>> = SpinLock::new(None);
+
+/// Attempts to mount the one filesystem this kernel supports off
+/// whatever block device `virtio_blk::init` found this boot, storing it
+/// for [`with_root`] on success. Called once, unconditionally, from the
+/// real boot sequence right before `init` is spawned (`main.rs`) --
+/// `Err` (no device this boot, or the device's own content isn't a
+/// valid FAT12 volume) is an ordinary, expected outcome for most
+/// scenarios, never a panic; the caller seeds `FS_CAP` into `init`'s own
+/// capability table only when this returns `Ok`.
+pub fn mount_root() -> Result<(), FatError> {
+    let volume = virtio_blk::with_device(Fat12Volume::mount).ok_or(FatError::NoDevice)??;
+    *ROOT_VOLUME.lock() = Some(volume);
+    Ok(())
+}
+
+/// Runs `f` against the mounted root volume and the one real block
+/// device, or `None` if [`mount_root`] was never called or found
+/// nothing to mount. Mirrors `virtio_blk::with_device`'s own singleton
+/// shape.
+pub fn with_root<R>(f: impl FnOnce(&Fat12Volume, &mut VirtioBlk) -> R) -> Option<R> {
+    let guard = ROOT_VOLUME.lock();
+    let volume = guard.as_ref()?;
+    virtio_blk::with_device(|device| f(volume, device))
 }

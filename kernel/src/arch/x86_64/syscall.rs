@@ -24,12 +24,13 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tarnos_abi::{
-    CapIndex, Message, SyscallError, PROGRAM_NAME_MAX, SYS_BLOCK_READ, SYS_EXIT, SYS_GRANT,
-    SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    CapIndex, Message, SyscallError, SHORT_NAME_MAX, SYS_BLOCK_READ, SYS_EXIT, SYS_FILE_READ,
+    SYS_GRANT, SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT,
+    SYS_YIELD,
 };
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
-use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::context_switch::TrapFrame;
@@ -250,6 +251,7 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_KILL => sys_kill(frame),
         SYS_SBRK => sys_sbrk(frame),
         SYS_BLOCK_READ => sys_block_read(frame),
+        SYS_FILE_READ => sys_file_read(frame),
         _ => {
             regs.rax = SyscallError::NoSuchSyscall.as_retval() as u64;
             frame
@@ -345,7 +347,7 @@ fn sys_recv(frame: *mut TrapFrame) -> *mut TrapFrame {
 
 /// `SYS_SPAWN`: creates a new, `Suspended` process from a boot-shipped
 /// program named by `rdi`/`rsi`/`rdx` (packed via
-/// `tarnos_abi::pack_program_name`), recording the caller as its parent.
+/// `tarnos_abi::pack_short_name`), recording the caller as its parent.
 /// Never blocks — always returns `frame` directly. On success, `rax`
 /// holds the new process's raw `Pid`; there is no capability wrapping it
 /// (a `Pid` alone confers no authority — only `SYS_GRANT`/
@@ -354,8 +356,8 @@ fn sys_recv(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// those two syscalls already check.
 fn sys_spawn(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
-    let mut name_buf = [0u8; PROGRAM_NAME_MAX];
-    let name = tarnos_abi::unpack_program_name(regs.rdi, regs.rsi, regs.rdx, &mut name_buf);
+    let mut name_buf = [0u8; SHORT_NAME_MAX];
+    let name = tarnos_abi::unpack_short_name(regs.rdi, regs.rsi, regs.rdx, &mut name_buf);
 
     let result: Result<u64, SyscallError> = (|| {
         let caller_pid = scheduler::with_current_process(|p| p.pid)
@@ -613,6 +615,87 @@ fn sys_sbrk(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// reasoning: never hold `SCHEDULER` across the driver's own polling
 /// loop, however brief in practice), then performs the actual device
 /// I/O and the copy into the caller's buffer entirely outside that lock.
+/// Validates that every page touched by the destination range
+/// `ptr..ptr + len` (walked through `pml4_frame`, the calling process's
+/// own PML4 -- never the global kernel-only mapper, which has no
+/// visibility into any process's own user-half mappings at all) is
+/// present/writable/user-accessible, before any device or filesystem
+/// I/O ever runs. Shared by every syscall that writes through a
+/// caller-supplied destination pointer (`sys_block_read`,
+/// `sys_file_read`) -- first written for `sys_block_read` alone
+/// (Milestone 11 Phase 4), extracted here once `sys_file_read` became a
+/// second real caller needing the exact same check.
+fn validate_write_range(
+    pml4_frame: PhysFrame<Size4KiB>,
+    ptr: u64,
+    len: u64,
+) -> Result<u64, SyscallError> {
+    let end = ptr.checked_add(len).ok_or(SyscallError::InvalidArgument)?;
+    let required =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let mut page_addr = ptr & !0xFFF;
+    while page_addr < end {
+        // SAFETY: `pml4_frame` names this same, still-live calling
+        // process's own PML4 -- this syscall handler is the only thing
+        // acting on it meanwhile (same reasoning `sys_sbrk`'s own doc
+        // comment gives for its own gap between `with_current_process`
+        // calls).
+        let (_, flags) = unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
+            .ok_or(SyscallError::InvalidArgument)?;
+        if !flags.contains(required) {
+            return Err(SyscallError::InvalidArgument);
+        }
+        page_addr = page_addr.saturating_add(4096);
+    }
+    Ok(end)
+}
+
+/// Copies `src` into the destination range `ptr..ptr + src.len()`
+/// (inside the address space `pml4_frame` names), one physical page at
+/// a time through each page's own HHDM alias -- never a raw write
+/// through `ptr` itself. That virtual address is only meaningful under
+/// the *caller's* own page tables; going through the physical alias
+/// instead means this doesn't silently depend on "SYSCALL never
+/// switches CR3" (true on this kernel today, but not a fact this
+/// function needs to lean on). Caller must have already validated the
+/// whole range with [`validate_write_range`] -- every `expect` below
+/// leans on that.
+fn copy_into_user_range(pml4_frame: PhysFrame<Size4KiB>, ptr: u64, src: &[u8]) {
+    let end = ptr + src.len() as u64;
+    let mut page_addr = ptr & !0xFFF;
+    while page_addr < end {
+        // SAFETY: re-translated, not reused from the validation pass
+        // above -- cheap (a page-table walk, not I/O), and nothing in
+        // between could have changed this process's own mappings
+        // anyway. Expect, not `?`: this exact address was already
+        // confirmed mapped by the caller's own `validate_write_range`
+        // call; a failure here would mean this process's own page
+        // tables changed underneath this single syscall, which nothing
+        // does.
+        let (phys_page_base, _) = unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
+            .expect("page was already validated as mapped by validate_write_range");
+        let copy_start = ptr.max(page_addr);
+        let copy_end = end.min(page_addr.saturating_add(4096));
+        let offset_in_page = copy_start - page_addr;
+        let offset_in_src = copy_start - ptr;
+        let copy_len = (copy_end - copy_start) as usize;
+        let dest = virt::phys_to_virt(phys_page_base + offset_in_page);
+        // SAFETY: `dest` is this exact page's own HHDM alias (ordinary
+        // RAM, not device MMIO), `copy_len` bytes of which were just
+        // confirmed present/writable/user-accessible by the caller;
+        // `src` is the caller's own local buffer, read-only from this
+        // point on.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(offset_in_src as usize),
+                dest.as_mut_ptr::<u8>(),
+                copy_len,
+            );
+        }
+        page_addr = page_addr.saturating_add(4096);
+    }
+}
+
 fn sys_block_read(frame: *mut TrapFrame) -> *mut TrapFrame {
     let regs = unsafe { &mut *frame };
     let cap_index = CapIndex(regs.rdi as u32);
@@ -625,33 +708,19 @@ fn sys_block_read(frame: *mut TrapFrame) -> *mut TrapFrame {
             return Err(SyscallError::InvalidArgument);
         }
         let len = sector_count * SECTOR_SIZE as u64;
-        let end = buf_ptr.checked_add(len).ok_or(SyscallError::InvalidArgument)?;
 
         let pml4_frame = scheduler::with_current_process(|process| {
             let slot = process.cap_table.lookup(cap_index, Rights::READ)?;
             match &slot.object {
                 KernelObjectRef::BlockDevice => Ok(process.address_space.pml4_frame()),
-                KernelObjectRef::Endpoint(_) => Err(SyscallError::BadCapability),
+                KernelObjectRef::Endpoint(_) | KernelObjectRef::FsRoot => {
+                    Err(SyscallError::BadCapability)
+                }
             }
         })
         .unwrap_or(Err(SyscallError::BadCapability))?;
 
-        let required =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        let mut page_addr = buf_ptr & !0xFFF;
-        while page_addr < end {
-            // SAFETY: `pml4_frame` names this same, still-live calling
-            // process's own PML4 -- this syscall handler is the only
-            // thing acting on it meanwhile (same reasoning `sys_sbrk`'s
-            // own doc comment gives for its own gap between
-            // `with_current_process` calls).
-            let (_, flags) = unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
-                .ok_or(SyscallError::InvalidArgument)?;
-            if !flags.contains(required) {
-                return Err(SyscallError::InvalidArgument);
-            }
-            page_addr = page_addr.saturating_add(4096);
-        }
+        validate_write_range(pml4_frame, buf_ptr, len)?;
 
         let mut kernel_buf = [0u8; MAX_SECTORS_PER_REQUEST * SECTOR_SIZE];
         match virtio_blk::with_device(|device| device.read_sectors(lba, &mut kernel_buf[..len as usize]))
@@ -662,51 +731,72 @@ fn sys_block_read(frame: *mut TrapFrame) -> *mut TrapFrame {
             None => return Err(SyscallError::IoError),
         }
 
-        // Copy into the caller's buffer one physical page at a time,
-        // through each page's own HHDM alias -- never a raw write
-        // through `buf_ptr` itself. That virtual address is only
-        // meaningful under the *caller's* own page tables; going
-        // through the physical alias instead means this doesn't
-        // silently depend on "SYSCALL never switches CR3" (true on this
-        // kernel today, but not a fact this function needs to lean on).
-        let mut page_addr = buf_ptr & !0xFFF;
-        while page_addr < end {
-            // SAFETY: re-translated, not reused from the validation pass
-            // above -- cheap (a page-table walk, not I/O), and nothing
-            // in between could have changed this process's own mappings
-            // anyway. Expect, not `?`: this exact address was already
-            // confirmed mapped above; a failure here would mean this
-            // process's own page tables changed underneath this single
-            // syscall, which nothing does.
-            let (phys_page_base, _) =
-                unsafe { virt::translate_in(pml4_frame, VirtAddr::new(page_addr)) }
-                    .expect("page was already validated as mapped above");
-            let copy_start = buf_ptr.max(page_addr);
-            let copy_end = end.min(page_addr.saturating_add(4096));
-            let offset_in_page = copy_start - page_addr;
-            let offset_in_kernel_buf = copy_start - buf_ptr;
-            let copy_len = (copy_end - copy_start) as usize;
-            let dest = virt::phys_to_virt(phys_page_base + offset_in_page);
-            // SAFETY: `dest` is this exact page's own HHDM alias
-            // (ordinary RAM, not device MMIO), `copy_len` bytes of which
-            // were just confirmed present/writable/user-accessible
-            // above; `kernel_buf` is this function's own local array,
-            // read-only from this point on.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    kernel_buf.as_ptr().add(offset_in_kernel_buf as usize),
-                    dest.as_mut_ptr::<u8>(),
-                    copy_len,
-                );
-            }
-            page_addr = page_addr.saturating_add(4096);
-        }
-
+        copy_into_user_range(pml4_frame, buf_ptr, &kernel_buf[..len as usize]);
         Ok(())
     })();
 
     regs.rax = match outcome {
         Ok(()) => 0,
+        Err(e) => e.as_retval() as u64,
+    };
+    frame
+}
+
+/// `SYS_FILE_READ`: reads the named file's content, from its start,
+/// into the caller's buffer, gated by a capability holding
+/// [`Rights::READ`] on an `FsRoot` object (`tarnos_abi::FS_CAP` for the
+/// real `init` process — see that constant's own doc comment for why a
+/// `BadCapability` result here just means "no filesystem this boot,"
+/// not a bug). Validates the whole destination range
+/// present/writable/user-accessible before the filesystem is ever
+/// touched, the same rigor [`sys_block_read`] already established, via
+/// the same shared [`validate_write_range`]/[`copy_into_user_range`]
+/// helpers. `name` is unpacked from `rsi`/`rdx`/`r10` via
+/// `tarnos_abi::unpack_short_name` -- the same fixed-width, pointer-free
+/// scheme `sys_spawn` already established for its own program name, not
+/// a second, pointer-based mechanism.
+///
+/// On success, `rax` holds the number of bytes actually copied
+/// (`min(file_size, buf_len)`) -- this is a length-bounded prefix read,
+/// not a general `pread` with an arbitrary offset (`fs::fat` itself has
+/// no partial-file read yet).
+fn sys_file_read(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let regs = unsafe { &mut *frame };
+    let cap_index = CapIndex(regs.rdi as u32);
+    let mut name_buf = [0u8; SHORT_NAME_MAX];
+    let name = tarnos_abi::unpack_short_name(regs.rsi, regs.rdx, regs.r10, &mut name_buf);
+    let buf_ptr = regs.r8;
+    let buf_len = regs.r9;
+
+    let outcome: Result<u64, SyscallError> = (|| {
+        let pml4_frame = scheduler::with_current_process(|process| {
+            let slot = process.cap_table.lookup(cap_index, Rights::READ)?;
+            match &slot.object {
+                KernelObjectRef::FsRoot => Ok(process.address_space.pml4_frame()),
+                KernelObjectRef::Endpoint(_) | KernelObjectRef::BlockDevice => {
+                    Err(SyscallError::BadCapability)
+                }
+            }
+        })
+        .unwrap_or(Err(SyscallError::BadCapability))?;
+
+        validate_write_range(pml4_frame, buf_ptr, buf_len)?;
+
+        let data = crate::fs::fat::with_root(|volume, device| volume.read_file(device, name))
+            .ok_or(SyscallError::BadCapability)?
+            .map_err(|e| match e {
+                crate::fs::fat::FatError::NoSuchFile => SyscallError::NoSuchFile,
+                crate::fs::fat::FatError::NameTooLong => SyscallError::InvalidArgument,
+                _ => SyscallError::IoError,
+            })?;
+
+        let copy_len = core::cmp::min(data.len() as u64, buf_len) as usize;
+        copy_into_user_range(pml4_frame, buf_ptr, &data[..copy_len]);
+        Ok(copy_len as u64)
+    })();
+
+    regs.rax = match outcome {
+        Ok(n) => n,
         Err(e) => e.as_retval() as u64,
     };
     frame

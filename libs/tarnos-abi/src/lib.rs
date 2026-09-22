@@ -65,6 +65,22 @@ pub const SYS_SBRK: u64 = 9;
 /// before anything is read from the device; an invalid range fails with
 /// [`SyscallError::InvalidArgument`] without touching the device at all.
 pub const SYS_BLOCK_READ: u64 = 10;
+/// `sys_file_read(cap, name_lo, name_hi, name_len, buf_ptr, buf_len)` —
+/// reads the named file's content, from its start, into the caller's
+/// buffer at `buf_ptr..buf_ptr + buf_len`, returning the number of
+/// bytes actually copied (`min(file_size, buf_len)` — this is a
+/// length-bounded prefix read, not a general `pread` with an arbitrary
+/// offset; `fs::fat::Fat12Volume::read_file` itself has no partial-file
+/// read yet, so the syscall can't expose more than that). `cap` must
+/// hold [`Rights::READ`] on an `FsRoot` object. `name_lo`/`name_hi`/
+/// `name_len` are the file's name packed via [`pack_short_name`] — the
+/// same fixed-width, pointer-free encoding [`SYS_SPAWN`] already
+/// established for a program name, reused here rather than adding a
+/// second scheme, since an 8.3 FAT name (at most 11 bytes) fits
+/// [`SHORT_NAME_MAX`] just as easily. The whole destination range is
+/// validated present/writable/user-accessible before the device is
+/// touched, the same rigor [`SYS_BLOCK_READ`] already established.
+pub const SYS_FILE_READ: u64 = 11;
 
 /// An index into the *calling process's own* capability table.
 ///
@@ -101,6 +117,21 @@ pub const CHILD_LINK_CAP: CapIndex = CapIndex(1);
 /// [`CHILD_LINK_CAP`] enables for `echo-child`) is that phase's own
 /// work, not done yet.
 pub const BLOCK_CAP: CapIndex = CapIndex(2);
+
+/// The fixed, well-known capability index for [`Rights::READ`] on the
+/// one FAT12 volume this kernel can mount — analogous to
+/// [`CONSOLE_CAP`]/[`CHILD_LINK_CAP`]. Seeded into the real `init`
+/// process's own capability table at boot (`main.rs`, right before
+/// spawning it) whenever a valid FAT12 volume is actually found this
+/// boot; a slot lookup against this index returning
+/// [`SyscallError::BadCapability`] means simply "no filesystem this
+/// boot" (most scenarios attach no disk at all, or Milestone 11's own
+/// raw-pattern test disks, neither of which mount as FAT12) — not a
+/// bug for a caller to treat as fatal. Unlike [`BLOCK_CAP`], this one
+/// really is wired into the real `init` process, not a throwaway test
+/// fixture — see `docs/adr/0031`'s own Consequences for why `BLOCK_CAP`
+/// itself never was.
+pub const FS_CAP: CapIndex = CapIndex(3);
 
 /// Maximum number of inline `u64` payload words carried by a `Message`.
 ///
@@ -228,25 +259,33 @@ bitflags::bitflags! {
 /// anywhere in this kernel yet, by design — see
 /// `docs/adr/0003-ipc-message-format.md`); this mirrors `Message`'s own
 /// register-packing idiom rather than introducing a new one.
-pub const PROGRAM_NAME_MAX: usize = 16;
+///
+/// Originally sized and named for [`SYS_SPAWN`]'s own program name;
+/// [`SYS_FILE_READ`] (Milestone 12) reuses the exact same packing for a
+/// file name (at most 11 bytes for an 8.3 FAT name, comfortably under
+/// this) rather than inventing a second scheme for what is really just
+/// "a short string, passed by value in two registers instead of by
+/// pointer" — hence the generic name.
+pub const SHORT_NAME_MAX: usize = 16;
 
-/// Packs a program name into `(lo, hi, len)` for `sys_spawn`'s three
-/// register arguments, little-endian, truncated (not just padded) to
-/// [`PROGRAM_NAME_MAX`] bytes — mirrors [`Message::from_str_lossy`].
-pub fn pack_program_name(name: &str) -> (u64, u64, u64) {
+/// Packs a short string (a program name for `sys_spawn`, a file name
+/// for `sys_file_read`) into `(lo, hi, len)` for three register
+/// arguments, little-endian, truncated (not just padded) to
+/// [`SHORT_NAME_MAX`] bytes — mirrors [`Message::from_str_lossy`].
+pub fn pack_short_name(name: &str) -> (u64, u64, u64) {
     let bytes = name.as_bytes();
-    let len = core::cmp::min(bytes.len(), PROGRAM_NAME_MAX);
-    let mut buf = [0u8; PROGRAM_NAME_MAX];
+    let len = core::cmp::min(bytes.len(), SHORT_NAME_MAX);
+    let mut buf = [0u8; SHORT_NAME_MAX];
     buf[..len].copy_from_slice(&bytes[..len]);
     let lo = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     (lo, hi, len as u64)
 }
 
-/// Inverse of [`pack_program_name`]: reinterprets `lo`/`hi` as `len`
+/// Inverse of [`pack_short_name`]: reinterprets `lo`/`hi` as `len`
 /// bytes of UTF-8, lossily replacing invalid sequences — mirrors
 /// [`Message::as_str_lossy`].
-pub fn unpack_program_name(lo: u64, hi: u64, len: u64, buf: &mut [u8; PROGRAM_NAME_MAX]) -> &str {
+pub fn unpack_short_name(lo: u64, hi: u64, len: u64, buf: &mut [u8; SHORT_NAME_MAX]) -> &str {
     buf[0..8].copy_from_slice(&lo.to_le_bytes());
     buf[8..16].copy_from_slice(&hi.to_le_bytes());
     let len = core::cmp::min(len as usize, buf.len());
@@ -298,6 +337,9 @@ pub enum SyscallError {
     /// `sys_block_read`'s underlying device reported failure completing
     /// an otherwise well-formed, in-range request.
     IoError = 11,
+    /// `sys_file_read`'s name did not match any file in the mounted
+    /// FAT12 volume's root directory.
+    NoSuchFile = 12,
 }
 
 impl SyscallError {
@@ -331,6 +373,7 @@ impl SyscallError {
             9 => SyscallError::PeerClosed,
             10 => SyscallError::IoOutOfRange,
             11 => SyscallError::IoError,
+            12 => SyscallError::NoSuchFile,
             _ => SyscallError::NoSuchSyscall,
         }
     }
@@ -360,35 +403,35 @@ mod proptests {
         /// no truncation, no lossy replacement, since every byte is both
         /// present and a valid UTF-8 boundary on its own.
         #[test]
-        fn pack_program_name_round_trips_short_ascii(name in "[ -~]{0,16}") {
-            let (lo, hi, len) = pack_program_name(&name);
-            let mut buf = [0u8; PROGRAM_NAME_MAX];
-            let out = unpack_program_name(lo, hi, len, &mut buf);
+        fn pack_short_name_round_trips_short_ascii(name in "[ -~]{0,16}") {
+            let (lo, hi, len) = pack_short_name(&name);
+            let mut buf = [0u8; SHORT_NAME_MAX];
+            let out = unpack_short_name(lo, hi, len, &mut buf);
             prop_assert_eq!(out, name);
         }
 
         /// Longer than the inline capacity: truncated to exactly the
-        /// first `PROGRAM_NAME_MAX` bytes — still exact (not lossy) since
+        /// first `SHORT_NAME_MAX` bytes — still exact (not lossy) since
         /// the input is pure ASCII, so any byte offset is a valid UTF-8
         /// boundary.
         #[test]
-        fn pack_program_name_truncates_long_ascii(name in "[ -~]{17,64}") {
-            let (lo, hi, len) = pack_program_name(&name);
-            let mut buf = [0u8; PROGRAM_NAME_MAX];
-            let out = unpack_program_name(lo, hi, len, &mut buf);
-            prop_assert_eq!(out, &name[..PROGRAM_NAME_MAX]);
+        fn pack_short_name_truncates_long_ascii(name in "[ -~]{17,64}") {
+            let (lo, hi, len) = pack_short_name(&name);
+            let mut buf = [0u8; SHORT_NAME_MAX];
+            let out = unpack_short_name(lo, hi, len, &mut buf);
+            prop_assert_eq!(out, &name[..SHORT_NAME_MAX]);
         }
 
         /// Arbitrary Unicode input (which can straddle a multi-byte
         /// codepoint right at the truncation boundary) must never panic —
-        /// `unpack_program_name`'s own lossy fallback is exactly the
+        /// `unpack_short_name`'s own lossy fallback is exactly the
         /// mechanism that's supposed to handle that, not a `unwrap()`
         /// this could still panic through.
         #[test]
-        fn pack_program_name_never_panics_on_arbitrary_unicode(name in ".{0,64}") {
-            let (lo, hi, len) = pack_program_name(&name);
-            let mut buf = [0u8; PROGRAM_NAME_MAX];
-            let _ = unpack_program_name(lo, hi, len, &mut buf);
+        fn pack_short_name_never_panics_on_arbitrary_unicode(name in ".{0,64}") {
+            let (lo, hi, len) = pack_short_name(&name);
+            let mut buf = [0u8; SHORT_NAME_MAX];
+            let _ = unpack_short_name(lo, hi, len, &mut buf);
         }
 
         #[test]
@@ -459,6 +502,7 @@ mod proptests {
             SyscallError::PeerClosed,
             SyscallError::IoOutOfRange,
             SyscallError::IoError,
+            SyscallError::NoSuchFile,
         ];
         for err in variants {
             assert_eq!(SyscallError::from_retval(err.as_retval()), err);

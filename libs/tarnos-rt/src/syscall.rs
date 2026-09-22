@@ -6,8 +6,9 @@
 use core::arch::asm;
 
 use tarnos_abi::{
-    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_BLOCK_READ, SYS_EXIT, SYS_GRANT,
-    SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT, SYS_YIELD,
+    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_BLOCK_READ, SYS_EXIT, SYS_FILE_READ,
+    SYS_GRANT, SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT,
+    SYS_YIELD,
 };
 
 pub fn sys_yield() {
@@ -81,7 +82,7 @@ pub fn sys_recv(cap: CapIndex) -> Result<Message, SyscallError> {
 /// process's raw `Pid` value — not yet schedulable until [`sys_grant`]
 /// (optionally) and [`sys_process_start`] release it.
 pub fn sys_spawn(name: &str) -> Result<u64, SyscallError> {
-    let (lo, hi, len) = tarnos_abi::pack_program_name(name);
+    let (lo, hi, len) = tarnos_abi::pack_short_name(name);
     let retval: i64;
     unsafe {
         asm!(
@@ -260,6 +261,38 @@ pub fn sys_block_read(
         Err(SyscallError::from_retval(retval))
     } else {
         Ok(())
+    }
+}
+
+/// Reads the named file's content, from its start, into `buf`, up to
+/// `buf.len()` bytes — a length-bounded prefix read, not a general
+/// `pread` with an arbitrary offset (see [`SYS_FILE_READ`]'s own doc
+/// comment for why). `cap` must hold [`Rights::READ`] on an `FsRoot`
+/// capability (`tarnos_abi::FS_CAP` for the real `init` process).
+/// Returns the number of bytes actually copied, which may be less than
+/// `buf.len()` if the file itself is smaller.
+pub fn sys_file_read(cap: CapIndex, name: &str, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    let (name_lo, name_hi, name_len) = tarnos_abi::pack_short_name(name);
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_FILE_READ => retval,
+            in("rdi") cap.0 as u64,
+            in("rsi") name_lo,
+            in("rdx") name_hi,
+            in("r10") name_len,
+            in("r8") buf.as_mut_ptr() as u64,
+            in("r9") buf.len() as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(retval as usize)
     }
 }
 
