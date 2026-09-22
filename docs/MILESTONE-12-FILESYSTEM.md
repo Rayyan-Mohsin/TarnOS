@@ -137,6 +137,66 @@ variant, sector/cluster geometry, and boot-sector/root-directory byte
 layout against a real image this environment actually built — not
 copied from a spec.
 
+#### Findings
+
+Built a real 1.44 MiB image (`mformat -f 1440 -C -i test.img ::`),
+copied in two known files (`HELLO.TXT`, 8 bytes, and `BIGFILE.TXT`,
+3500 bytes — chosen specifically to span more than one cluster), and
+read the raw bytes back with `od` rather than trusting `mdir`'s own
+higher-level listing. Every value below is read directly off that real
+image, not the FAT spec's own worked examples.
+
+- **Boot sector (LBA 0) BPB fields, confirmed byte-for-byte**:
+  `BytsPerSec=512`, `SecPerClus=1` (so cluster size == sector size,
+  512 bytes), `RsvdSecCnt=1` (just the boot sector), `NumFATs=2`,
+  `RootEntCnt=224`, `TotSec16=2880` (2880×512 = 1,474,560 bytes,
+  matching the image's own file size exactly), `Media=0xF0`,
+  `FATSz16=9`, extended boot signature `0x29` present, followed by a
+  real `VolID`, `VolLab` ("NO NAME"), and `FilSysType` string
+  ("FAT12   ") — confirmed present but *not* trusted as authoritative
+  (see below). Signature `55 AA` present at bytes 510-511, as required.
+- **FAT12 confirmed via the spec's own authoritative rule, not the
+  label string**: `FilSysType` is documented as informational only —
+  the real determination is cluster count. Computed from this image's
+  own geometry: root directory occupies `(224×32)/512 = 14` sectors;
+  data region starts at LBA `1 + (2×9) + 14 = 33`; total data sectors
+  `2880 - 33 = 2847`; `2847 / SecPerClus(1) = 2847` clusters. `2847 <
+  4085` → FAT12, by the spec's own threshold — happens to agree with
+  the label this time, but the parser will compute this, never read
+  the string.
+- **FAT12's packed 12-bit entry encoding confirmed against two real
+  cluster chains**, using the standard `FatOffset = N*3/2`,
+  even-N-vs-odd-N masking formula: `HELLO.TXT` (8 bytes, fits in one
+  cluster) starts at cluster 2 with `FAT[2] = 0xFFF` (end-of-chain) —
+  confirmed by reading LBA 33 directly and finding the literal bytes
+  `HELLOFAT`. `BIGFILE.TXT` (3500 bytes, needs
+  `ceil(3500/512) = 7` clusters) starts at cluster 3 with the chain
+  `3→4→5→6→7→8→9→(0xFFF)` — confirmed by reading LBA 34 directly and
+  finding the file's own known first line. `FAT[0]`/`FAT[1]` (the two
+  reserved entries) read as `0xFF0`/`0xFFF`, matching the spec exactly
+  for media byte `0xF0`.
+- **The two on-disk FAT copies are byte-identical** in a real
+  `mformat`/`mcopy`-built image (`cmp` confirmed it directly). This
+  milestone's parser will read only the first copy and never
+  cross-check or repair from the second — the same "smallest correct
+  thing, not defensive against a case that doesn't arise" choice this
+  project already made for `virtio_blk`'s own single-request driver.
+- **Root directory entry (32 bytes) layout confirmed field-by-field**
+  for both files: 11-byte space-padded name with no stored dot
+  (`"HELLO   TXT"`, `"BIGFILE TXT"`), attribute byte `0x20` (archive,
+  the default for an ordinary file), a DOS-format creation date that
+  decoded to exactly this image's own real creation date (2026-09-22,
+  confirmed by decoding the bit-packed year/month/day fields by hand),
+  `FstClusLO` matching each file's own known starting cluster (`2` and
+  `3`), and a 4-byte little-endian `FileSize` matching each file's
+  exact real size (`8` and `3500`) — no LFN (long-filename) entries
+  appeared for either name, as expected for names that already fit 8.3.
+- **Cluster-to-LBA mapping formula confirmed end to end**:
+  `LBA = DataRegionStart(33) + (cluster - 2) × SecPerClus(1)` — verified
+  by computing cluster 2's and cluster 3's own LBAs from this formula
+  and finding each file's real, known content exactly there, not
+  assumed from the arithmetic alone.
+
 ### Phase 2 — FAT parsing core
 
 Implement `fs::fat`: parse the boot sector, locate and walk the FAT
