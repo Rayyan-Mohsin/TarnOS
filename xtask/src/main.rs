@@ -52,6 +52,8 @@ fn main() {
         "test-block-fixture" => test_block_fixture(),
         "test-fat-parsing" => test_fat_parsing(),
         "test-fat-spawn" => test_fat_spawn(),
+        "test-fat-fixture" => test_fat_fixture(),
+        "test-fat-boundary" => test_fat_boundary(),
         // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
         // own doc comment.
         "test-kitchen-sink" => test_kitchen_sink(),
@@ -82,7 +84,9 @@ fn main() {
             .and_then(|_| test_block_boundary())
             .and_then(|_| test_block_fixture())
             .and_then(|_| test_fat_parsing())
-            .and_then(|_| test_fat_spawn()),
+            .and_then(|_| test_fat_spawn())
+            .and_then(|_| test_fat_fixture())
+            .and_then(|_| test_fat_boundary()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -179,6 +183,12 @@ fn print_usage() {
          \x20                    in limine.conf and confirm a real, ordinary boot's own init\n\
          \x20                    process can SYS_SPAWN it via the filesystem fallback and run\n\
          \x20                    it to completion (Milestone 12)\n\
+         \x20 test-fat-fixture      Same seeded disk, read by a real ELF userland fixture\n\
+         \x20                    (fs-child) through tarnos-rt's own syscall wrapper, not a\n\
+         \x20                    raw-asm dummy process (Milestone 12)\n\
+         \x20 test-fat-boundary     Confirm SYS_FILE_READ rejects a missing file and a missing\n\
+         \x20                    capability, rejects an unmapped buffer, and truncates (never\n\
+         \x20                    errors) a request past the file's own end (Milestone 12)\n\
          \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
          \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
          \x20                    test-spawn-boundary, test-process-lifecycle,\n\
@@ -189,8 +199,8 @@ fn print_usage() {
          \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
          \x20                    test-smp-forced-preempt, test-block-driver,\n\
          \x20                    test-block-syscall, test-block-boundary,\n\
-         \x20                    test-block-fixture, test-fat-parsing, and test-fat-spawn in\n\
-         \x20                    sequence"
+         \x20                    test-block-fixture, test-fat-parsing, test-fat-spawn,\n\
+         \x20                    test-fat-fixture, and test-fat-boundary in sequence"
     );
 }
 
@@ -311,6 +321,7 @@ const USER_CRATES: &[&str] = &[
     "exit-code-child",
     "heap-child",
     "block-child",
+    "fs-child",
 ];
 
 fn build(release: bool, kernel_features: &[&str]) -> Result<(), String> {
@@ -2157,6 +2168,150 @@ fn test_fat_spawn() -> Result<(), String> {
         "xtask: test-fat-spawn PASSED — SYS_SPAWN's new filesystem fallback found and loaded a \
          program that exists only on the FAT image (not in limine.conf's boot-module list), and \
          it ran to completion with exactly the exit code expected"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 5: builds the kernel with the `fat-fixture-test`
+/// feature (a real ELF-loaded userland fixture, `userland/fs-child`,
+/// holding a directly-seeded `FS_CAP`) against a real FAT12 disk
+/// seeded with `HELLO.TXT`/`BIGFILE.TXT`, and confirms its own real
+/// `SYS_FILE_READ` call read back content matching exactly what this
+/// scenario seeded -- the ring-3, kernel-external counterpart to
+/// Phase 2/3's own checks, matching `test-block-fixture`'s own
+/// Milestone 11 precedent.
+fn test_fat_fixture() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-fixture-test-disk.img");
+    let hello_path = root.join("build").join("fat-fixture-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-fixture-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-fixture-test"],
+        "fat-fixture-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FS_FIXTURE_FAIL") {
+        return Err(
+            "the real fs-child userland fixture's own SYS_FILE_READ call reported \
+             FS_FIXTURE_FAIL -- either the syscall itself failed or the content it read back \
+             didn't match what this scenario seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_FIXTURE_OK") {
+        return Err(
+            "expected \"FS_FIXTURE_OK\" -- fs-child never reported a result at all".to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-fixture PASSED — the real fs-child userland fixture's own \
+         SYS_FILE_READ call, through tarnos-rt's syscall wrapper, read back content matching \
+         exactly what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 5: builds the kernel with the `fat-boundary-test`
+/// feature (a dummy ring-3 process that runs four adversarial
+/// `SYS_FILE_READ` probes — a missing file, a capability index nothing
+/// was seeded into, an unmapped destination buffer, and a request whose
+/// buffer is larger than the file's own size) against a real FAT12 disk
+/// seeded with only `HELLO.TXT` (deliberately no `NOSUCH.TXT`, no
+/// `BIGFILE.TXT` -- this scenario doesn't need either), and confirms
+/// every probe behaved with exactly the outcome it should — the same
+/// "prove the boundary is enforced, not just unexercised" bar
+/// `test-block-boundary`'s own Milestone 11 precedent already holds
+/// itself to.
+fn test_fat_boundary() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-boundary-test-disk.img");
+    let hello_path = root.join("build").join("fat-boundary-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-boundary-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    // Not used by this scenario's own probes -- included only so the
+    // real `init` process spawned alongside the dummy boundary-test
+    // process (every real boot spawns it unconditionally) finds its own
+    // Phase 3 `FS_CAP` probe fully satisfied too, rather than an
+    // unrelated (harmless, but confusing) `FS_SYSCALL_FAIL` cluttering
+    // this scenario's own captured log.
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-boundary-test"],
+        "fat-boundary-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FAT_BOUNDARY_FAIL") {
+        return Err(
+            "one or more SYS_FILE_READ boundary probes didn't match its expected outcome -- see \
+             the captured log above for which one"
+                .to_string(),
+        );
+    }
+    if !log.contains("FAT_BOUNDARY_OK") {
+        return Err(
+            "expected \"FAT_BOUNDARY_OK\" -- the boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-boundary PASSED — a missing file, a missing capability, an unmapped \
+         buffer, and a read past the file's own end all behaved with exactly the outcome each \
+         should"
     );
     Ok(())
 }

@@ -450,6 +450,51 @@ already hold to.
 full existing regression suite (Milestone 11's own 26 scenarios plus
 this milestone's additions) still green.
 
+#### Findings
+
+**New fixture, mirroring `block-child` exactly.** `userland/fs-child`
+(new crate) reads `HELLO.TXT` through `tarnos_rt::syscall::sys_file_read`
+and reports `FS_FIXTURE_OK`/`FAIL`, spawned directly via
+`Process::from_elf` with `FS_CAP`/`CONSOLE_CAP` seeded straight into its
+own table -- the same "real, independently-linked ELF binary, not a
+kernel-copied function" bar `block-child` already set in Milestone 11.
+Its own boot block (`fat-fixture-test`) has to call `fs::fat::mount_root`
+itself, unlike the real boot sequence: this block ends in
+`scheduler::start()` and never reaches the tail code where `main.rs`
+normally calls it.
+
+**Boundary probes.** `milestone12_tests::fat_boundary_process` (a dummy
+process, same raw-`asm!`/`MaybeUninit`/top-level-`const` constraints as
+`milestone11_tests::block_boundary_process`) runs four `SYS_FILE_READ`
+checks against a real FAT12 disk holding only `HELLO.TXT`: a name that
+doesn't exist (`NoSuchFile`, `-12`), a capability index nothing was
+seeded into (`BadCapability`, `-2`), an unmapped destination buffer
+(`InvalidArgument`, `-8`), and a destination buffer larger than the
+file's own 46-byte size -- which must *succeed*, returning exactly
+`46`, proving the length-bounded-prefix-read semantics `SYS_FILE_READ`'s
+own doc comment describes are real, not just documented. All four
+passed on the first real boot attempt; every register/name-packing
+constant was independently verified with a short Python snippet before
+being hand-transcribed into the `asm!` blocks, given this project's own
+now-twice-recorded history of exactly this kind of register-mapping
+bug (Phase 4's `sys_wait` finding) slipping past casual inspection.
+
+**Log hygiene, not a bug:** both new scenarios' own disk images
+include `BIGFILE.TXT` even though neither probe reads it, purely so
+the real `init` process spawned alongside each dummy/fixture process
+(every real boot spawns it unconditionally) finds its own Phase 3
+`FS_CAP` probe fully satisfied too -- without it, `test-fat-boundary`'s
+own first attempt showed a harmless but confusing `FS_SYSCALL_FAIL`
+line from `init`'s unrelated check.
+
+Full regression (clean rebuild): `test-smp-sched-concurrency` hit the
+same pre-existing, environment-specific timing failure Phases 2-4
+already root-caused; every other scenario in `test-all` (26
+pre-existing plus this milestone's four) individually green. `cargo
+clippy` clean across the kernel (default and both new features),
+`tarnos-rt`, every userland crate including the new `fs-child`, and
+`xtask`.
+
 ### Phase 6 — Documentation and sign-off
 
 Write the closing ADR, confirm `test-kitchen-sink` is still correctly

@@ -24,6 +24,7 @@ mod milestone5_tests;
 mod milestone7_tests;
 mod milestone8_tests;
 mod milestone11_tests;
+mod milestone12_tests;
 mod kitchen_sink_tests;
 mod sync;
 mod task;
@@ -569,6 +570,93 @@ extern "C" fn _start() -> ! {
         if hello_ok && bigfile_ok {
             earlyprintln!("[fat-test] FAT_READ_OK");
         }
+    }
+
+    // Milestone 12, Phase 5: boots with a real ELF-loaded userland
+    // fixture (userland/fs-child, spawned directly the same way `init`
+    // itself is -- not via SYS_SPAWN) holding a directly-seeded
+    // `FS_CAP`, which issues a real `SYS_FILE_READ` through
+    // `tarnos-rt`'s own syscall wrapper and reports whether the content
+    // matches. `fs::fat::mount_root` is called explicitly here (this
+    // boot block bypasses the real boot sequence's own call to it,
+    // further down, by ending in `scheduler::start()`), so this feature
+    // requires a real FAT12 disk actually attached -- `xtask
+    // test-fat-fixture` always attaches one. Never enabled for a normal
+    // build.
+    #[cfg(feature = "fat-fixture-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        fs::fat::mount_root().expect("fat-fixture-test requires a real FAT12 disk attached");
+
+        let fixture_module = boot_modules
+            .iter()
+            .find(|module| module.cmdline() == "fs-child")
+            .expect("no boot module with cmdline \"fs-child\" (check limine.conf's module_string)");
+
+        let pid = task::scheduler::allocate_pid();
+        let mut process = task::process::Process::from_elf(pid, fixture_module.data(), None)
+            .expect("failed to load fs-child's ELF image");
+        process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        process.cap_table.insert(
+            tarnos_abi::FS_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::FsRoot,
+                rights: ipc::Rights::READ,
+            },
+        );
+        task::scheduler::spawn(process).expect("spawn failed");
+    }
+
+    // Milestone 12, Phase 5: spawns one dummy ring-3 process (`FS_CAP`
+    // and `CONSOLE_CAP` seeded directly into its own, otherwise empty,
+    // capability table) that runs four adversarial `SYS_FILE_READ`
+    // probes -- a missing file, a capability index nothing was seeded
+    // into, an unmapped destination buffer, and a request whose buffer
+    // is larger than the file's own size -- confirming each fails (or,
+    // for the last, succeeds truncated) with exactly the outcome it
+    // should. Same `mount_root` requirement as `fat-fixture-test`
+    // above. Never enabled for a normal build.
+    #[cfg(feature = "fat-boundary-test")]
+    {
+        let console_endpoint = alloc::sync::Arc::new(ipc::Endpoint::new());
+        task::executor::spawn(task::executor::Task::new(driver::uart::console_server(
+            console_endpoint.clone(),
+        )));
+
+        fs::fat::mount_root().expect("fat-boundary-test requires a real FAT12 disk attached");
+
+        let pid = task::scheduler::allocate_pid();
+        let mut process = task::process::Process::new_dummy(
+            pid,
+            milestone12_tests::fat_boundary_process,
+            None,
+        )
+        .expect("failed to create the fat-boundary-test process");
+        process.cap_table.insert(
+            tarnos_abi::CONSOLE_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::Endpoint(console_endpoint),
+                rights: ipc::Rights::SEND,
+            },
+        );
+        process.cap_table.insert(
+            tarnos_abi::FS_CAP,
+            ipc::CapabilitySlot {
+                object: ipc::KernelObjectRef::FsRoot,
+                rights: ipc::Rights::READ,
+            },
+        );
+        task::scheduler::spawn(process).expect("spawn failed");
     }
 
     // Deliberately faults instead of continuing boot — see

@@ -181,6 +181,25 @@ block-fixture-test = []
 # root-directory lookup all work end to end against a real
 # mformat/mcopy-built image. See docs/MILESTONE-12-FILESYSTEM.md.
 fat-fs-test = []
+# Milestone 12, Phase 5: boots with a real ELF-loaded userland fixture
+# (userland/fs-child, spawned directly the same way `init` itself is --
+# not via SYS_SPAWN) holding a directly-seeded FS_CAP, which issues a
+# real SYS_FILE_READ through tarnos-rt's own syscall wrapper and reports
+# whether the content matches -- the ring-3, kernel-external counterpart
+# to Phase 2/3's own checks, matching every other milestone's "the
+# fixture is the real thing, not a kernel-copied function" bar
+# (echo-child, heap-child, block-child, ...). Exercised by
+# `cargo run -p xtask -- test-fat-fixture`.
+fat-fixture-test = []
+# Milestone 12, Phase 5: spawns a dummy ring-3 process (FS_CAP and
+# CONSOLE_CAP seeded directly) that runs four adversarial SYS_FILE_READ
+# probes -- a missing file, a capability index nothing was seeded into,
+# an unmapped destination buffer, and a request whose buffer is larger
+# than the file's own size (confirming a truncated, not erroring, read)
+# -- and confirms each one behaves with exactly the outcome it should,
+# not just "some error." Exercised by
+# `cargo run -p xtask -- test-fat-boundary`.
+fat-boundary-test = []
 
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }

@@ -68,6 +68,7 @@ jobs:
         run: |
           RUSTFLAGS="-C relocation-model=static" cargo clippy \
             -p tarnos-rt -p init -p echo-child -p exit-code-child -p heap-child -p block-child \
+            -p fs-child \
             --target targets/x86_64-tarnos-user.json -Zjson-target-spec \
             -Zbuild-std=core,alloc,compiler_builtins \
             -Zbuild-std-features=compiler-builtins-mem -- -D warnings
@@ -163,3 +164,9 @@ jobs:
 
       - name: xtask test-fat-spawn (SYS_SPAWN's filesystem fallback loads a program off the FAT image)
         run: cargo run -p xtask -- test-fat-spawn
+
+      - name: xtask test-fat-fixture (real userland fixture reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-fat-fixture
+
+      - name: xtask test-fat-boundary (missing-file/missing-cap/unmapped-buffer/past-end SYS_FILE_READ rejected or truncated correctly)
+        run: cargo run -p xtask -- test-fat-boundary
