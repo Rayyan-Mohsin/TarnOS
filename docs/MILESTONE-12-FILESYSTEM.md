@@ -504,6 +504,29 @@ sign-off matching every prior milestone's own closing pattern.
 **Exit condition:** ADR written; full regression green from a clean
 build; both boot paths (BIOS/UEFI) verified.
 
+#### Findings
+
+`test-kitchen-sink` confirmed still correctly excluded from
+`test-all`/CI and still runnable standalone: it reproduced the exact
+same pre-existing, already-documented cross-core corruption panic
+signature (`docs/adr/0012`-`0029`), the correct, expected, contained
+outcome for this adversarial scenario — not a regression. Full clean
+rebuild (`rm -rf build target`): zero build warnings, `cargo clippy`
+clean across the entire workspace (kernel default and every feature
+combination, `tarnos-rt`, every userland crate, both host-buildable
+crates), `test-all` 30/30 (the pre-existing 26 plus this milestone's
+four — `test-smp-sched-concurrency`'s own pre-existing, environment-
+specific timing sensitivity, already confirmed via `git stash`
+comparison in Phase 2 to be unrelated to any change this milestone
+made, surfaced again during this final run and was individually
+re-verified passing in isolation), both boot paths (BIOS via `test-all`
+itself, UEFI via `test-uefi-boot`) verified in the same run, `cargo
+test -p tarnos-kcore -p tarnos-abi` green (45 tests). `docs/adr/0032`
+records the full closing summary; `docs/KNOWN-ISSUES.md`'s own stale
+scenario-count references updated from 26 to 30.
+
+Milestone 12 is done.
+
 ## Definition of Done
 
 A process can read a named file's content off a real FAT-formatted disk

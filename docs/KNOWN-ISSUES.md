@@ -45,10 +45,11 @@ with direct evidence, and what each round's own captures showed.
   `context_switch::resume`).
   **This is not something that fires with the same certainty on
   ordinary, light multi-core use** (a couple of cooperating processes,
-  the normal boot sequence, any of the 26 scenarios in `test-all`
+  the normal boot sequence, any of the 30 scenarios in `test-all`
   — 22 as of Milestone 10, joined by Milestone 11's four virtio-blk
-  scenarios, none of which touch scheduling/dispatch at all) —
-  every one of those passes reliably and is run in CI on every push.
+  scenarios and Milestone 12's own four FAT filesystem scenarios, none
+  of which touch scheduling/dispatch at all) — every one of those
+  passes reliably and is run in CI on every push.
   The failure rate scales with how much concurrent scheduling pressure
   is actually applied.
 - **Fails safely.** Every observed failure is a kernel panic into a
@@ -109,9 +110,10 @@ further individual data structure.
 
 - Building the filesystem, a real driver, or anything else on top of
   the process/scheduler/IPC core does not need to wait for this to be
-  fixed — every normal code path (`test-all`'s 26 scenarios, the whole
-  of Milestone 10's own audit, and Milestone 11's virtio-blk driver and
-  its own four scenarios) is unaffected. This bug requires
+  fixed — every normal code path (`test-all`'s 30 scenarios, the whole
+  of Milestone 10's own audit, Milestone 11's virtio-blk driver and its
+  own four scenarios, and Milestone 12's own FAT filesystem and its
+  four scenarios) is unaffected. This bug requires
   `test-kitchen-sink`'s own specific, deliberately adversarial stress
   shape to reproduce at any practical rate.
 - If a future scenario or real workload starts hitting this under
