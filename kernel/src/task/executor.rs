@@ -1,0 +1,187 @@
+//! Cooperative executor for kernel-space futures (driver state machines,
+//! the UART console server — `driver::uart::console_server`).
+//!
+//! Deliberately separate from `task::scheduler`'s preemptive process
+//! scheduler: kernel tasks are trusted and stackless, so they don't need
+//! forced preemption or a full register/stack context switch the way
+//! untrusted usermode code does. The two share one bridge primitive — a
+//! `Waker` that ends up here, in the ready queue — rather than one
+//! unified run-loop; see `docs/adr/0002-async-executor-and-scheduler.md`.
+//!
+//! The load-bearing rule: an interrupt handler may only ever *enqueue*
+//! (call [`Waker::wake`]) — never poll a future or run task code inline.
+//! That's what makes the ready queue a fixed-capacity array behind a
+//! [`SpinLock`](crate::sync::SpinLock) instead of anything backed by the
+//! heap: the global allocator's own lock is not interrupt-reentrant, so
+//! an interrupt handler that indirectly tried to allocate while normal
+//! code held that lock would deadlock the core against itself.
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::task::Wake;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::{Context, Poll, Waker};
+
+use crate::sync::SpinLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        TaskId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+pub struct Task {
+    id: TaskId,
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Task {
+    pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            id: TaskId::new(),
+            future: Box::pin(future),
+        }
+    }
+
+    fn poll(&mut self, context: &mut Context) -> Poll<()> {
+        self.future.as_mut().poll(context)
+    }
+}
+
+const READY_QUEUE_CAPACITY: usize = 64;
+
+/// See `tarnos_kcore::RingBuffer`'s doc comment — this is the extracted,
+/// unit-tested version of what used to be a hand-copied ring buffer
+/// here (and, until the same extraction, an almost-identical copy in
+/// `task::scheduler`).
+type ReadyQueue = tarnos_kcore::RingBuffer<TaskId, READY_QUEUE_CAPACITY>;
+
+static READY_QUEUE: SpinLock<ReadyQueue> = SpinLock::new(ReadyQueue::new());
+
+/// Set when the ready queue is full at wake time, so the woken task ID is
+/// lost. Recovered from by conservatively re-polling every live task on
+/// the next drain instead of a panic or an allocation from interrupt
+/// context — correctness over precision for an event that should be rare
+/// (64 simultaneously-ready kernel tasks) and is not fatal to recover
+/// from.
+static OVERFLOWED: AtomicBool = AtomicBool::new(false);
+
+struct TaskWaker {
+    task_id: TaskId,
+}
+
+impl TaskWaker {
+    fn new_waker(task_id: TaskId) -> Waker {
+        Waker::from(Arc::new(TaskWaker { task_id }))
+    }
+
+    fn wake_task(&self) {
+        if !READY_QUEUE.lock().push(self.task_id) {
+            OVERFLOWED.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_task();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wake_task();
+    }
+}
+
+/// A single-threaded, cooperative task executor.
+///
+/// Reached through the global [`spawn`]/[`run_ready_tasks`] functions
+/// below rather than constructed per-caller: kernel tasks (the UART echo
+/// task, the console server) need to keep making progress both from the
+/// kernel's own idle loop *and* from the scheduler's per-tick drain once
+/// real processes are running (see `task::scheduler::on_timer_tick`) — a
+/// value local to one call site couldn't be reached from the other. The
+/// lock is [`SpinLock`] (interrupt-disabling), not a plain one, because
+/// both of those call sites really do use it: the idle loop with
+/// interrupts enabled, the scheduler's tick handler with them already
+/// off.
+pub struct Executor {
+    tasks: BTreeMap<TaskId, Task>,
+    wakers: BTreeMap<TaskId, Waker>,
+}
+
+static EXECUTOR: SpinLock<Executor> = SpinLock::new(Executor::new());
+
+/// Adds a task and schedules it to run at least once.
+pub fn spawn(task: Task) {
+    let id = task.id;
+    EXECUTOR.lock().tasks.insert(id, task);
+    READY_QUEUE.lock().push(id);
+}
+
+/// Polls every currently-ready task once. Safe to call both from the
+/// kernel idle loop and from interrupt-disabled context (the scheduler's
+/// timer-tick handler) — never from *inside* an interrupt handler that
+/// hasn't already gone through `SpinLock`, since polling a future can
+/// allocate (e.g. inserting into `wakers` below) and a genuinely
+/// interrupts-enabled interrupted context is exactly what must never
+/// touch the heap allocator's lock.
+pub fn run_ready_tasks() {
+    EXECUTOR.lock().run_ready_tasks_locked();
+}
+
+impl Executor {
+    const fn new() -> Self {
+        Self {
+            tasks: BTreeMap::new(),
+            wakers: BTreeMap::new(),
+        }
+    }
+
+    fn run_ready_tasks_locked(&mut self) {
+        if OVERFLOWED.swap(false, Ordering::Relaxed) {
+            let ids: Vec<TaskId> = self.tasks.keys().copied().collect();
+            for id in ids {
+                self.poll_task(id);
+            }
+            return;
+        }
+
+        loop {
+            // Deliberately not `while let Some(id) = READY_QUEUE.lock().pop()`:
+            // a `while let` scrutinee's temporaries live for the whole loop
+            // body, which would hold this lock across `poll_task` — and
+            // polling a task can itself wake another one, re-entering this
+            // same lock and deadlocking the core against itself. Binding
+            // the popped value first lets the guard drop at the end of the
+            // `let` statement, before `poll_task` runs.
+            let id = READY_QUEUE.lock().pop();
+            match id {
+                Some(id) => self.poll_task(id),
+                None => break,
+            }
+        }
+    }
+
+    fn poll_task(&mut self, id: TaskId) {
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return; // already completed and removed
+        };
+        let waker = self
+            .wakers
+            .entry(id)
+            .or_insert_with(|| TaskWaker::new_waker(id))
+            .clone();
+        let mut context = Context::from_waker(&waker);
+        if task.poll(&mut context).is_ready() {
+            self.tasks.remove(&id);
+            self.wakers.remove(&id);
+        }
+    }
+}

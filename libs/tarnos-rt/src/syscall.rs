@@ -1,0 +1,320 @@
+//! Raw syscall wrappers. Register convention matches
+//! `arch::x86_64::syscall` on the kernel side exactly: RAX=number, args
+//! in RDI/RSI/RDX/R10/R8/R9, return in RAX (negative = error), RCX/R11
+//! always marked clobbered since the `SYSCALL` instruction itself
+//! overwrites them — no caller of these wrappers may assume otherwise.
+use core::arch::asm;
+
+use tarnos_abi::{
+    CapIndex, ExitStatus, Message, Rights, SyscallError, SYS_BLOCK_READ, SYS_EXIT, SYS_FILE_READ,
+    SYS_GRANT, SYS_KILL, SYS_PROCESS_START, SYS_RECV, SYS_SBRK, SYS_SEND, SYS_SPAWN, SYS_WAIT,
+    SYS_YIELD,
+};
+
+pub fn sys_yield() {
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") SYS_YIELD,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub fn sys_send(cap: CapIndex, message: Message) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_SEND => retval,
+            in("rdi") cap.0 as u64,
+            in("rsi") message.tag,
+            in("rdx") message.words[0],
+            in("r10") message.words[1],
+            in("r8") message.words[2],
+            in("r9") message.words[3],
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Receives a message on `cap`, blocking (at the kernel level — this
+/// call simply doesn't return until a sender shows up) if none is
+/// already waiting. `Err` only for a genuine failure: the capability
+/// doesn't grant `RECV`, doesn't exist, or (see
+/// `SyscallError::ResourceExhausted`) the endpoint's bounded wait queue
+/// was already completely full.
+pub fn sys_recv(cap: CapIndex) -> Result<Message, SyscallError> {
+    let retval: i64;
+    let tag: u64;
+    let (w0, w1, w2): (u64, u64, u64);
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_RECV => retval,
+            inout("rdi") cap.0 as u64 => tag,
+            out("rsi") w0,
+            out("rdx") w1,
+            out("r10") w2,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(Message::new(tag, [w0, w1, w2, 0]))
+    }
+}
+
+/// Creates a new, `Suspended` process from a boot-shipped program named
+/// `name`, with the caller recorded as its parent. `Ok` holds the new
+/// process's raw `Pid` value — not yet schedulable until [`sys_grant`]
+/// (optionally) and [`sys_process_start`] release it.
+pub fn sys_spawn(name: &str) -> Result<u64, SyscallError> {
+    let (lo, hi, len) = tarnos_abi::pack_short_name(name);
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_SPAWN => retval,
+            in("rdi") lo,
+            in("rsi") hi,
+            in("rdx") len,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(retval as u64)
+    }
+}
+
+/// Clones the capability at `src_cap` in the caller's own table into
+/// `dest_cap` in `target_pid`'s table, narrowed to `rights` (a subset of
+/// what the caller holds — rights can only be narrowed on grant, never
+/// amplified). Only permitted while `target_pid` is a `Suspended` child
+/// of the caller (i.e. one it just created via [`sys_spawn`] and hasn't
+/// yet released with [`sys_process_start`]).
+pub fn sys_grant(
+    target_pid: u64,
+    src_cap: CapIndex,
+    dest_cap: CapIndex,
+    rights: Rights,
+) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_GRANT => retval,
+            in("rdi") target_pid,
+            in("rsi") src_cap.0 as u64,
+            in("rdx") dest_cap.0 as u64,
+            in("r10") rights.bits() as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Releases a `Suspended` child of the caller into the scheduler's ready
+/// queue. Once started, the child is an ordinary independent process —
+/// the parent relationship confers no further authority.
+pub fn sys_process_start(target_pid: u64) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_PROCESS_START => retval,
+            in("rdi") target_pid,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Blocks until `target_pid` (a child of the caller, in any state)
+/// terminates, then returns how. Non-blocking if `target_pid` already
+/// terminated before this call.
+///
+/// `rdi`/`rsi` on return, not `rsi`/`rdx`: the kernel side
+/// (`arch::x86_64::syscall::sys_wait`'s doc comment, and both places
+/// that actually write these -- `task::scheduler::wait_for_child`'s
+/// `AlreadyDone` branch and `apply_wake_result`'s `WaitCompleted` arm)
+/// always writes `kind` into `rdi` and `code` into `rsi`; `rdx` is never
+/// touched at all. A real, previously-latent bug here (this exact
+/// wrapper read `kind`/`code` from `rsi`/`rdx` instead) went unnoticed
+/// since Milestone 4: no compiled userland binary ever called this safe
+/// wrapper before Milestone 12's own `userland/init` did -- every
+/// existing `SYS_WAIT` test used a raw-`asm!` dummy process reading the
+/// registers directly, correctly, bypassing this function entirely.
+pub fn sys_wait(target_pid: u64) -> Result<ExitStatus, SyscallError> {
+    let retval: i64;
+    let (kind, code): (u64, u64);
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_WAIT => retval,
+            inout("rdi") target_pid => kind,
+            out("rsi") code,
+            out("rdx") _,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(ExitStatus::from_regs(kind, code))
+    }
+}
+
+/// Immediately terminates `target_pid`, a child of the caller,
+/// regardless of its current state.
+pub fn sys_kill(target_pid: u64) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_KILL => retval,
+            in("rdi") target_pid,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Grows the caller's heap by `increment` bytes (must be `>= 0` — see
+/// `SyscallError::InvalidArgument`) and returns the previous break
+/// address. `increment == 0` is a side-effect-free query of the current
+/// break. Used by [`crate::heap`]'s global allocator; most callers
+/// should just use `alloc::*` types instead of calling this directly.
+pub fn sys_sbrk(increment: i64) -> Result<u64, SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_SBRK => retval,
+            in("rdi") increment,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(retval as u64)
+    }
+}
+
+/// Reads `sector_count` whole 512-byte sectors starting at `lba` from
+/// the block device named by `cap` (must hold [`Rights::READ`]) into
+/// `buf`. `buf.len()` must equal `sector_count * 512` exactly — this
+/// wrapper does not itself validate that (the kernel does, returning
+/// [`SyscallError::InvalidArgument`] for a mismatched or misshapen
+/// request); it exists to spare a caller the raw register-packing
+/// `asm!` block, not to duplicate the kernel's own checks.
+pub fn sys_block_read(
+    cap: CapIndex,
+    lba: u64,
+    buf: &mut [u8],
+    sector_count: u64,
+) -> Result<(), SyscallError> {
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_BLOCK_READ => retval,
+            in("rdi") cap.0 as u64,
+            in("rsi") lba,
+            in("rdx") buf.as_mut_ptr() as u64,
+            in("r10") sector_count,
+            in("r8") 0u64,
+            in("r9") 0u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(())
+    }
+}
+
+/// Reads the named file's content, from its start, into `buf`, up to
+/// `buf.len()` bytes — a length-bounded prefix read, not a general
+/// `pread` with an arbitrary offset (see [`SYS_FILE_READ`]'s own doc
+/// comment for why). `cap` must hold [`Rights::READ`] on an `FsRoot`
+/// capability (`tarnos_abi::FS_CAP` for the real `init` process).
+/// Returns the number of bytes actually copied, which may be less than
+/// `buf.len()` if the file itself is smaller.
+pub fn sys_file_read(cap: CapIndex, name: &str, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    let (name_lo, name_hi, name_len) = tarnos_abi::pack_short_name(name);
+    let retval: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") SYS_FILE_READ => retval,
+            in("rdi") cap.0 as u64,
+            in("rsi") name_lo,
+            in("rdx") name_hi,
+            in("r10") name_len,
+            in("r8") buf.as_mut_ptr() as u64,
+            in("r9") buf.len() as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    if retval < 0 {
+        Err(SyscallError::from_retval(retval))
+    } else {
+        Ok(retval as usize)
+    }
+}
+
+pub fn sys_exit(code: i32) -> ! {
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") SYS_EXIT,
+            in("rdi") code as u64,
+            options(noreturn)
+        );
+    }
+}

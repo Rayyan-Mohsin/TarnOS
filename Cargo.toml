@@ -3,9 +3,15 @@ resolver = "2"
 members = [
     "xtask",
     "libs/tarnos-abi",
+    "libs/tarnos-kcore",
     "libs/tarnos-rt",
     "kernel",
     "userland/init",
+    "userland/echo-child",
+    "userland/exit-code-child",
+    "userland/heap-child",
+    "userland/block-child",
+    "userland/fs-child",
 ]
 
 # The kernel and userland binaries build against custom no_std target JSONs

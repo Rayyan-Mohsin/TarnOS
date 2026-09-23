@@ -1,0 +1,15 @@
+[package]
+name = "heap-child"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "heap-child"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+tarnos-abi = { path = "../../libs/tarnos-abi" }
+tarnos-rt = { path = "../../libs/tarnos-rt" }

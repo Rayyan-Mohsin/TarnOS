@@ -17,10 +17,76 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[1.min(args.len())..];
 
+    let features = parse_features(rest);
+    let feature_refs: Vec<&str> = features.iter().map(String::as_str).collect();
+
     let result = match cmd {
-        "build" => build(false),
-        "iso" => iso(false),
-        "run" => run(rest),
+        "build" => build(false, &feature_refs),
+        "iso" => iso(false, &feature_refs),
+        "run" => run(rest, &feature_refs),
+        "test-fault" => test_fault(),
+        "test-fault-isolation" => test_fault_isolation(),
+        "test-blocking-ipc" => test_blocking_ipc(),
+        "test-double-send" => test_double_send(),
+        "test-uefi-boot" => test_uefi_boot(),
+        "test-spawn-ipc" => test_spawn_ipc(),
+        "test-spawn-boundary" => test_spawn_boundary(),
+        "test-process-lifecycle" => test_process_lifecycle(),
+        "test-wait-exit-code" => test_wait_exit_code(),
+        "test-kill-boundary" => test_kill_boundary(),
+        "test-heap-growth" => test_heap_growth(),
+        "test-sbrk-boundary" => test_sbrk_boundary(),
+        "test-smp-boot" => test_smp_boot(),
+        "test-smp-degraded" => test_smp_degraded(),
+        "test-smp-ipi" => test_smp_ipi(),
+        "test-smp-regression" => test_smp_regression(),
+        "test-smp-sched-concurrency" => test_smp_sched_concurrency(),
+        "test-smp-wait-cross-core" => test_smp_wait_cross_core(),
+        "test-smp-kill-cross-core" => test_smp_kill_cross_core(),
+        "test-smp-sched-stress" => test_smp_sched_stress(),
+        "test-smp-send-cross-core" => test_smp_send_cross_core(),
+        "test-smp-forced-preempt" => test_smp_forced_preempt(),
+        "test-block-driver" => test_block_driver(),
+        "test-block-syscall" => test_block_syscall(),
+        "test-block-boundary" => test_block_boundary(),
+        "test-block-fixture" => test_block_fixture(),
+        "test-fat-parsing" => test_fat_parsing(),
+        "test-fat-spawn" => test_fat_spawn(),
+        "test-fat-fixture" => test_fat_fixture(),
+        "test-fat-boundary" => test_fat_boundary(),
+        // Deliberately not part of `test-all` -- see `test_kitchen_sink`'s
+        // own doc comment.
+        "test-kitchen-sink" => test_kitchen_sink(),
+        "test-all" => test_fault()
+            .and_then(|_| test_fault_isolation())
+            .and_then(|_| test_blocking_ipc())
+            .and_then(|_| test_double_send())
+            .and_then(|_| test_uefi_boot())
+            .and_then(|_| test_spawn_ipc())
+            .and_then(|_| test_spawn_boundary())
+            .and_then(|_| test_process_lifecycle())
+            .and_then(|_| test_wait_exit_code())
+            .and_then(|_| test_kill_boundary())
+            .and_then(|_| test_heap_growth())
+            .and_then(|_| test_sbrk_boundary())
+            .and_then(|_| test_smp_boot())
+            .and_then(|_| test_smp_degraded())
+            .and_then(|_| test_smp_ipi())
+            .and_then(|_| test_smp_regression())
+            .and_then(|_| test_smp_sched_concurrency())
+            .and_then(|_| test_smp_wait_cross_core())
+            .and_then(|_| test_smp_kill_cross_core())
+            .and_then(|_| test_smp_sched_stress())
+            .and_then(|_| test_smp_send_cross_core())
+            .and_then(|_| test_smp_forced_preempt())
+            .and_then(|_| test_block_driver())
+            .and_then(|_| test_block_syscall())
+            .and_then(|_| test_block_boundary())
+            .and_then(|_| test_block_fixture())
+            .and_then(|_| test_fat_parsing())
+            .and_then(|_| test_fat_spawn())
+            .and_then(|_| test_fat_fixture())
+            .and_then(|_| test_fat_boundary()),
         _ => {
             print_usage();
             std::process::exit(if cmd.is_empty() { 0 } else { 1 });
@@ -38,12 +104,134 @@ fn print_usage() {
         "TarnOS build automation\n\n\
          Usage: cargo run -p xtask -- <command> [flags]\n\n\
          Commands:\n\
-         \x20 build            Build the kernel and init ELF binaries\n\
-         \x20 iso              Build (if needed) and assemble build/tarnos.iso\n\
+         \x20 build [flags]    Build the kernel and init ELF binaries\n\
+         \x20 iso [flags]      Build (if needed) and assemble build/tarnos.iso\n\
          \x20 run [flags]      Build the ISO (if needed) and boot it in QEMU\n\
          \x20                    --uefi    boot via OVMF instead of legacy BIOS\n\
-         \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot"
+         \x20                    --debug   add -d int,guest_errors -D build/qemu.log -no-reboot\n\
+         \x20                    --features a,b   enable kernel Cargo features (build/iso/run\n\
+         \x20                    all accept this -- e.g. `build --features kitchen-sink-test`\n\
+         \x20                    for a manual stress batch outside any one test-* scenario)\n\
+         \x20 test-fault       Build with a deliberate page fault injected at boot and\n\
+         \x20                    confirm it produces a clean panic + halt, not a triple fault\n\
+         \x20 test-fault-isolation  Confirm a faulting ring-3 process is killed alone,\n\
+         \x20                    not the kernel, and a second process still runs afterward\n\
+         \x20 test-blocking-ipc     Confirm a process can genuinely block on sys_send with\n\
+         \x20                    no receiver ready, then resume once one arrives\n\
+         \x20 test-double-send      Confirm two senders with no receiver both queue\n\
+         \x20                    instead of panicking (the historical bug this milestone fixed)\n\
+         \x20 test-uefi-boot        Confirm the normal boot sequence also completes\n\
+         \x20                    end to end via UEFI/OVMF, not just BIOS\n\
+         \x20 test-spawn-ipc        Confirm init can dynamically spawn a second process,\n\
+         \x20                    grant it a capability, release it, and complete a real IPC\n\
+         \x20                    round trip with it -- not boot-choreographed\n\
+         \x20 test-spawn-boundary   Confirm SYS_GRANT/SYS_PROCESS_START reject a non-child\n\
+         \x20                    target and a rights-amplifying grant, while a legitimate\n\
+         \x20                    grant+start still succeeds\n\
+         \x20 test-process-lifecycle  Confirm repeated spawn+kill cycles well beyond\n\
+         \x20                    MAX_PROCESSES never exhaust the process table or leak memory\n\
+         \x20 test-wait-exit-code    Confirm SYS_WAIT genuinely blocks on a not-yet-run\n\
+         \x20                    child and reports the exit code it actually passed to sys_exit\n\
+         \x20 test-kill-boundary     Confirm SYS_KILL rejects a non-child target, while\n\
+         \x20                    legitimate kills against a Suspended and a Blocked child succeed\n\
+         \x20 test-heap-growth      Confirm heap-child's sys_sbrk-backed Vec<u64> allocation\n\
+         \x20                    survives several heap growths and exits cleanly\n\
+         \x20 test-sbrk-boundary     Confirm SYS_SBRK rejects an absurd increment and a\n\
+         \x20                    negative one, while a valid grow and a zero-increment query\n\
+         \x20                    behave correctly\n\
+         \x20 test-smp-boot         Confirm every CPU core Limine reports boots, reaches\n\
+         \x20                    ready, and genuinely executes concurrently (-smp 4)\n\
+         \x20 test-smp-degraded     The same check as test-smp-boot, at -smp 2 instead of 4,\n\
+         \x20                    proving bring-up isn't hardcoded to a specific core count\n\
+         \x20 test-smp-ipi          Confirm a targeted IPI reaches exactly one core and\n\
+         \x20                    nothing else, and a send to a nonexistent target is safe\n\
+         \x20 test-smp-regression   Confirm fault isolation and blocking IPC still behave\n\
+         \x20                    identically with other cores booted and idling (-smp 4)\n\
+         \x20 test-smp-sched-concurrency  Confirm two real processes genuinely run\n\
+         \x20                    concurrently on two different cores (-smp 4)\n\
+         \x20 test-smp-wait-cross-core    Confirm SYS_WAIT's block-wake-and-report path\n\
+         \x20                    still works when the child runs on a different core (-smp 4)\n\
+         \x20 test-smp-kill-cross-core    Confirm SYS_KILL can evict a process genuinely\n\
+         \x20                    running on another core, and the machine stays healthy after\n\
+         \x20 test-smp-sched-stress       Stress-test rapid spawn+kill+wait cycles across\n\
+         \x20                    cores for the idle-park lost-wakeup hazard (-smp 4)\n\
+         \x20 test-smp-send-cross-core    Confirm a cross-core SYS_SEND correctly wakes a\n\
+         \x20                    receiver blocked in SYS_RECV on a different core (-smp 4)\n\
+         \x20 test-smp-forced-preempt     Confirm a process making zero syscalls is still\n\
+         \x20                    preempted by its own core's LAPIC timer, an ordinary process\n\
+         \x20                    still runs alongside it, and SYS_KILL still evicts it (-smp 4)\n\
+         \x20 test-kitchen-sink            IPC, heap growth, process lifecycle, and\n\
+         \x20                    cross-core kill running concurrently (-smp 4) -- reproduces\n\
+         \x20                    a known, open cross-core corruption bug (docs/adr/0012-0029),\n\
+         \x20                    so deliberately not part of test-all/CI\n\
+         \x20 test-block-driver     Attach a disk seeded with known content, boot with the\n\
+         \x20                    virtio-blk driver, and confirm a real polled sector read\n\
+         \x20                    matches exactly what was seeded (Milestone 11)\n\
+         \x20 test-block-syscall    Same seeded disk, but read through a real ring-3\n\
+         \x20                    process's own SYS_BLOCK_READ call instead of calling the\n\
+         \x20                    driver directly from kernel context (Milestone 11)\n\
+         \x20 test-block-boundary   Confirm SYS_BLOCK_READ rejects an out-of-range LBA, a\n\
+         \x20                    missing capability, a zero sector count, and an unmapped\n\
+         \x20                    buffer -- each with the exact error it should (Milestone 11)\n\
+         \x20 test-block-fixture    Same seeded disk, read by a real ELF userland fixture\n\
+         \x20                    (block-child) through tarnos-rt's own syscall wrapper,\n\
+         \x20                    not a raw-asm dummy process (Milestone 11)\n\
+         \x20 test-fat-parsing      Attach a real mformat/mcopy-built FAT12 disk and confirm\n\
+         \x20                    fs::fat mounts it, walks a real cluster chain, and reads a\n\
+         \x20                    known file's exact content -- no syscall yet (Milestone 12)\n\
+         \x20 test-fat-spawn        Attach a FAT12 disk holding a program that exists nowhere\n\
+         \x20                    in limine.conf and confirm a real, ordinary boot's own init\n\
+         \x20                    process can SYS_SPAWN it via the filesystem fallback and run\n\
+         \x20                    it to completion (Milestone 12)\n\
+         \x20 test-fat-fixture      Same seeded disk, read by a real ELF userland fixture\n\
+         \x20                    (fs-child) through tarnos-rt's own syscall wrapper, not a\n\
+         \x20                    raw-asm dummy process (Milestone 12)\n\
+         \x20 test-fat-boundary     Confirm SYS_FILE_READ rejects a missing file and a missing\n\
+         \x20                    capability, rejects an unmapped buffer, and truncates (never\n\
+         \x20                    errors) a request past the file's own end (Milestone 12)\n\
+         \x20 test-all         Run test-fault, test-fault-isolation, test-blocking-ipc,\n\
+         \x20                    test-double-send, test-uefi-boot, test-spawn-ipc,\n\
+         \x20                    test-spawn-boundary, test-process-lifecycle,\n\
+         \x20                    test-wait-exit-code, test-kill-boundary, test-heap-growth,\n\
+         \x20                    test-sbrk-boundary, test-smp-boot, test-smp-degraded,\n\
+         \x20                    test-smp-ipi, test-smp-regression, test-smp-sched-concurrency,\n\
+         \x20                    test-smp-wait-cross-core, test-smp-kill-cross-core,\n\
+         \x20                    test-smp-sched-stress, test-smp-send-cross-core,\n\
+         \x20                    test-smp-forced-preempt, test-block-driver,\n\
+         \x20                    test-block-syscall, test-block-boundary,\n\
+         \x20                    test-block-fixture, test-fat-parsing, test-fat-spawn,\n\
+         \x20                    test-fat-fixture, and test-fat-boundary in sequence"
     );
+}
+
+/// Parses a `--features a,b,c` flag out of `build`/`iso`/`run`'s own raw
+/// argument list (comma-separated, same convention as `cargo build
+/// --features`). Was missing entirely until this milestone's own
+/// cross-core corruption investigation silently ran several stress
+/// batches against a stale, unrelated ISO for an entire debugging
+/// session: `cargo run -p xtask -- build --features kitchen-sink-test`
+/// looked like it worked (no error, "xtask: build OK") but `build`
+/// never parsed `rest` at all and never touched `build/tarnos.iso` in
+/// the first place, so the flag was silently a no-op both ways. Every
+/// other feature-gated scenario already goes through a dedicated
+/// `test-*` function that passes its own fixed feature list directly in
+/// Rust (`run_scenario(&["kitchen-sink-test"], ...)`); this only matters
+/// for driving `build`/`iso`/`run` manually with an arbitrary feature
+/// set from the command line, e.g. for a repeated manual stress batch
+/// outside any one fixed `test-*` scenario's own assertions.
+fn parse_features(args: &[String]) -> Vec<String> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--features" {
+            return args
+                .get(i + 1)
+                .map(|list| list.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+        }
+        if let Some(list) = arg.strip_prefix("--features=") {
+            return list.split(',').map(str::to_string).collect();
+        }
+    }
+    Vec::new()
 }
 
 fn workspace_root() -> PathBuf {
@@ -72,7 +260,7 @@ fn run_cmd(cmd: &mut Command) -> Result<(), String> {
 /// it. It defaults to a position-independent executable, which a fixed-
 /// address higher-half kernel doesn't want, hence the explicit
 /// `relocation-model=static` override.
-fn build_kernel(root: &Path, release: bool) -> Result<(), String> {
+fn build_kernel(root: &Path, release: bool, extra_features: &[&str]) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root)
         .env("RUSTFLAGS", "-C relocation-model=static")
@@ -88,15 +276,25 @@ fn build_kernel(root: &Path, release: bool) -> Result<(), String> {
     if release {
         cmd.arg("--release");
     }
+    if !extra_features.is_empty() {
+        cmd.args(["--features", &extra_features.join(",")]);
+    }
     run_cmd(&mut cmd)
 }
 
-fn build_init(root: &Path, release: bool) -> Result<(), String> {
+/// Builds one userland crate against the custom `x86_64-tarnos-user`
+/// target. `package` is the Cargo package name (e.g. `"init"`,
+/// `"echo-child"`) — every userland binary built this way ends up at
+/// the same `target/x86_64-tarnos-user/<profile>/<package>` path
+/// `user_elf_path` computes, since Cargo names the output after the
+/// `[[bin]]` target, which every userland `Cargo.toml` here sets equal
+/// to its package name.
+fn build_user_crate(root: &Path, release: bool, package: &str) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root).args([
         "build",
         "-p",
-        "init",
+        package,
         "--target",
         USER_TARGET_JSON,
         "-Zjson-target-spec",
@@ -109,10 +307,29 @@ fn build_init(root: &Path, release: bool) -> Result<(), String> {
     run_cmd(&mut cmd)
 }
 
-fn build(release: bool) -> Result<(), String> {
+/// Every userland binary the ISO ships — `init` (boot-loaded directly)
+/// plus every program `SYS_SPAWN` can create a process from by name
+/// (see `task::process::init_spawnable_modules`). Building and shipping
+/// all of them unconditionally, for every scenario, keeps `limine.conf`
+/// (which declares a fixed set of boot modules) valid regardless of
+/// which kernel feature a given `xtask` command builds with — none of
+/// the existing milestone-2 test scenarios exercise spawning, but they
+/// still boot the same `limine.conf`.
+const USER_CRATES: &[&str] = &[
+    "init",
+    "echo-child",
+    "exit-code-child",
+    "heap-child",
+    "block-child",
+    "fs-child",
+];
+
+fn build(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
-    build_kernel(&root, release)?;
-    build_init(&root, release)?;
+    build_kernel(&root, release, kernel_features)?;
+    for package in USER_CRATES {
+        build_user_crate(&root, release, package)?;
+    }
     println!("xtask: build OK");
     Ok(())
 }
@@ -132,11 +349,11 @@ fn kernel_elf_path(root: &Path, release: bool) -> PathBuf {
         .join("tarnos-kernel")
 }
 
-fn init_elf_path(root: &Path, release: bool) -> PathBuf {
+fn user_elf_path(root: &Path, release: bool, package: &str) -> PathBuf {
     root.join("target")
         .join("x86_64-tarnos-user")
         .join(profile_dir_name(release))
-        .join("init")
+        .join(package)
 }
 
 /// Ensures a working Limine checkout (with prebuilt binaries and the built
@@ -173,10 +390,12 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
     Ok(limine_dir)
 }
 
-fn iso(release: bool) -> Result<(), String> {
+fn iso(release: bool, kernel_features: &[&str]) -> Result<(), String> {
     let root = workspace_root();
-    build_kernel(&root, release)?;
-    build_init(&root, release)?;
+    build_kernel(&root, release, kernel_features)?;
+    for package in USER_CRATES {
+        build_user_crate(&root, release, package)?;
+    }
     let limine_dir = ensure_limine(&root)?;
 
     let iso_root = root.join("build").join("iso_root");
@@ -192,7 +411,12 @@ fn iso(release: bool) -> Result<(), String> {
     };
 
     copy(&kernel_elf_path(&root, release), &boot_dir.join("kernel"))?;
-    copy(&init_elf_path(&root, release), &boot_dir.join("init"))?;
+    for package in USER_CRATES {
+        copy(
+            &user_elf_path(&root, release, package),
+            &boot_dir.join(package),
+        )?;
+    }
     copy(&root.join("limine.conf"), &boot_dir.join("limine.conf"))?;
     copy(
         &limine_dir.join("limine-bios.sys"),
@@ -245,25 +469,32 @@ fn iso(release: bool) -> Result<(), String> {
 }
 
 fn find_ovmf_code() -> Option<PathBuf> {
-    ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/ovmf/OVMF.fd"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/ovmf/OVMF.fd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
 fn find_ovmf_vars_template() -> Option<PathBuf> {
-    ["/usr/share/OVMF/OVMF_VARS_4M.fd"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
-fn run(flags: &[String]) -> Result<(), String> {
+fn run(flags: &[String], kernel_features: &[&str]) -> Result<(), String> {
     let uefi = flags.iter().any(|f| f == "--uefi");
     let debug = flags.iter().any(|f| f == "--debug");
 
     let root = workspace_root();
-    iso(false)?;
+    iso(false, kernel_features)?;
 
     let iso_path = root.join("build").join("tarnos.iso");
     let mut cmd = Command::new("qemu-system-x86_64");
@@ -313,4 +544,1774 @@ fn run(flags: &[String]) -> Result<(), String> {
 
     println!("xtask: launching QEMU ({})", if uefi { "UEFI" } else { "BIOS" });
     run_cmd(&mut cmd)
+}
+
+/// Builds the kernel with `kernel_features` enabled, boots it in QEMU
+/// (BIOS, unless `uefi` is set) with serial output redirected to
+/// `<build>/<log_name>`, waits a fixed window (these test scenarios
+/// have no way to signal "done" on their own — most end in a deliberate
+/// halt loop — so this kills QEMU after giving it time to reach that
+/// point rather than waiting for it to exit), and returns the captured
+/// log. Shared by every milestone-2 integration test scenario below;
+/// each one builds with its own feature and applies its own assertions
+/// to the returned log.
+/// `smp` is explicit on every call, never a hidden QEMU default (`1`
+/// today): every pre-SMP-milestone scenario passes `1`, which is the
+/// cheapest possible regression check that this milestone's changes
+/// don't perturb single-core behavior at all, and the new `test-smp-*`
+/// scenarios pass a real core count to actually exercise multi-core boot.
+fn run_scenario(
+    kernel_features: &[&str],
+    log_name: &str,
+    timeout_secs: u64,
+    uefi: bool,
+    smp: u32,
+) -> Result<String, String> {
+    run_scenario_ext(kernel_features, log_name, timeout_secs, uefi, smp, &[])
+}
+
+/// Like [`run_scenario`], but with additional raw QEMU arguments appended
+/// to the invocation — for a scenario that needs to attach hardware
+/// `run_scenario`'s own fixed flag set doesn't cover (Milestone 11's
+/// `-drive`/`-device virtio-blk-pci-non-transitional` disk attachment,
+/// e.g.). Kept as a separate function rather than adding a mandatory
+/// parameter to `run_scenario` itself so every one of that function's
+/// many existing call sites stays untouched.
+fn run_scenario_ext(
+    kernel_features: &[&str],
+    log_name: &str,
+    timeout_secs: u64,
+    uefi: bool,
+    smp: u32,
+    extra_qemu_args: &[&str],
+) -> Result<String, String> {
+    let root = workspace_root();
+    iso(false, kernel_features)?;
+
+    let iso_path = root.join("build").join("tarnos.iso");
+    let log_path = root.join("build").join(log_name);
+    let _ = std::fs::remove_file(&log_path);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.current_dir(&root).args([
+        "-M",
+        "q35",
+        "-m",
+        "512M",
+        "-smp",
+        &smp.to_string(),
+        "-serial",
+        &format!("file:{}", log_path.display()),
+        "-display",
+        "none",
+        "-cdrom",
+        iso_path.to_str().unwrap(),
+        "-boot",
+        "d",
+        "-no-reboot",
+        "-no-shutdown",
+    ]);
+    cmd.args(extra_qemu_args);
+
+    if uefi {
+        let code = find_ovmf_code()
+            .ok_or("OVMF firmware not found (looked for /usr/share/OVMF/OVMF_CODE_4M.fd)")?;
+        let vars_template = find_ovmf_vars_template()
+            .ok_or("OVMF vars template not found (looked for /usr/share/OVMF/OVMF_VARS_4M.fd)")?;
+        // A name distinct from `run`'s own `OVMF_VARS.fd` copy, so a
+        // `test-uefi-boot` run doesn't race a concurrent `run --uefi`
+        // over the same file.
+        let vars_copy = root.join("build").join("OVMF_VARS_test.fd");
+        std::fs::copy(&vars_template, &vars_copy).map_err(|e| e.to_string())?;
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", vars_copy.display()),
+        ]);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
+
+    std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log = std::fs::read_to_string(&log_path)
+        .map_err(|e| format!("reading {}: {e}", log_path.display()))?;
+    println!("xtask: captured serial output:\n{log}");
+    Ok(log)
+}
+
+/// Extracts every `free_frames=<N>` value the kernel logged, in the
+/// order they appear — `task::scheduler::switch_to_next_or_halt` prints
+/// one at every halt, and `process-lifecycle-test`'s boot block prints
+/// a matching one right before the scheduler starts, giving
+/// `test_process_lifecycle` a before/after pair to compare.
+fn extract_free_frame_counts(log: &str) -> Vec<u64> {
+    log.lines()
+        .filter_map(|line| line.split("free_frames=").nth(1))
+        .filter_map(|rest| rest.trim().parse::<u64>().ok())
+        .collect()
+}
+
+/// Confirms the guest booted exactly once — the guest resetting instead
+/// of cleanly halting (a triple fault, or a panic loop under
+/// `-no-reboot` somehow not actually halting) would show up as a second
+/// "TarnOS booting" line.
+fn assert_booted_once(log: &str) -> Result<(), String> {
+    let boot_lines = log.matches("TarnOS booting").count();
+    if boot_lines != 1 {
+        return Err(format!(
+            "expected exactly one boot (\"TarnOS booting\" once); saw {boot_lines} — \
+             looks like the guest reset instead of halting"
+        ));
+    }
+    Ok(())
+}
+
+/// Boots the normal (no test feature) kernel via UEFI/OVMF and confirms
+/// it reaches the same end-to-end result as a BIOS boot: init's greeting
+/// arriving over the full syscall/capability/IPC path. `xtask run --uefi`
+/// already exercises this manually, but with no automated pass/fail
+/// signal and no fixed timeout (it would hang a CI job forever once the
+/// kernel reaches its terminal halt) — this is the permanent, CI-safe
+/// form of that same check, added after this milestone's earlier
+/// (BIOS-only) test-fault regression test shipped without a UEFI
+/// counterpart, even though an intermittent UEFI-only boot hang was one
+/// of the very issues this milestone's hardening work fixed.
+fn test_uefi_boot() -> Result<(), String> {
+    let log = run_scenario(&[], "uefi-boot-test.log", 8, true, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic on a normal UEFI boot".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to arrive over UEFI, same as it does over BIOS"
+                .to_string(),
+        );
+    }
+    println!("xtask: test-uefi-boot PASSED — normal boot completed end to end via UEFI/OVMF");
+    Ok(())
+}
+
+/// Builds the kernel with a deliberate page-fault-at-boot injected (the
+/// `fault-injection-test` feature — see `kernel/src/main.rs`), boots it,
+/// and checks the serial output for a clean panic + halt rather than a
+/// triple fault (which under QEMU with `-no-reboot` would otherwise show
+/// up as the guest resetting instead of printing a diagnostic). This is
+/// the permanent, repeatable form of the same check done by hand back
+/// when the double-fault IST stack was first wired up. Reaches this
+/// fault while still in ring 0 (early boot code), so it must still
+/// panic the whole kernel — see `test_fault_isolation` for the
+/// ring-3 (process-only) case.
+fn test_fault() -> Result<(), String> {
+    let log = run_scenario(&["fault-injection-test"], "fault-test.log", 5, false, 1)?;
+    assert_booted_once(&log)?;
+    if !log.contains("[KERNEL PANIC]") || !log.contains("page fault") {
+        return Err(
+            "expected a \"[KERNEL PANIC] ... page fault ...\" line in the serial output, \
+             but didn't find one"
+                .to_string(),
+        );
+    }
+    println!("xtask: test-fault PASSED — one clean panic + halt, no triple fault / reboot loop");
+    Ok(())
+}
+
+/// Milestone 2 workstream B: builds the kernel with two dummy ring-3
+/// processes (the `fault-isolation-test` feature) — one that
+/// dereferences a bad pointer, one that exits cleanly — and confirms
+/// the fault kills only the offending process: no kernel panic, and the
+/// survivor still reaches the scheduler's normal "last process exited"
+/// halt afterward. This is what distinguishes real process isolation
+/// from merely not crashing: the machine keeps doing useful work after
+/// a process misbehaves.
+fn test_fault_isolation() -> Result<(), String> {
+    let log = run_scenario(&["fault-isolation-test"], "fault-isolation-test.log", 5, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a ring-3 fault should kill only the offending \
+             process, not the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("[fault]") || !log.contains("killed") {
+        return Err(
+            "expected a \"[fault] pid ... killed: ...\" line showing the faulting process \
+             was terminated"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err(
+            "expected the survivor process to still reach a clean exit after the other \
+             process faulted"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fault-isolation PASSED — faulting process killed, survivor still ran \
+         to completion, no kernel panic"
+    );
+    Ok(())
+}
+
+/// Milestone 2 workstream C: builds the kernel with the console server
+/// deliberately left unpolled before init runs (the `blocking-ipc-test`
+/// feature), forcing init's first `sys_send` to find nobody receiving
+/// and genuinely block, rather than the normal boot's always-primed-
+/// receiver ordering. Confirms init's message still arrives once the
+/// scheduler gives the console server its first chance to run — proving
+/// a process can actually suspend and later resume, not merely that the
+/// demo's usual ordering happens to avoid ever needing to.
+fn test_blocking_ipc() -> Result<(), String> {
+    let log = run_scenario(&["blocking-ipc-test"], "blocking-ipc-test.log", 8, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to still arrive after genuinely blocking on sys_send"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-blocking-ipc PASSED — init's send blocked with no receiver ready and \
+         still delivered once the console server was polled"
+    );
+    Ok(())
+}
+
+/// Milestone 2 workstream C (the specific bug it fixes): builds the
+/// kernel with two dummy ring-3 processes that both send on the same
+/// endpoint before any receiver is ever polled (the `double-send-test`
+/// feature) — the exact historical scenario where a second sender with
+/// nobody receiving panicked the kernel. Confirms both sends queue and
+/// are eventually delivered instead.
+fn test_double_send() -> Result<(), String> {
+    let log = run_scenario(&["double-send-test"], "double-send-test.log", 8, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a second sender with nobody receiving must queue, \
+             not panic"
+                .to_string(),
+        );
+    }
+    if !log.contains("MSGA") || !log.contains("MSGB") {
+        return Err(
+            "expected both queued senders' messages (\"MSGA\" and \"MSGB\") to have been \
+             delivered"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both sender processes to reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-double-send PASSED — two senders with no receiver both queued and were \
+         delivered, no kernel panic"
+    );
+    Ok(())
+}
+
+/// Milestone 3: boots the *normal, unconditional* boot sequence (no test
+/// feature — `init` always does this now) and confirms the whole
+/// dynamic-process-creation chain works end to end: `init` spawns
+/// `echo-child` (a process boot code never mentions at all), grants it a
+/// capability it starts with none of, releases it with
+/// `SYS_PROCESS_START`, and completes a genuine rendezvous with it —
+/// none of it boot-choreographed the way the console-server handoff is.
+fn test_spawn_ipc() -> Result<(), String> {
+    let log = run_scenario(&[], "spawn-ipc-test.log", 8, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err("expected init's own greeting (regression check)".to_string());
+    }
+    if !log.contains("child replied: pong") {
+        return Err(
+            "expected \"child replied: pong\" -- init's dynamically spawned echo-child should \
+             have replied over the granted capability"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both init and its spawned child to reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-spawn-ipc PASSED — init dynamically spawned echo-child, granted it a \
+         capability, and completed a real IPC round trip with it"
+    );
+    Ok(())
+}
+
+/// Milestone 3, adversarially: builds the kernel with two dummy ring-3
+/// processes (the `spawn-boundary-test` feature) — an idle bystander,
+/// and a test process that probes `SYS_GRANT`/`SYS_PROCESS_START`'s
+/// ownership and rights checks directly (a grant against a real
+/// process that isn't its child, a grant requesting rights it doesn't
+/// hold, then a legitimate spawn+grant+start) — and confirms all four
+/// checks matched their expected result. Complements `test_spawn_ipc`:
+/// that one proves the happy path works, this one proves the boundary
+/// is actually enforced, not merely unexercised.
+fn test_spawn_boundary() -> Result<(), String> {
+    let log = run_scenario(&["spawn-boundary-test"], "spawn-boundary-test.log", 5, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("BOUNDARY_FAIL") {
+        return Err(
+            "boundary-test process reported BOUNDARY_FAIL -- SYS_GRANT/SYS_PROCESS_START did \
+             not enforce ownership/rights the way it should have"
+                .to_string(),
+        );
+    }
+    if !log.contains("BOUNDARY_OK") {
+        return Err(
+            "expected \"BOUNDARY_OK\" -- the boundary-test process never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-spawn-boundary PASSED — a grant against a non-child and a rights-\
+         amplifying grant were both rejected, while a legitimate grant+start still succeeded"
+    );
+    Ok(())
+}
+
+/// Milestone 4: builds the kernel with a single dummy ring-3 process
+/// (the `process-lifecycle-test` feature) that repeatedly spawns a
+/// `Suspended` `echo-child` and immediately kills it, 3 * `MAX_PROCESSES`
+/// times in a row — far more than the process table's 16 slots could
+/// ever survive if terminating a process didn't actually free its slot
+/// and physical memory. Confirms the loop completes (no
+/// `ResourceExhausted`/`SpawnFailed` partway through) and that the
+/// physical frame allocator reports the exact same free-frame count
+/// before the loop starts and after the run halts.
+fn test_process_lifecycle() -> Result<(), String> {
+    let log = run_scenario(
+        &["process-lifecycle-test"],
+        "process-lifecycle-test.log",
+        8,
+        false,
+        1,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("LIFECYCLE_FAIL") {
+        return Err(
+            "lifecycle-test process reported LIFECYCLE_FAIL -- a spawn or kill failed \
+             partway through the loop, suggesting the process table is leaking"
+                .to_string(),
+        );
+    }
+    if !log.contains("LIFECYCLE_OK") {
+        return Err(
+            "expected \"LIFECYCLE_OK\" -- the lifecycle-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    match extract_free_frame_counts(&log).as_slice() {
+        [before, after] if before == after => {}
+        [before, after] => {
+            return Err(format!(
+                "expected the free physical frame count to return to its starting value \
+                 after 48 spawn+kill cycles, but it went from {before} to {after} -- \
+                 AddressSpace teardown is leaking physical memory"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "expected exactly two \"free_frames=\" log lines (before and after), found {}",
+                other.len()
+            ));
+        }
+    }
+    println!(
+        "xtask: test-process-lifecycle PASSED — 48 spawn+kill cycles completed without \
+         exhausting the process table, and physical memory usage returned to baseline"
+    );
+    Ok(())
+}
+
+/// Milestone 4: builds the kernel with a single dummy ring-3 process
+/// (the `wait-exit-code-test` feature) that spawns `exit-code-child`,
+/// releases it, and immediately `SYS_WAIT`s on it before it has ever
+/// run — deterministically forcing the wait to genuinely block and
+/// later resume, rather than merely reading an already-`Zombie` slot.
+/// Confirms the reported status matches the exact code
+/// `exit-code-child` passes to `sys_exit`.
+fn test_wait_exit_code() -> Result<(), String> {
+    let log = run_scenario(&["wait-exit-code-test"], "wait-exit-code-test.log", 8, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("WAIT_FAIL") {
+        return Err(
+            "wait-test process reported WAIT_FAIL -- SYS_WAIT did not report the exit code \
+             exit-code-child actually passed to sys_exit"
+                .to_string(),
+        );
+    }
+    if !log.contains("WAIT_OK") {
+        return Err(
+            "expected \"WAIT_OK\" -- the wait-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-wait-exit-code PASSED — SYS_WAIT genuinely blocked on a not-yet-run \
+         child and reported its correct exit code once it exited"
+    );
+    Ok(())
+}
+
+/// Milestone 4, adversarially: builds the kernel with two dummy ring-3
+/// processes (the `kill-boundary-test` feature) — an idle bystander,
+/// and a test process that probes `SYS_KILL`'s ownership check directly
+/// (a kill against a real process that isn't its child), then proves a
+/// legitimate kill still works against both a `Suspended` child and a
+/// genuinely `Blocked` one. Complements `test_spawn_boundary`'s bar for
+/// adversarial proof, applied to termination instead of grant/start.
+fn test_kill_boundary() -> Result<(), String> {
+    let log = run_scenario(&["kill-boundary-test"], "kill-boundary-test.log", 5, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("KILL_FAIL") {
+        return Err(
+            "kill-test process reported KILL_FAIL -- SYS_KILL did not enforce ownership, or \
+             a legitimate kill against a Suspended/Blocked child did not succeed"
+                .to_string(),
+        );
+    }
+    if !log.contains("KILL_OK") {
+        return Err(
+            "expected \"KILL_OK\" -- the kill-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-kill-boundary PASSED — a kill against a non-child was rejected, while \
+         legitimate kills against both a Suspended and a genuinely Blocked child succeeded"
+    );
+    Ok(())
+}
+
+/// Milestone 5: builds the kernel with a single dummy ring-3 process
+/// (the `heap-growth-test` feature) that spawns `heap-child` — a real
+/// ELF process that builds a 512 KiB `Vec<u64>` via `sys_sbrk`-backed
+/// `alloc`, forcing dozens of separate heap growths, then verifies
+/// every value it wrote is still intact — and confirms it exits `0`.
+fn test_heap_growth() -> Result<(), String> {
+    let log = run_scenario(&["heap-growth-test"], "heap-growth-test.log", 8, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("HEAP_FAIL") {
+        return Err(
+            "heap-growth-test process reported HEAP_FAIL -- heap-child's Vec<u64> either \
+             failed to grow via sys_sbrk or lost data it had already written"
+                .to_string(),
+        );
+    }
+    if !log.contains("HEAP_OK") {
+        return Err(
+            "expected \"HEAP_OK\" -- the heap-growth-test process never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-heap-growth PASSED — heap-child's multi-page Vec<u64>, backed by \
+         sys_sbrk and tarnos-rt's userland allocator, grew and stayed intact end to end"
+    );
+    Ok(())
+}
+
+/// Milestone 5, adversarially: builds the kernel with a single dummy
+/// ring-3 process (the `sbrk-boundary-test` feature) that calls
+/// `SYS_SBRK` directly — an increment comfortably over the fixed 64 MiB
+/// heap ceiling is rejected before any frame is touched, a valid grow
+/// succeeds, a negative increment is rejected (grow-only this
+/// milestone), and a zero-increment query returns the unchanged current
+/// break, proving the rejected calls truly had no side effects.
+fn test_sbrk_boundary() -> Result<(), String> {
+    let log = run_scenario(&["sbrk-boundary-test"], "sbrk-boundary-test.log", 5, false, 1)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("SBRK_FAIL") {
+        return Err(
+            "sbrk-boundary-test process reported SBRK_FAIL -- SYS_SBRK did not enforce its \
+             heap ceiling or grow-only contract, or a legitimate grow/query misbehaved"
+                .to_string(),
+        );
+    }
+    if !log.contains("SBRK_OK") {
+        return Err(
+            "expected \"SBRK_OK\" -- the sbrk-boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-sbrk-boundary PASSED — an absurd increment and a negative increment were \
+         both rejected, while a valid grow and a side-effect-free query behaved correctly"
+    );
+    Ok(())
+}
+
+/// Shared implementation for `test_smp_boot`/`test_smp_degraded`: builds
+/// the kernel with the `smp-boot-test` feature (see `kernel/src/main.rs`)
+/// and boots it with `smp` virtual CPUs. Checks that every core Limine
+/// reported reaches its own ready line (not a hardcoded count — read
+/// back from the kernel's own "MP info received" log line) and that
+/// every one of their independent, free-running spin counters has
+/// advanced by a comparable order of magnitude — real evidence the cores
+/// are executing concurrently, not secretly serialized, without needing
+/// any periodic timer interrupt at all. Returns how many CPUs Limine
+/// actually reported, for the caller's own success message.
+fn smp_boot_check(smp: u32, log_name: &str) -> Result<usize, String> {
+    let log = run_scenario(&["smp-boot-test"], log_name, 10, false, smp)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+
+    let reported: usize = log
+        .lines()
+        .find_map(|line| line.split("MP info received (").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| "expected an \"MP info received (N CPU(s)...\" log line".to_string())?;
+
+    // Every core (BSP via `smp::bring_up_aps`, every AP via
+    // `smp::ap_entry_on_own_stack`) logs "[smp] core N ready" -- counted
+    // by the literal " ready" suffix rather than a stricter prefix match,
+    // since the exact core index varies.
+    let ready_count = log.matches(" ready").count();
+    if ready_count != reported {
+        return Err(format!(
+            "expected {reported} core(s) to report ready (Limine reported {reported} CPU(s)), \
+             but saw {ready_count} \"ready\" line(s)"
+        ));
+    }
+    if !log.contains("[smp-test] boot check complete") {
+        return Err("expected the smp-boot-test process to reach its final log line".to_string());
+    }
+
+    // "[smp-test] core {index} spin_count={count}" -- one line per ready
+    // core (BSP included), parsed as (index, count) pairs so the BSP's
+    // own count (always 0 -- it never runs the AP-only free-spin loop,
+    // see `ap_entry_on_own_stack`) can be excluded from the "did this
+    // core actually run concurrently" check below without excluding it
+    // from the "did every core report in at all" line-count check.
+    let spin_lines: Vec<(usize, u64)> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("[smp-test] core "))
+        .filter_map(|rest| rest.split_once(" spin_count="))
+        .filter_map(|(idx, count)| Some((idx.trim().parse().ok()?, count.trim().parse().ok()?)))
+        .collect();
+    if spin_lines.len() != reported {
+        return Err(format!(
+            "expected {reported} \"spin_count=\" log line(s), found {}",
+            spin_lines.len()
+        ));
+    }
+
+    let ap_spin_counts: Vec<u64> = spin_lines
+        .iter()
+        .filter(|(core_index, _)| *core_index != 0)
+        .map(|(_, count)| *count)
+        .collect();
+    if ap_spin_counts.is_empty() {
+        return Err("expected at least one AP to check spin counters for".to_string());
+    }
+    if ap_spin_counts.iter().any(|&c| c == 0) {
+        return Err(
+            "expected every AP's spin counter to have advanced -- a zero count suggests \
+             that core never actually ran concurrently with the others"
+                .to_string(),
+        );
+    }
+    let min = *ap_spin_counts.iter().min().unwrap();
+    let max = *ap_spin_counts.iter().max().unwrap();
+    // A generous ratio -- this only needs to catch "one core never ran
+    // at all" or "cores were secretly time-sliced one at a time instead
+    // of truly concurrently," not assert anything about precise
+    // fairness between them.
+    if max > min.saturating_mul(1000) {
+        return Err(format!(
+            "expected every AP's spin counter to advance by a comparable order of magnitude, \
+             but saw counts ranging from {min} to {max}"
+        ));
+    }
+
+    Ok(reported)
+}
+
+/// Milestone 6: builds the kernel with the `smp-boot-test` feature and
+/// boots it with 4 virtual CPUs, via [`smp_boot_check`].
+fn test_smp_boot() -> Result<(), String> {
+    let reported = smp_boot_check(4, "smp-boot-test.log")?;
+    println!(
+        "xtask: test-smp-boot PASSED — {reported} core(s) all reported ready and advanced \
+         their own independent spin counters"
+    );
+    Ok(())
+}
+
+/// The same `smp-boot-test` kernel image as [`test_smp_boot`], run with
+/// only 2 virtual CPUs instead of 4 — proves the ready-count assertion
+/// and bring-up logic isn't hardcoded to a specific core count and
+/// degrades gracefully (exercising `arch::x86_64::smp::bring_up_aps`'s
+/// bounded-timeout wait) rather than hanging waiting for cores that
+/// don't exist.
+fn test_smp_degraded() -> Result<(), String> {
+    let reported = smp_boot_check(2, "smp-degraded-test.log")?;
+    println!(
+        "xtask: test-smp-degraded PASSED — the same bring-up logic correctly handled \
+         {reported} core(s) instead of the usual 4, with no hang and no hardcoded count"
+    );
+    Ok(())
+}
+
+/// Milestone 6, adversarially: builds the kernel with the `smp-ipi-test`
+/// feature and boots it with 4 virtual CPUs. Confirms a targeted IPI
+/// (`arch::x86_64::lapic::send_ipi`, never a broadcast) reaches exactly
+/// one specific core and no other, and that sending the same vector to a
+/// LAPIC ID with no corresponding booted core doesn't hang or fault the
+/// kernel — confirmed empirically rather than assumed.
+fn test_smp_ipi() -> Result<(), String> {
+    let log = run_scenario(&["smp-ipi-test"], "smp-ipi-test.log", 10, false, 4)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("IPI_FAIL") {
+        return Err(
+            "smp-ipi-test reported IPI_FAIL -- a targeted IPI reached the wrong core(s), or \
+             the bad-target send hung/faulted the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("IPI_OK") {
+        return Err(
+            "expected \"IPI_OK\" -- the smp-ipi-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-smp-ipi PASSED — a targeted IPI reached exactly its target and nothing \
+         else, and a send to a nonexistent target didn't hang or fault"
+    );
+    Ok(())
+}
+
+/// Milestone 6's own regression check: re-runs `test-fault-isolation`
+/// and `test-blocking-ipc`'s exact kernel builds at `-smp 4` instead of
+/// `-smp 1`, asserting the exact same pass criteria as their original
+/// single-core versions — proving that other cores merely booting and
+/// idling nearby doesn't perturb the untouched BSP-only
+/// scheduler/IPC/fault logic this milestone deliberately never changes.
+fn test_smp_regression() -> Result<(), String> {
+    let log = run_scenario(
+        &["fault-isolation-test"],
+        "smp-regression-fault-isolation.log",
+        5,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic under -smp 4 -- a ring-3 fault should still kill only \
+             the offending process, not the kernel"
+                .to_string(),
+        );
+    }
+    if !log.contains("[fault]") || !log.contains("killed") {
+        return Err(
+            "expected a \"[fault] pid ... killed: ...\" line under -smp 4, same as at -smp 1"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err(
+            "expected the survivor process to still reach a clean exit under -smp 4"
+                .to_string(),
+        );
+    }
+
+    let log = run_scenario(
+        &["blocking-ipc-test"],
+        "smp-regression-blocking-ipc.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if !log.contains("Hello from TarnOS userspace!") {
+        return Err(
+            "expected init's greeting to still arrive after genuinely blocking on sys_send, \
+             under -smp 4"
+                .to_string(),
+        );
+    }
+
+    println!(
+        "xtask: test-smp-regression PASSED — fault isolation and blocking IPC behave \
+         identically with other cores booted and idling nearby"
+    );
+    Ok(())
+}
+
+/// Milestone 7: builds the kernel with the `smp-sched-concurrency-test`
+/// feature and boots it with 4 virtual CPUs. Two dummy processes each
+/// free-spin on `SYS_YIELD`; the kernel itself polls every core's
+/// current-process atomic and logs the moment it finds both processes
+/// resident on two *different* cores at once — direct proof of genuine
+/// concurrent, cross-core execution for real processes (not merely
+/// "eventually scheduled somewhere," and not just the idle-loop
+/// free-spin counters `test-smp-boot` already proved for cores with
+/// nothing to run).
+fn test_smp_sched_concurrency() -> Result<(), String> {
+    let log = run_scenario(
+        &["smp-sched-concurrency-test"],
+        "smp-sched-concurrency-test.log",
+        15,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if log.contains("CONCURRENCY_FAIL") {
+        return Err(
+            "smp-sched-concurrency-test reported CONCURRENCY_FAIL -- never observed both test \
+             processes resident on two different cores at the same instant"
+                .to_string(),
+        );
+    }
+    if !log.contains("CONCURRENCY_OK") {
+        return Err(
+            "expected \"CONCURRENCY_OK\" -- the concurrency check never reported a result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("concurrent") {
+        return Err(
+            "expected a \"pid_a on core ..., pid_b on core ... -- concurrent\" line naming the \
+             two distinct cores"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected both spinning processes to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-sched-concurrency PASSED — two real processes ran concurrently on two \
+         different cores, confirmed directly rather than assumed"
+    );
+    Ok(())
+}
+
+/// Milestone 7: re-runs `test-wait-exit-code`'s exact kernel build
+/// (`wait-exit-code-test`) at `-smp 4` instead of `-smp 1` — the parent
+/// `SYS_WAIT`s on `exit-code-child` before it has ever run, forcing a
+/// genuine block; with more than one core, the child is very likely to
+/// get picked up by a different, idle core than the one the parent
+/// blocked on, proving the block-wake-and-report path works correctly
+/// across cores, not just within one. Same pass criteria as the
+/// single-core version, plus a check that the switch log actually shows
+/// a process running on a non-BSP core at some point.
+fn test_smp_wait_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["wait-exit-code-test"],
+        "smp-wait-cross-core-test.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("WAIT_FAIL") {
+        return Err(
+            "wait-exit-code-test reported WAIT_FAIL under -smp 4 -- the cross-core wake-and-\
+             report path did not deliver the correct exit status"
+                .to_string(),
+        );
+    }
+    if !log.contains("WAIT_OK") {
+        return Err(
+            "expected \"WAIT_OK\" -- the wait-test process never reported a result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the wait-test process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-wait-cross-core PASSED — SYS_WAIT correctly blocked, and the child's \
+         exit correctly woke and reported to its parent, under -smp 4"
+    );
+    Ok(())
+}
+
+/// Milestone 7, the direct adversarial test for cross-core `SYS_KILL`:
+/// builds the kernel with the `kill-cross-core-test` feature and boots
+/// it with 4 virtual CPUs. A dummy process free-spins on `SYS_YIELD`
+/// forever as the child of a second dummy process that yields a few
+/// times (letting the first one actually start running, most likely on
+/// a different, idle core) and then `SYS_KILL`s it — exercising
+/// `task::scheduler::terminate_process`'s cross-core eviction protocol
+/// (a targeted IPI plus a bounded wait for the owning core to confirm)
+/// rather than the same-core immediate-finalize path every earlier
+/// milestone's kill tests already covered. Immediately afterward the
+/// killer spawns, starts, and waits on one more completely ordinary
+/// child — the direct adversarial check for the idle-core stale-CR3
+/// fix (see `docs/adr/0010-cross-core-scheduling.md`): a missing or
+/// broken fix would surface as a spurious kernel-mode page fault right
+/// here, quite possibly on the very core that was just evicted.
+fn test_smp_kill_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["kill-cross-core-test"],
+        "smp-kill-cross-core-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err(
+            "expected no kernel panic -- a missing idle-core stale-CR3 fix would surface as a \
+             spurious page fault right after the cross-core kill"
+                .to_string(),
+        );
+    }
+    if log.contains("KILL_CC_FAIL") {
+        return Err(
+            "kill-cross-core-test reported KILL_CC_FAIL -- either the cross-core kill itself \
+             failed, or the machine was not fully healthy afterward"
+                .to_string(),
+        );
+    }
+    if !log.contains("KILL_CC_OK") {
+        return Err(
+            "expected \"KILL_CC_OK\" -- the kill-cross-core-test process never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the killer process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-kill-cross-core PASSED — SYS_KILL correctly evicted a process \
+         genuinely running on another core, and the machine stayed fully healthy afterward"
+    );
+    Ok(())
+}
+
+/// Milestone 8's direct adversarial test for the cross-core SYS_SEND/
+/// SYS_RECV race `Process::pending_wake` closes (see docs/adr/0011):
+/// builds the kernel with the `smp-send-cross-core-test` feature and
+/// boots it with 4 virtual CPUs. A receiver process blocks in SYS_RECV
+/// before anything has been sent; a sender process, spawned right after
+/// it and very likely landing on a different, previously-idle core,
+/// immediately SYS_SENDs the same message -- forcing the exact race
+/// window between registering as a waiter and actually reaching
+/// `block_current_process` that a single-core version of this test
+/// could never reach at all.
+fn test_smp_send_cross_core() -> Result<(), String> {
+    let log = run_scenario(
+        &["smp-send-cross-core-test"],
+        "smp-send-cross-core-test.log",
+        8,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("SEND_CC_FAIL") {
+        return Err(
+            "smp-send-cross-core-test reported SEND_CC_FAIL -- the delivered message did not \
+             match what the sender actually sent"
+                .to_string(),
+        );
+    }
+    if !log.contains("SEND_CC_OK") {
+        return Err(
+            "expected \"SEND_CC_OK\" -- the send-cross-core-test receiver never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-smp-send-cross-core PASSED — a cross-core SYS_SEND correctly woke a \
+         receiver blocked in SYS_RECV on a different core, with the correct message delivered"
+    );
+    Ok(())
+}
+
+/// Milestone 8's direct adversarial test for per-core forced preemption:
+/// builds the kernel with the `forced-preempt-test` feature and boots it
+/// with 4 virtual CPUs. A dummy process busy-loops forever making *zero*
+/// syscalls -- only the new per-core LAPIC timer can ever preempt it.
+/// Boot code polls to find out empirically which core it landed on, then
+/// confirms it actually gets preempted there (`PREEMPTION_OK`), that an
+/// ordinary process still gets to run and exit cleanly alongside it
+/// (`PREEMPT_ORD_OK`), and that SYS_KILL's cross-core eviction protocol
+/// still works against a target that was forcibly, not cooperatively,
+/// scheduled the whole time (`FRC_PRE_OK`).
+fn test_smp_forced_preempt() -> Result<(), String> {
+    let log = run_scenario(
+        &["forced-preempt-test"],
+        "forced-preempt-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("PREEMPTION_FAIL") {
+        return Err(
+            "forced-preempt-test reported PREEMPTION_FAIL -- the never-syscalling busy process \
+             never got preempted on its own core"
+                .to_string(),
+        );
+    }
+    if !log.contains("PREEMPTION_OK") {
+        return Err(
+            "expected \"PREEMPTION_OK\" -- the forced-preempt-test busy process never started \
+             running at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("PREEMPT_ORD_OK") {
+        return Err(
+            "expected \"PREEMPT_ORD_OK\" -- the ordinary process never got to run and exit \
+             alongside the never-yielding busy process"
+                .to_string(),
+        );
+    }
+    if log.contains("FRC_PRE_FAIL") {
+        return Err(
+            "forced-preempt-test reported FRC_PRE_FAIL -- either SYS_KILL failed against the \
+             forcibly-scheduled busy process, or the machine was not fully healthy afterward"
+                .to_string(),
+        );
+    }
+    if !log.contains("FRC_PRE_OK") {
+        return Err(
+            "expected \"FRC_PRE_OK\" -- the forced-preempt-test killer process never reported a \
+             result at all"
+                .to_string(),
+        );
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-smp-forced-preempt PASSED — a never-syscalling process was genuinely \
+         preempted by its own core's LAPIC timer, an ordinary process still ran alongside it, \
+         and SYS_KILL still evicted it despite it never cooperating"
+    );
+    Ok(())
+}
+
+/// Milestone 9's combined "kitchen sink" scenario: builds the kernel
+/// with the `kitchen-sink-test` feature and boots it at `-smp 4` with
+/// several small orchestrator processes running concurrently, each
+/// driving a *different*, already-proven-solid workload rather than in
+/// isolation -- an IPC round trip via `echo-child`, heap growth via
+/// `heap-child`, a bounded spawn+wait lifecycle loop via
+/// `exit-code-child`, a kill-mid-flight orchestrator against a
+/// never-yielding target, and background `SYS_YIELD` pressure processes
+/// keeping every core genuinely busy throughout.
+///
+/// Deliberately **not** part of `test-all`/CI: prototyping this scenario
+/// found and fixed two real cross-core bugs (see `docs/adr/0011`), but a
+/// further, deeper cross-core corruption issue -- intermittent kernel
+/// panics or process kills with a saved trap-frame RIP corrupted into
+/// what looks like a raw packed `Pid` value rather than a real code
+/// address -- remains open across a long investigation (`docs/adr/0012`
+/// through `docs/adr/0029` and counting). Milestone 10 treats it as a
+/// known, contained, documented risk rather than a blocker (it fails
+/// safely into a panic + halt, never silent corruption that keeps
+/// running) -- see `docs/adr/0029` for where the investigation currently
+/// stands. Kept as a standalone command so it can still be run and
+/// iterated on directly whenever that thread is picked back up, without
+/// making every `test-all`/CI run flaky in the meantime.
+fn test_kitchen_sink() -> Result<(), String> {
+    let log = run_scenario(&["kitchen-sink-test"], "kitchen-sink-test.log", 20, false, 4)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    // Underscore counts here match each orchestrator's own `WORD0`
+    // constant byte-for-byte (see `kitchen_sink_tests.rs`): "IPC" is 3
+    // letters, so `"KS_" + "IPC" + "_"` needs one more pad byte to fill
+    // the 8-byte word, giving a double underscore; "HEAP"/"LIFE"/"KILL"
+    // are each 4 letters, so `"KS_" + <word> + "_"` already fills all 8
+    // bytes with a single trailing underscore and no room for a second.
+    for (fail_marker, ok_marker, description) in [
+        ("KS_IPC__FAIL", "KS_IPC__OK", "the IPC round trip via echo-child"),
+        ("KS_HEAP_FAIL", "KS_HEAP_OK", "heap growth via heap-child"),
+        ("KS_LIFE_FAIL", "KS_LIFE_OK", "the exit-code-child lifecycle loop"),
+        ("KS_KILL_FAIL", "KS_KILL_OK", "the kill-mid-flight orchestrator"),
+    ] {
+        if log.contains(fail_marker) {
+            return Err(format!(
+                "kitchen-sink-test reported {fail_marker} -- {description} failed while running \
+                 concurrently with every other workload"
+            ));
+        }
+        if !log.contains(ok_marker) {
+            return Err(format!(
+                "expected \"{ok_marker}\" -- {description} never reported a result at all"
+            ));
+        }
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the machine to still reach a clean final halt".to_string());
+    }
+    println!(
+        "xtask: test-kitchen-sink PASSED — IPC, heap growth, process lifecycle, and cross-core \
+         kill all held up correctly running concurrently under -smp 4"
+    );
+    Ok(())
+}
+
+/// Milestone 7's own stress test for the lost-wakeup hazard named in
+/// `task::scheduler::park_until_woken`'s doc comment: re-runs
+/// `test-process-lifecycle`'s exact kernel build (48 rapid spawn+kill+
+/// wait cycles) at `-smp 4` instead of `-smp 1`. With more than one
+/// core, every one of those cycles is a chance for a core to park via
+/// the interrupt-driven idle wait and need a wake-up IPI to notice new
+/// work — a bug in that path would show up here as a hang (caught by
+/// `run_scenario`'s own bounded timeout) long before it would in the
+/// single-core version, which never actually exercises the idle-park
+/// path at all. Same pass criteria as the single-core version.
+fn test_smp_sched_stress() -> Result<(), String> {
+    let log = run_scenario(
+        &["process-lifecycle-test"],
+        "smp-sched-stress-test.log",
+        10,
+        false,
+        4,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic under -smp 4".to_string());
+    }
+    if log.contains("LIFECYCLE_FAIL") {
+        return Err(
+            "process-lifecycle-test reported LIFECYCLE_FAIL under -smp 4 -- a rapid spawn+kill \
+             cycle failed under real cross-core scheduling pressure"
+                .to_string(),
+        );
+    }
+    if !log.contains("LIFECYCLE_OK") {
+        return Err(
+            "expected \"LIFECYCLE_OK\" -- the lifecycle-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    match extract_free_frame_counts(&log).as_slice() {
+        [before, after] if before == after => {}
+        [before, after] => {
+            return Err(format!(
+                "expected the free physical frame count to return to its starting value after \
+                 48 rapid spawn+kill cycles under -smp 4, but it went from {before} to {after} \
+                 -- AddressSpace teardown is leaking physical memory"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "expected exactly two \"free_frames=\" log lines (before and after) under \
+                 -smp 4, found {}",
+                other.len()
+            ));
+        }
+    }
+    if !log.contains("last process exited, halting") {
+        return Err("expected the lifecycle-test process to still reach a clean exit".to_string());
+    }
+    println!(
+        "xtask: test-smp-sched-stress PASSED — 48 rapid spawn+kill+wait cycles completed under \
+         -smp 4 with no hang and no leaked physical memory"
+    );
+    Ok(())
+}
+
+/// Sector size every block-driver test scenario assumes — this
+/// milestone's one real device (and every other block device
+/// `driver::block::BlockDevice` is ever likely to describe) is
+/// universally addressed in 512-byte sectors; see that trait's own
+/// `SECTOR_SIZE` constant.
+const TEST_SECTOR_SIZE: usize = 512;
+
+/// The sector `main.rs`'s `block-driver-test`-gated smoke test reads
+/// back and compares — kept in sync with that file's own
+/// `KNOWN_TEST_LBA` constant by convention (both are small, fixed,
+/// easy-to-grep values, not derived from any shared source of truth,
+/// since xtask and the kernel build as entirely separate crates with no
+/// shared config between them for a single test constant).
+const KNOWN_TEST_LBA: u64 = 2;
+
+/// Builds a small raw disk image at `path`: `sector_count` sectors,
+/// every byte zero except sector [`KNOWN_TEST_LBA`], which is filled
+/// with a fixed, easy-to-recognize repeating byte pattern (`0..=255`
+/// repeated). Not real filesystem content — this milestone has none,
+/// see its own Non-goals — just a deterministic fingerprint the
+/// kernel-side smoke test can read back and compare against exactly.
+fn create_test_disk_image(path: &Path, sector_count: u64) -> Result<(), String> {
+    let mut data = vec![0u8; sector_count as usize * TEST_SECTOR_SIZE];
+    let start = KNOWN_TEST_LBA as usize * TEST_SECTOR_SIZE;
+    for (i, byte) in data[start..start + TEST_SECTOR_SIZE].iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+    std::fs::write(path, &data).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// The exact known content `main.rs`'s `fat-fs-test`-gated smoke test
+/// expects back from `HELLO.TXT` -- kept in sync with that file's own
+/// `HELLO_EXPECTED` constant by convention, the same way
+/// [`KNOWN_TEST_LBA`] is kept in sync with `block-driver-test`'s own
+/// constant.
+const FAT_TEST_HELLO_CONTENT: &[u8] = b"TarnOS Milestone 12 FAT12 smoke test payload.\n";
+
+/// Length of `BIGFILE.TXT`'s content -- kept in sync with `main.rs`'s
+/// own `BIGFILE_LEN` constant. Deliberately larger than one 512-byte
+/// FAT12 cluster (this milestone's own test image geometry has
+/// `SecPerClus = 1`, confirmed in Phase 1's own findings), so reading
+/// it back correctly requires walking a real multi-cluster FAT12 chain,
+/// not just following a single entry straight to its own end-of-chain
+/// marker the way `HELLO.TXT` alone would.
+const FAT_TEST_BIGFILE_LEN: usize = 3000;
+
+/// The same `(i % 256) as u8` repeating byte pattern
+/// [`create_test_disk_image`] already uses for its own raw-sector
+/// fixture -- reused here rather than inventing a second pattern, and
+/// kept in sync with `main.rs`'s own matching check.
+fn fat_test_bigfile_content() -> Vec<u8> {
+    (0..FAT_TEST_BIGFILE_LEN).map(|i| (i % 256) as u8).collect()
+}
+
+/// Builds a real, standards-compliant 1.44 MiB FAT12 disk image at
+/// `path` via `mformat`/`mcopy` -- confirmed installed in this
+/// environment and sufficient for this purpose in this milestone's own
+/// Phase 1 findings -- and copies each `(host_path, dos_name)` pair in
+/// `files` into its root directory. Real on-disk FAT12 content, not a
+/// synthetic byte pattern: `fs::fat` parses the real format, so its own
+/// test fixture has to be the real format too.
+fn create_fat_test_disk_image(path: &Path, files: &[(&Path, &str)]) -> Result<(), String> {
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("removing stale {}: {e}", path.display()))?;
+    }
+    let path_str = path.to_str().ok_or_else(|| {
+        format!("disk image path {} is not valid UTF-8", path.display())
+    })?;
+    run_cmd(Command::new("mformat").args(["-f", "1440", "-C", "-i", path_str, "::"]))?;
+    for (host_path, dos_name) in files {
+        let host_path_str = host_path.to_str().ok_or_else(|| {
+            format!("test file path {} is not valid UTF-8", host_path.display())
+        })?;
+        run_cmd(Command::new("mcopy").args([
+            "-i",
+            path_str,
+            host_path_str,
+            &format!("::{dos_name}"),
+        ]))?;
+    }
+    Ok(())
+}
+
+/// Milestone 11, Phase 3: builds the kernel with the `block-driver-test`
+/// feature, attaches a small disk image (seeded by
+/// [`create_test_disk_image`] with known content at a known sector) as a
+/// `virtio-blk-pci-non-transitional` device exactly the way this
+/// milestone's own Phase 1 findings confirmed, and boots it. Proves the
+/// virtio-blk driver itself works end to end — PCI enumeration, feature
+/// negotiation, virtqueue setup, and a real polled sector read — not
+/// just that the earlier PCI-enumeration-only smoke test still passes.
+fn test_block_driver() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-driver-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-driver-test"],
+        "block-driver-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLOCK_READ_FAIL") {
+        return Err(
+            "virtio-blk smoke test reported BLOCK_READ_FAIL -- see the captured log above for \
+             which stage failed"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLOCK_READ_OK") {
+        return Err(
+            "expected \"BLOCK_READ_OK\" -- the virtio-blk smoke test never reported a result at \
+             all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-driver PASSED — the virtio-blk driver negotiated features, set up a \
+         virtqueue, and read back a sector whose content exactly matched what this scenario \
+         seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 4: builds the kernel with the `block-syscall-test`
+/// feature (a dummy ring-3 process with `BLOCK_CAP`/`CONSOLE_CAP` seeded
+/// directly into its own table) against the same seeded disk image
+/// [`test_block_driver`] uses, and confirms the process's own real
+/// `SYS_BLOCK_READ` call read back content matching exactly what was
+/// seeded — proving the syscall/capability surface works end to end
+/// from genuine ring-3 code, not just `driver::virtio_blk` called
+/// directly from kernel context (Phase 3's own check).
+fn test_block_syscall() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-syscall-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-syscall-test"],
+        "block-syscall-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLK_SYSCALL_FAIL") {
+        return Err(
+            "the dummy process's own SYS_BLOCK_READ reported BLK_SYSCALL_FAIL -- either the \
+             syscall itself failed or the content it read back didn't match what this scenario \
+             seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLK_SYSCALL_OK") {
+        return Err(
+            "expected \"BLK_SYSCALL_OK\" -- the dummy process never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-syscall PASSED — a real ring-3 process's own SYS_BLOCK_READ call, \
+         gated by a directly-seeded BLOCK_CAP capability, read back content matching exactly \
+         what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 5: builds the kernel with the `block-boundary-test`
+/// feature (a dummy ring-3 process that runs four adversarial
+/// `SYS_BLOCK_READ` probes — an out-of-range LBA, a capability index
+/// nothing was seeded into, a zero sector count, and an unmapped buffer
+/// address) against the same seeded disk image, and confirms every
+/// probe failed with exactly the error code it should — the same
+/// "prove the boundary is enforced, not just unexercised" bar every
+/// prior milestone's own boundary tests already hold to.
+fn test_block_boundary() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-boundary-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-boundary-test"],
+        "block-boundary-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLK_BOUNDARY_FAIL") {
+        return Err(
+            "the boundary-test process reported BLK_BOUNDARY_FAIL -- at least one adversarial \
+             SYS_BLOCK_READ probe didn't fail with the exact error code expected"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLK_BOUNDARY_OK") {
+        return Err(
+            "expected \"BLK_BOUNDARY_OK\" -- the boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-boundary PASSED — an out-of-range LBA, a missing capability, a zero \
+         sector count, and an unmapped buffer address all failed with exactly the error code \
+         each should"
+    );
+    Ok(())
+}
+
+/// Milestone 11, Phase 5: builds the kernel with the `block-fixture-test`
+/// feature (a real ELF-loaded userland fixture, `block-child`, spawned
+/// directly like `init` itself with `BLOCK_CAP`/`CONSOLE_CAP` seeded)
+/// against the same seeded disk image, and confirms the fixture's own
+/// `tarnos-rt`-wrapped `SYS_BLOCK_READ` call read back content matching
+/// exactly what was seeded — the same check `test_block_syscall`'s
+/// raw-asm dummy process already makes, now through a real compiled
+/// userland binary and its own runtime, matching every other
+/// milestone's "the fixture is the real thing" bar (`echo-child`,
+/// `heap-child`, ...).
+fn test_block_fixture() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("block-fixture-test-disk.img");
+    create_test_disk_image(&disk_path, 64)?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["block-fixture-test"],
+        "block-fixture-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("BLOCK_FIXTURE_FAIL") {
+        return Err(
+            "block-child reported BLOCK_FIXTURE_FAIL -- either its own SYS_BLOCK_READ call \
+             failed or the content it read back didn't match what this scenario seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("BLOCK_FIXTURE_OK") {
+        return Err(
+            "expected \"BLOCK_FIXTURE_OK\" -- block-child never reported a result at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-block-fixture PASSED — the real block-child userland fixture's own \
+         SYS_BLOCK_READ call, through tarnos-rt's syscall wrapper, read back content matching \
+         exactly what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 2: builds the kernel with the `fat-fs-test`
+/// feature, attaches a real FAT12-formatted disk image (built via
+/// `mformat`/`mcopy`, not a synthetic byte pattern -- see
+/// [`create_fat_test_disk_image`] and this milestone's own Phase 1
+/// findings) seeded with two known files -- `HELLO.TXT` (single
+/// cluster) and `BIGFILE.TXT` (several clusters, so the smoke test
+/// actually exercises a real FAT12 chain walk, not just an immediate
+/// end-of-chain marker) -- and boots it. Proves `fs::fat` parses a real
+/// boot sector, walks a real multi-cluster FAT12 chain, finds a
+/// root-directory entry by 8.3 name, and reads back exact file content
+/// -- entirely inside the kernel, no syscall yet (that's Phase 3).
+fn test_fat_parsing() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-parsing-test-disk.img");
+    let hello_path = root.join("build").join("fat-parsing-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-parsing-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-fs-test"],
+        "fat-parsing-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FAT_READ_FAIL") {
+        return Err(
+            "the fs::fat smoke test reported FAT_READ_FAIL -- see the captured log above for \
+             which stage failed"
+                .to_string(),
+        );
+    }
+    if !log.contains("FAT_READ_OK") {
+        return Err(
+            "expected \"FAT_READ_OK\" -- the fs::fat smoke test never reported a result at all"
+                .to_string(),
+        );
+    }
+    if log.contains("FS_SYSCALL_FAIL") {
+        return Err(
+            "the real init process's own SYS_FILE_READ probe reported FS_SYSCALL_FAIL -- either \
+             the syscall itself failed or the content it read back didn't match (Milestone 12 \
+             Phase 3)"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_SYSCALL_OK") {
+        return Err(
+            "expected \"FS_SYSCALL_OK\" -- the real init process's own SYS_FILE_READ probe never \
+             reported a result at all (Milestone 12 Phase 3)"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-parsing PASSED — fs::fat parsed a real FAT12 boot sector, walked a \
+         real cluster chain, and read back a known file's exact content, both directly and \
+         through a real SYS_FILE_READ syscall from the real init process"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 4: builds a real FAT12 disk image seeded with
+/// `HELLO.TXT`/`BIGFILE.TXT` (so Phase 3's own `FS_CAP` probe still
+/// passes) plus a copy of the already-proven `exit-code-child` binary
+/// (Milestone 4) under the name `FSCHILD.ELF` -- a name that never
+/// appears in `limine.conf`'s own boot-module list, so `init`'s own
+/// `SYS_SPAWN("FSCHILD.ELF")` can only succeed through the new
+/// filesystem fallback. Boots with **no** kernel test feature at all --
+/// this is the ordinary, unconditional real boot sequence, proving the
+/// fallback works on a completely normal boot, not a special test path.
+fn test_fat_spawn() -> Result<(), String> {
+    let root = workspace_root();
+    // `create_fat_test_disk_image` copies straight from this path, so it
+    // must already exist -- `run_scenario_ext`'s own `iso()` call would
+    // build it too, but only *after* the disk image below is created.
+    build_user_crate(&root, false, "exit-code-child")?;
+    let fschild_elf = user_elf_path(&root, false, "exit-code-child");
+    // A debug build carries several MiB of DWARF debug sections, none
+    // of them `SHF_ALLOC` (so `Process::from_elf`'s own PT_LOAD-segment
+    // loader never reads any of it) -- but comfortably too large for a
+    // 1.44 MiB floppy image regardless. `strip` removes exactly that
+    // non-loaded debug information, never anything `from_elf` actually
+    // maps, so this changes nothing about how the program runs.
+    let fschild_stripped = root.join("build").join("fschild-stripped.elf");
+    std::fs::copy(&fschild_elf, &fschild_stripped).map_err(|e| {
+        format!(
+            "copying {} -> {}: {e}",
+            fschild_elf.display(),
+            fschild_stripped.display()
+        )
+    })?;
+    run_cmd(Command::new("strip").arg(&fschild_stripped))?;
+
+    let disk_path = root.join("build").join("fat-spawn-test-disk.img");
+    let hello_path = root.join("build").join("fat-spawn-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-spawn-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[
+            (&hello_path, "HELLO.TXT"),
+            (&bigfile_path, "BIGFILE.TXT"),
+            (&fschild_stripped, "FSCHILD.ELF"),
+        ],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(&[], "fat-spawn-test.log", 10, false, 1, &extra_args)?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FS_SPAWN_FAIL") {
+        return Err(
+            "init's own SYS_SPAWN(\"FSCHILD.ELF\") probe reported FS_SPAWN_FAIL -- either the \
+             spawn itself failed or the spawned process's own exit code didn't match \
+             (Milestone 12 Phase 4)"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_SPAWN_OK") {
+        return Err(
+            "expected \"FS_SPAWN_OK\" -- init's own SYS_SPAWN(\"FSCHILD.ELF\") probe never \
+             reported a result at all (Milestone 12 Phase 4)"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-spawn PASSED — SYS_SPAWN's new filesystem fallback found and loaded a \
+         program that exists only on the FAT image (not in limine.conf's boot-module list), and \
+         it ran to completion with exactly the exit code expected"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 5: builds the kernel with the `fat-fixture-test`
+/// feature (a real ELF-loaded userland fixture, `userland/fs-child`,
+/// holding a directly-seeded `FS_CAP`) against a real FAT12 disk
+/// seeded with `HELLO.TXT`/`BIGFILE.TXT`, and confirms its own real
+/// `SYS_FILE_READ` call read back content matching exactly what this
+/// scenario seeded -- the ring-3, kernel-external counterpart to
+/// Phase 2/3's own checks, matching `test-block-fixture`'s own
+/// Milestone 11 precedent.
+fn test_fat_fixture() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-fixture-test-disk.img");
+    let hello_path = root.join("build").join("fat-fixture-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-fixture-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-fixture-test"],
+        "fat-fixture-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FS_FIXTURE_FAIL") {
+        return Err(
+            "the real fs-child userland fixture's own SYS_FILE_READ call reported \
+             FS_FIXTURE_FAIL -- either the syscall itself failed or the content it read back \
+             didn't match what this scenario seeded"
+                .to_string(),
+        );
+    }
+    if !log.contains("FS_FIXTURE_OK") {
+        return Err(
+            "expected \"FS_FIXTURE_OK\" -- fs-child never reported a result at all".to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-fixture PASSED — the real fs-child userland fixture's own \
+         SYS_FILE_READ call, through tarnos-rt's syscall wrapper, read back content matching \
+         exactly what this scenario seeded into the disk image"
+    );
+    Ok(())
+}
+
+/// Milestone 12, Phase 5: builds the kernel with the `fat-boundary-test`
+/// feature (a dummy ring-3 process that runs four adversarial
+/// `SYS_FILE_READ` probes — a missing file, a capability index nothing
+/// was seeded into, an unmapped destination buffer, and a request whose
+/// buffer is larger than the file's own size) against a real FAT12 disk
+/// seeded with only `HELLO.TXT` (deliberately no `NOSUCH.TXT`, no
+/// `BIGFILE.TXT` -- this scenario doesn't need either), and confirms
+/// every probe behaved with exactly the outcome it should — the same
+/// "prove the boundary is enforced, not just unexercised" bar
+/// `test-block-boundary`'s own Milestone 11 precedent already holds
+/// itself to.
+fn test_fat_boundary() -> Result<(), String> {
+    let root = workspace_root();
+    let disk_path = root.join("build").join("fat-boundary-test-disk.img");
+    let hello_path = root.join("build").join("fat-boundary-test-hello.txt");
+    let bigfile_path = root.join("build").join("fat-boundary-test-bigfile.txt");
+    std::fs::write(&hello_path, FAT_TEST_HELLO_CONTENT)
+        .map_err(|e| format!("writing {}: {e}", hello_path.display()))?;
+    // Not used by this scenario's own probes -- included only so the
+    // real `init` process spawned alongside the dummy boundary-test
+    // process (every real boot spawns it unconditionally) finds its own
+    // Phase 3 `FS_CAP` probe fully satisfied too, rather than an
+    // unrelated (harmless, but confusing) `FS_SYSCALL_FAIL` cluttering
+    // this scenario's own captured log.
+    std::fs::write(&bigfile_path, fat_test_bigfile_content())
+        .map_err(|e| format!("writing {}: {e}", bigfile_path.display()))?;
+    create_fat_test_disk_image(
+        &disk_path,
+        &[(&hello_path, "HELLO.TXT"), (&bigfile_path, "BIGFILE.TXT")],
+    )?;
+
+    let drive_arg = format!("file={},if=none,format=raw,id=blk0", disk_path.display());
+    let extra_args: [&str; 6] = [
+        "-drive",
+        drive_arg.as_str(),
+        "-device",
+        "virtio-blk-pci-non-transitional,drive=blk0",
+        "-nic",
+        "none",
+    ];
+    let log = run_scenario_ext(
+        &["fat-boundary-test"],
+        "fat-boundary-test.log",
+        10,
+        false,
+        1,
+        &extra_args,
+    )?;
+    assert_booted_once(&log)?;
+    if log.contains("[KERNEL PANIC]") {
+        return Err("expected no kernel panic".to_string());
+    }
+    if !log.contains("PCI_ENUM_OK") {
+        return Err("expected PCI enumeration to still succeed with the disk attached".to_string());
+    }
+    if log.contains("FAT_BOUNDARY_FAIL") {
+        return Err(
+            "one or more SYS_FILE_READ boundary probes didn't match its expected outcome -- see \
+             the captured log above for which one"
+                .to_string(),
+        );
+    }
+    if !log.contains("FAT_BOUNDARY_OK") {
+        return Err(
+            "expected \"FAT_BOUNDARY_OK\" -- the boundary-test process never reported a result \
+             at all"
+                .to_string(),
+        );
+    }
+    println!(
+        "xtask: test-fat-boundary PASSED — a missing file, a missing capability, an unmapped \
+         buffer, and a read past the file's own end all behaved with exactly the outcome each \
+         should"
+    );
+    Ok(())
 }

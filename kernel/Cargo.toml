@@ -11,6 +11,202 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Deliberately dereferences an unmapped address early in boot instead of
+# running the normal boot sequence, to confirm the page-fault/double-fault
+# handling actually produces a clean panic + halt rather than a triple
+# fault. Exercised by `cargo run -p xtask -- test-fault`, never enabled
+# for a normal build/run.
+fault-injection-test = []
+# Spawns two dummy ring-3 processes at boot instead of the real init:
+# one that immediately dereferences a bad pointer, one that immediately
+# exits cleanly. Confirms the fault kills only the offending process --
+# no kernel panic, and the survivor still reaches a clean exit. Exercised
+# by `cargo run -p xtask -- test-fault-isolation`.
+fault-isolation-test = []
+# Spawns the real init process but skips priming the console server as a
+# waiting receiver before init runs, forcing init's first sys_send to
+# find nobody ready and genuinely block. Confirms a process can suspend
+# and later resume correctly, rather than merely that the always-primed-
+# receiver demo path happens to work. Exercised by
+# `cargo run -p xtask -- test-blocking-ipc`.
+blocking-ipc-test = []
+# Spawns two dummy ring-3 processes that both send on the same endpoint
+# before a receiver is ever polled, reproducing the historical bug where
+# a second sender with nobody receiving panicked the kernel. Confirms
+# both sends queue and are eventually delivered instead. Exercised by
+# `cargo run -p xtask -- test-double-send`.
+double-send-test = []
+# Spawns two dummy ring-3 processes: a bystander that just idles, and a
+# test process that adversarially probes SYS_GRANT/SYS_PROCESS_START --
+# a grant against a real process that isn't its child, a grant
+# requesting rights it doesn't hold, then a legitimate spawn+grant+start
+# to prove the mechanism still works. Exercised by
+# `cargo run -p xtask -- test-spawn-boundary`.
+spawn-boundary-test = []
+# Spawns a single dummy ring-3 process that repeatedly spawns a
+# Suspended echo-child and immediately kills it, 3 * MAX_PROCESSES times
+# in a row -- a process-table/physical-memory leak would exhaust the
+# table long before the loop completes. Confirms process teardown
+# actually frees what it allocated. Exercised by
+# `cargo run -p xtask -- test-process-lifecycle`.
+process-lifecycle-test = []
+# Spawns a single dummy ring-3 process that spawns exit-code-child,
+# releases it, and immediately SYS_WAITs on it (before the child has
+# run even once), forcing the wait to genuinely block and later resume.
+# Confirms the reported exit status matches what the child actually
+# passed to sys_exit. Exercised by
+# `cargo run -p xtask -- test-wait-exit-code`.
+wait-exit-code-test = []
+# Spawns a bystander dummy process plus a test process that
+# adversarially probes SYS_KILL -- a kill against a real process that
+# isn't its child, then legitimate kills against both a Suspended and a
+# genuinely Blocked real child. Exercised by
+# `cargo run -p xtask -- test-kill-boundary`.
+kill-boundary-test = []
+# Spawns a single dummy ring-3 process that spawns heap-child, releases
+# it, and SYS_WAITs for it to report success via its exit code --
+# heap-child itself builds a multi-page Vec<u64> backed by sys_sbrk and
+# tarnos-rt's userland allocator, proving real, multi-page heap growth
+# works end to end. Exercised by `cargo run -p xtask -- test-heap-growth`.
+heap-growth-test = []
+# Spawns a single dummy ring-3 process that adversarially probes
+# SYS_SBRK directly -- an increment over the fixed 64 MiB heap ceiling,
+# a valid grow, a rejected negative increment, and a side-effect-free
+# zero-increment query. Exercised by
+# `cargo run -p xtask -- test-sbrk-boundary`.
+sbrk-boundary-test = []
+# Every additional core's idle loop free-spins incrementing its own
+# counter instead of immediately hlt-parking; after a fixed delay the BSP
+# logs every core's count as evidence they're genuinely executing
+# concurrently, not secretly serialized. Exercised by
+# `cargo run -p xtask -- test-smp-boot` (and, at a different `-smp`
+# count, `test-smp-degraded`).
+smp-boot-test = []
+# After bring-up, the BSP sends a targeted test IPI to one specific core
+# and confirms only that core's IPI counter advanced, then sends the same
+# IPI to a LAPIC ID with no corresponding booted core and confirms the
+# kernel doesn't hang or fault. Exercised by
+# `cargo run -p xtask -- test-smp-ipi`.
+smp-ipi-test = []
+# Spawns two dummy ring-3 processes that each free-spin on SYS_YIELD for
+# a large fixed iteration count, then polls every core's current-process
+# atomic looking for direct evidence both are resident on two different
+# cores at the same instant -- proof of genuine concurrent, cross-core
+# execution for real *processes* (not just the idle-loop free-spin
+# counters `smp-boot-test` already proved for cores with nothing to
+# run). Exercised by `cargo run -p xtask -- test-smp-sched-concurrency`.
+smp-sched-concurrency-test = []
+# Spawns a dummy ring-3 process that free-spins on SYS_YIELD forever
+# (never exiting on its own) as the child of a second dummy process that
+# yields a few times -- letting the first one actually start running,
+# most likely on a different core -- then SYS_KILLs it. Directly
+# exercises `task::scheduler::terminate_process`'s cross-core eviction
+# protocol (a targeted IPI plus a bounded wait for the owning core to
+# confirm), then spawns, starts, and waits on one more ordinary child to
+# confirm the machine is still fully healthy right after the eviction --
+# the direct adversarial check for the idle-core stale-CR3 fix. Exercised
+# by `cargo run -p xtask -- test-smp-kill-cross-core`.
+kill-cross-core-test = []
+# Spawns a receiver process that immediately blocks in SYS_RECV on a
+# fresh endpoint (nothing has been sent yet) and a sender process that
+# immediately SYS_SENDs the same message -- spawned in that order so the
+# receiver is very likely already blocked on a different, previously-
+# idle core by the time the sender delivers, forcing the exact
+# Process::pending_wake race window the SYS_SEND/SYS_RECV cross-core fix
+# closes (see docs/adr/0011). Exercised by
+# `cargo run -p xtask -- test-smp-send-cross-core`.
+smp-send-cross-core-test = []
+# Spawns a dummy ring-3 process that busy-loops forever making *zero*
+# syscalls -- unlike kill-cross-core-test's target, nothing here ever
+# traps into the kernel on its own, so only the new per-core LAPIC timer
+# can ever preempt it. Confirms (by directly polling which core it
+# landed on, then watching that core) it actually gets preempted there,
+# that an ordinary process still gets to run and exit cleanly alongside
+# it, and that SYS_KILL's cross-core eviction protocol still works
+# against a target that was forcibly, not cooperatively, scheduled the
+# whole time. Exercised by
+# `cargo run -p xtask -- test-smp-forced-preempt`.
+forced-preempt-test = []
+# Spawns several small orchestrator processes concurrently at -smp 4,
+# each driving a different, already-proven-solid workload rather than in
+# isolation: an IPC round trip via echo-child, heap growth via
+# heap-child, a bounded spawn+wait lifecycle loop via exit-code-child, a
+# kill-mid-flight orchestrator against a never-yielding target, and
+# background SYS_YIELD pressure processes keeping every core busy
+# throughout. Exercised by `cargo run -p xtask -- test-kitchen-sink`.
+# Milestone 9, in progress -- not yet reliable enough to be wired into
+# `test-all`/CI (see docs/adr/0011's Consequences).
+kitchen-sink-test = []
+# Milestone 11, Phase 3: runs a kernel-internal (no syscall) smoke test
+# against the virtio-blk device xtask attaches when this feature is
+# enabled -- reads back a sector xtask seeded with known content and
+# confirms it matches exactly, proving the driver itself (feature
+# negotiation, virtqueue setup, a real polled read) works end to end.
+# PCI enumeration itself (Phase 2) is unconditional since Phase 4 and no
+# longer needs its own feature. See docs/MILESTONE-11-BLOCK-STORAGE-DRIVER.md.
+block-driver-test = []
+# Milestone 11, Phase 4: spawns a dummy ring-3 process with BLOCK_CAP and
+# CONSOLE_CAP seeded directly into its own capability table (bypassing
+# init/SYS_GRANT), which issues a real SYS_BLOCK_READ via raw inline asm
+# and reports whether the content it read back matches -- proves the
+# same read Phase 3 already confirmed kernel-side is also reachable
+# through the real syscall/capability surface. Exercised by
+# `cargo run -p xtask -- test-block-syscall`.
+block-syscall-test = []
+# Milestone 11, Phase 5: spawns a dummy ring-3 process (BLOCK_CAP and
+# CONSOLE_CAP seeded directly) that runs four adversarial SYS_BLOCK_READ
+# probes -- an out-of-range LBA, a capability index nothing was seeded
+# into, a zero sector_count, and an unmapped buffer address -- and
+# confirms each one fails with exactly the error code it should, not
+# just "some error." Exercised by
+# `cargo run -p xtask -- test-block-boundary`.
+block-boundary-test = []
+# Milestone 11, Phase 5: boots with a real ELF-loaded userland fixture
+# (userland/block-child, spawned directly the same way `init` itself is
+# -- not via SYS_SPAWN) holding a directly-seeded BLOCK_CAP, which
+# issues a real SYS_BLOCK_READ through tarnos-rt's own syscall wrapper
+# and reports whether the content matches -- the same check
+# block-syscall-test's raw-asm dummy process makes, now through a real
+# compiled userland binary and its own runtime, matching every other
+# milestone's "the fixture is the real thing, not a kernel-copied
+# function" bar (echo-child, heap-child, ...). Exercised by
+# `cargo run -p xtask -- test-block-fixture`.
+block-fixture-test = []
+# Milestone 12, Phase 2: runs a kernel-internal (no syscall) smoke test
+# against a real FAT12-formatted disk xtask attaches when this feature is
+# enabled -- mounts it via fs::fat::Fat12Volume::mount, reads a known
+# file by 8.3 name, and confirms its content matches exactly, proving
+# boot-sector/BPB parsing, FAT12 cluster-chain traversal, and
+# root-directory lookup all work end to end against a real
+# mformat/mcopy-built image. See docs/MILESTONE-12-FILESYSTEM.md.
+fat-fs-test = []
+# Milestone 12, Phase 5: boots with a real ELF-loaded userland fixture
+# (userland/fs-child, spawned directly the same way `init` itself is --
+# not via SYS_SPAWN) holding a directly-seeded FS_CAP, which issues a
+# real SYS_FILE_READ through tarnos-rt's own syscall wrapper and reports
+# whether the content matches -- the ring-3, kernel-external counterpart
+# to Phase 2/3's own checks, matching every other milestone's "the
+# fixture is the real thing, not a kernel-copied function" bar
+# (echo-child, heap-child, block-child, ...). Exercised by
+# `cargo run -p xtask -- test-fat-fixture`.
+fat-fixture-test = []
+# Milestone 12, Phase 5: spawns a dummy ring-3 process (FS_CAP and
+# CONSOLE_CAP seeded directly) that runs four adversarial SYS_FILE_READ
+# probes -- a missing file, a capability index nothing was seeded into,
+# an unmapped destination buffer, and a request whose buffer is larger
+# than the file's own size (confirming a truncated, not erroring, read)
+# -- and confirms each one behaves with exactly the outcome it should,
+# not just "some error." Exercised by
+# `cargo run -p xtask -- test-fat-boundary`.
+fat-boundary-test = []
+
 [dependencies]
 tarnos-abi = { path = "../libs/tarnos-abi" }
+tarnos-kcore = { path = "../libs/tarnos-kcore" }
 limine = "0.6"
+x86_64 = "0.15"
+spin = "0.9"
+linked_list_allocator = "0.10"
+pic8259 = "0.11"
+bitflags = "2"

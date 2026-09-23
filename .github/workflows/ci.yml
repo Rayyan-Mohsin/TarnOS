@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A stale run for the same branch/PR is pure waste (build + a handful of
+# QEMU boots each take real minutes) -- cancel it once a newer push
+# supersedes it instead of letting both finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Picks up rust-toolchain.toml's pinned nightly + components
+      # (rust-src, llvm-tools, clippy) automatically -- rustup is
+      # preinstalled on GitHub's Ubuntu runners.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install system dependencies (xorriso, QEMU, OVMF, mtools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso qemu-system-x86 ovmf mtools
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Host-testable crates: pure logic extracted specifically so it
+      # doesn't need QEMU or a custom target to verify (see
+      # docs/adr/0002-0003 and libs/tarnos-kcore's own doc comments).
+      - name: Run host-side unit tests (tarnos-kcore, tarnos-abi)
+        run: cargo test -p tarnos-kcore -p tarnos-abi
+
+      - name: Clippy (host-buildable crates)
+        run: cargo clippy -p tarnos-kcore -p tarnos-abi --all-targets -- -D warnings
+
+      # The kernel and every no_std, custom-target crate below were never
+      # linted at all until Milestone 10 Phase 2 (see
+      # docs/MILESTONE-10-LAST-BASE-LEVEL-CHECK.md) -- `--all-targets`
+      # is deliberately omitted here (unlike the host-buildable crates
+      # above): none of these are host-testable, so `--all-targets`
+      # would try to build a `test` target these no_std/custom-target
+      # builds can't produce (`can't find crate for `test``), not lint
+      # anything real.
+      - name: Clippy (kernel, no_std, custom x86_64-unknown-none target)
+        run: |
+          RUSTFLAGS="-C relocation-model=static" cargo clippy -p tarnos-kernel \
+            --target x86_64-unknown-none \
+            -Zbuild-std=core,alloc,compiler_builtins \
+            -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+
+      - name: Clippy (tarnos-rt + every userland crate, custom x86_64-tarnos-user target)
+        run: |
+          RUSTFLAGS="-C relocation-model=static" cargo clippy \
+            -p tarnos-rt -p init -p echo-child -p exit-code-child -p heap-child -p block-child \
+            -p fs-child \
+            --target targets/x86_64-tarnos-user.json -Zjson-target-spec \
+            -Zbuild-std=core,alloc,compiler_builtins \
+            -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+
+      - name: Build kernel + init (cross-compiled, custom no_std targets)
+        run: cargo run -p xtask -- build
+
+      # Each of these boots a purpose-built kernel variant in QEMU
+      # (software emulation -- no KVM needed or available on a hosted
+      # runner) for a fixed window and asserts on the captured serial
+      # log; see xtask/src/main.rs's test_* functions for what each one
+      # actually checks.
+      - name: xtask test-fault (kernel-mode fault stays a clean panic)
+        run: cargo run -p xtask -- test-fault
+
+      - name: xtask test-fault-isolation (usermode fault kills only that process)
+        run: cargo run -p xtask -- test-fault-isolation
+
+      - name: xtask test-blocking-ipc (a process can genuinely block and resume)
+        run: cargo run -p xtask -- test-blocking-ipc
+
+      - name: xtask test-double-send (two senders queue instead of panicking)
+        run: cargo run -p xtask -- test-double-send
+
+      - name: xtask test-uefi-boot (normal boot also completes via UEFI/OVMF)
+        run: cargo run -p xtask -- test-uefi-boot
+
+      - name: xtask test-spawn-ipc (dynamic process creation + capability transfer + IPC)
+        run: cargo run -p xtask -- test-spawn-ipc
+
+      - name: xtask test-spawn-boundary (SYS_GRANT/SYS_PROCESS_START enforce ownership + rights)
+        run: cargo run -p xtask -- test-spawn-boundary
+
+      - name: xtask test-process-lifecycle (process teardown frees its table slot + memory)
+        run: cargo run -p xtask -- test-process-lifecycle
+
+      - name: xtask test-wait-exit-code (SYS_WAIT genuinely blocks and reports the right status)
+        run: cargo run -p xtask -- test-wait-exit-code
+
+      - name: xtask test-kill-boundary (SYS_KILL enforces ownership across every process state)
+        run: cargo run -p xtask -- test-kill-boundary
+
+      - name: xtask test-heap-growth (sys_sbrk-backed userland alloc survives multi-page growth)
+        run: cargo run -p xtask -- test-heap-growth
+
+      - name: xtask test-sbrk-boundary (SYS_SBRK enforces its heap ceiling and grow-only contract)
+        run: cargo run -p xtask -- test-sbrk-boundary
+
+      - name: xtask test-smp-boot (every reported CPU core boots and runs concurrently)
+        run: cargo run -p xtask -- test-smp-boot
+
+      - name: xtask test-smp-degraded (SMP bring-up isn't hardcoded to a specific core count)
+        run: cargo run -p xtask -- test-smp-degraded
+
+      - name: xtask test-smp-ipi (a targeted IPI reaches exactly one core, never a wrong one)
+        run: cargo run -p xtask -- test-smp-ipi
+
+      - name: xtask test-smp-regression (fault isolation + blocking IPC unaffected by other cores)
+        run: cargo run -p xtask -- test-smp-regression
+
+      - name: xtask test-smp-sched-concurrency (two real processes genuinely run on two cores)
+        run: cargo run -p xtask -- test-smp-sched-concurrency
+
+      - name: xtask test-smp-wait-cross-core (SYS_WAIT's block/wake/report works across cores)
+        run: cargo run -p xtask -- test-smp-wait-cross-core
+
+      - name: xtask test-smp-kill-cross-core (SYS_KILL evicts a process running on another core)
+        run: cargo run -p xtask -- test-smp-kill-cross-core
+
+      - name: xtask test-smp-sched-stress (rapid cross-core spawn+kill cycles, no lost wakeups)
+        run: cargo run -p xtask -- test-smp-sched-stress
+
+      - name: xtask test-smp-send-cross-core (SYS_SEND wakes a cross-core blocked SYS_RECV)
+        run: cargo run -p xtask -- test-smp-send-cross-core
+
+      - name: xtask test-smp-forced-preempt (a zero-syscall process is still preempted per-core)
+        run: cargo run -p xtask -- test-smp-forced-preempt
+
+      - name: xtask test-block-driver (virtio-blk reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-block-driver
+
+      - name: xtask test-block-syscall (SYS_BLOCK_READ works end to end from ring 3)
+        run: cargo run -p xtask -- test-block-syscall
+
+      - name: xtask test-block-boundary (out-of-range/missing-cap/invalid SYS_BLOCK_READ rejected)
+        run: cargo run -p xtask -- test-block-boundary
+
+      - name: xtask test-block-fixture (real userland fixture reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-block-fixture
+
+      - name: xtask test-fat-parsing (fs::fat parses a real FAT12 image and reads a known file)
+        run: cargo run -p xtask -- test-fat-parsing
+
+      - name: xtask test-fat-spawn (SYS_SPAWN's filesystem fallback loads a program off the FAT image)
+        run: cargo run -p xtask -- test-fat-spawn
+
+      - name: xtask test-fat-fixture (real userland fixture reads back exactly what was seeded)
+        run: cargo run -p xtask -- test-fat-fixture
+
+      - name: xtask test-fat-boundary (missing-file/missing-cap/unmapped-buffer/past-end SYS_FILE_READ rejected or truncated correctly)
+        run: cargo run -p xtask -- test-fat-boundary

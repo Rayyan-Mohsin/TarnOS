@@ -1,9 +1,15 @@
-# Applies only when a --target is explicitly given (kernel and userland/init,
-# both built against the custom JSON targets under targets/). xtask's own
-# host build never passes --target, so it is unaffected by this table.
-[unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
-
+# `-Zbuild-std=...` for the kernel/userland/init builds (both against the
+# custom JSON/builtin no_std targets under targets/) is passed explicitly
+# as a CLI flag by xtask itself (see xtask/src/main.rs's build_kernel and
+# build_init), not configured here. It used to also be duplicated in an
+# `[unstable] build-std = [...]` table in this file; that table applies
+# to *every* cargo invocation in this workspace regardless of --target
+# (unlike the CLI flag, which is scoped to the one invocation it's passed
+# to) — including plain host-target builds/tests of crates like
+# `tarnos-kcore` that need nothing of the sort, where it broke the build
+# with a "duplicate lang item" error (a from-source `core` built by
+# build-std colliding with the prebuilt `core` already linked in via
+# `std`). Removed for that reason; xtask's CLI flags are sufficient on
+# their own.
 [build]
 target-dir = "target"
